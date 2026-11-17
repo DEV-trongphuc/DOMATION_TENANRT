@@ -545,6 +545,7 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
     const targetUserId = req.params.id;
     const {
       full_name,
+      email,
       phone,
       role,
       password,
@@ -560,6 +561,20 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
       receive_ratio,
       data_per_turn,
     } = req.body || {};
+
+    let nextEmail: string | null = null;
+    if (email !== undefined) {
+      if (ctx.userRole !== 'tenant_admin') {
+        sendApiError(res, 403, 'FORBIDDEN_EMAIL_UPDATE', 'Chỉ Tenant Admin mới được đổi email nhân sự.');
+        return;
+      }
+      const cleaned = String(email || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned)) {
+        sendApiError(res, 422, 'INVALID_EMAIL', 'Định dạng email không hợp lệ.');
+        return;
+      }
+      nextEmail = cleaned;
+    }
 
     if (role !== undefined) {
       if (ctx.userRole !== 'tenant_admin' || (role !== 'sale' && role !== 'manager')) {
@@ -599,6 +614,16 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
         }
       }
 
+      if (nextEmail) {
+        const dupEmailRes = await client.query<{ id: string }>(
+          'SELECT id FROM users WHERE tenant_id = $1 AND LOWER(email) = $2 AND id <> $3 LIMIT 1',
+          [ctx.tenantId, nextEmail, targetUserId]
+        );
+        if (dupEmailRes.rows.length > 0) {
+          throw new Error('EMAIL_ALREADY_EXISTS');
+        }
+      }
+
       const uUpd = await client.query<{
         full_name: string;
         role: 'tenant_admin' | 'manager' | 'sale';
@@ -618,6 +643,8 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
                ELSE role_id
              END,
              password_hash = COALESCE($8, password_hash),
+             email = COALESCE($9, email),
+             account_id = CASE WHEN $9::text IS NOT NULL THEN NULL ELSE account_id END,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2
          RETURNING full_name, role, is_external_agency`,
@@ -630,6 +657,7 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
           typeof is_external_agency === 'boolean' ? is_external_agency : null,
           role || null,
           passwordHash,
+          nextEmail,
         ]
       );
       const updatedUserRow = uUpd.rows[0] || null;
@@ -774,6 +802,10 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
     const msg = String(err?.message || '');
     if (msg.startsWith('INVALID_PHONE:')) {
       sendApiError(res, 422, 'INVALID_PHONE', msg.slice('INVALID_PHONE:'.length));
+      return;
+    }
+    if (msg === 'EMAIL_ALREADY_EXISTS') {
+      sendApiError(res, 409, 'EMAIL_ALREADY_EXISTS', 'Email nhân sự này đã tồn tại trong doanh nghiệp.');
       return;
     }
     sendApiError(res, 500, 'UPDATE_USER_FAILED', msg || 'Không thể cập nhật thông tin nhân sự.');
