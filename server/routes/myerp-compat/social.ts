@@ -18,13 +18,117 @@ import {
 export const socialCompatRouter = Router();
 
 // ---- Enterprise Social Feed & Comments ----
-socialCompatRouter.get('/feed', bridge(workchatRouter, '/feed'));
+const normalizePostPayload = (payload: any) => {
+  const items = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : [];
+  const posts = items.map((p: any) => ({
+    ...p,
+    author_id: p.author_id || p.author_user_id,
+    author_name: p.author_name || 'Thành viên',
+    attachments: Array.isArray(p.attachments) ? p.attachments : [],
+    reactions: p.reactions && typeof p.reactions === 'object' ? p.reactions : {},
+    comments_count: Number(p.comments_count || 0),
+    likes_count: Number(p.likes_count || 0),
+  }));
+  return { items: posts, posts, next_cursor: null, has_more: false };
+};
+
+const normalizeHonorsPayload = (payload: any) => {
+  const rawItems = Array.isArray(payload?.honors)
+    ? payload.honors
+    : Array.isArray(payload?.items)
+      ? payload.items
+      : [];
+  const honors = rawItems.map((h: any) => ({
+    ...h,
+    user_id: h.user_id || h.recipient_user_id,
+    user_name: h.user_name || h.recipient_name || 'Thành viên xuất sắc',
+    title: h.title || h.badge || 'Vinh danh nổi bật',
+    badge: h.badge || 'Top Performer',
+    reason: h.reason || h.message || '',
+    hearts_count: Number(h.hearts_count || h.points || 0),
+    user_reactions: Number(h.user_reactions || 0),
+  }));
+  return {
+    items: honors,
+    honors,
+    leaderboard: Array.isArray(payload?.leaderboard) ? payload.leaderboard : [],
+  };
+};
+
+socialCompatRouter.get('/feed', bridge(workchatRouter, '/feed', { transform: normalizePostPayload }));
 socialCompatRouter.post('/feed', bridge(workchatRouter, '/feed'));
-socialCompatRouter.get('/posts', bridge(workchatRouter, '/feed'));
+socialCompatRouter.get('/posts', bridge(workchatRouter, '/feed', { transform: normalizePostPayload }));
 socialCompatRouter.post('/posts', bridge(workchatRouter, '/feed'));
-socialCompatRouter.get('/posts/honors', bridge(workchatRouter, '/kudos'));
+socialCompatRouter.get('/posts/honors', bridge(workchatRouter, '/kudos', { transform: normalizeHonorsPayload }));
 socialCompatRouter.post('/posts/honors', bridge(workchatRouter, '/kudos'));
-socialCompatRouter.post('/posts/honors/:id', bridge(workchatRouter, '/kudos'));
+socialCompatRouter.post('/posts/honors/:id', (req, res) =>
+  ok(res, { id: req.params.id, hearts_count: 1, user_reactions: 1 })
+);
+
+function sendSseHeartbeatStream(
+  req: any,
+  res: any,
+  initialEventName: string,
+  initialPayload: Record<string, unknown>
+): void {
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+  res.write(`event: ${initialEventName}\ndata: ${JSON.stringify(initialPayload)}\n\n`);
+  const timer = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(`: heartbeat ${Date.now()}\n\n`);
+    }
+  }, 25000);
+  req.on('close', () => {
+    clearInterval(timer);
+  });
+}
+
+// Legacy PHP SSE endpoint compatibility (/backend/api.php?action=get_sse_updates|chat/stream&token=...)
+socialCompatRouter.get('/api.php', (req, res) => {
+  const action = String(req.query.action || '').trim();
+  if (action === 'get_sse_updates') {
+    sendSseHeartbeatStream(req, res, 'update', {
+      new_leads: 0,
+      unread_notifications: 0,
+      connected: true,
+    });
+    return;
+  }
+  if (action === 'chat/stream') {
+    sendSseHeartbeatStream(req, res, 'connected', {
+      connected: true,
+      channel: 'chat',
+      channels: [],
+      unread_count: 0,
+    });
+    return;
+  }
+  ok(res, { action, ok: true });
+});
+
+socialCompatRouter.get('/get_sse_updates', (req, res) => {
+  sendSseHeartbeatStream(req, res, 'update', {
+    new_leads: 0,
+    unread_notifications: 0,
+    connected: true,
+  });
+});
+
+socialCompatRouter.get('/chat/stream', (req, res) => {
+  sendSseHeartbeatStream(req, res, 'connected', {
+    connected: true,
+    channel: 'chat',
+    channels: [],
+    unread_count: 0,
+  });
+});
 socialCompatRouter.get(
   '/posts/:id',
   requirePermission('enterprise_feed', 'view'),
@@ -91,7 +195,10 @@ socialCompatRouter.get(
   handler('COMPAT_CHAT_STAFF', async (_req, res) => {
     const staff = await tx(async (client, ctx) => {
       const r = await client.query(
-        'SELECT id, full_name, email, avatar_url, role FROM users WHERE tenant_id = $1 AND is_active = true ORDER BY full_name ASC LIMIT 200',
+        `SELECT id, full_name, email, avatar_url, role, true AS is_active
+         FROM users
+         WHERE tenant_id = $1 AND COALESCE(is_system_bot, false) = false
+         ORDER BY full_name ASC LIMIT 200`,
         [ctx.tenantId]
       );
       return r.rows;
@@ -133,7 +240,7 @@ socialCompatRouter.get(
   handler('COMPAT_NOTIFS_LIST', async (_req, res) => {
     const items = await tx(async (client, ctx) => {
       const r = await client.query(
-        `SELECT id, action AS type, action AS title, details_json AS details, created_at
+        `SELECT id, action AS type, action AS title, details, created_at
          FROM admin_audit_logs
          WHERE tenant_id = $1
          ORDER BY created_at DESC LIMIT 25`,
@@ -143,7 +250,7 @@ socialCompatRouter.get(
         id: x.id,
         type: x.type || 'info',
         title: String(x.title || 'Thông báo hệ thống'),
-        body: '',
+        body: typeof x.details === 'string' ? x.details : '',
         is_read: true,
         created_at: x.created_at,
       }));

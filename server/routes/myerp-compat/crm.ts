@@ -97,7 +97,7 @@ crmCompatRouter.get(
   requirePermission('leads', 'view'),
   handler('COMPAT_CONTACTS_PERSONA', async (_req, res) => {
     const data = await tx(async (client, ctx) => {
-      const [stageRes, srcRes, totalRes] = await Promise.all([
+      const [stageRes, srcRes, ownerRes, rowsRes] = await Promise.all([
         client.query<{ stage: string; cnt: number }>(
           `SELECT COALESCE(s.stage_name, l.lifecycle_stage, 'Chưa phân loại') AS stage, COUNT(*)::int AS cnt
            FROM leads l
@@ -112,18 +112,182 @@ crmCompatRouter.get(
            GROUP BY source ORDER BY cnt DESC LIMIT 15`,
           [ctx.tenantId]
         ),
-        client.query<{ total: number; hot: number; qualified: number }>(
-          `SELECT COUNT(*)::int AS total,
-                  COALESCE(SUM(CASE WHEN lead_score >= 75 THEN 1 ELSE 0 END), 0)::int AS hot,
-                  COALESCE(SUM(CASE WHEN lifecycle_stage IN ('mql','sql','opportunity','customer') THEN 1 ELSE 0 END), 0)::int AS qualified
-           FROM leads WHERE tenant_id = $1 AND is_deleted = false`,
+        client.query<{ owner_id: string; label: string; email: string; avatar: string; count: number }>(
+          `SELECT l.assigned_to::text AS owner_id,
+                  COALESCE(u.full_name, 'Chưa phân công') AS label,
+                  COALESCE(u.email, '') AS email,
+                  COALESCE(u.avatar_url, '') AS avatar,
+                  COUNT(*)::int AS count
+           FROM leads l
+           LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
+           WHERE l.tenant_id = $1 AND l.is_deleted = false
+           GROUP BY l.assigned_to, u.full_name, u.email, u.avatar_url
+           ORDER BY count DESC LIMIT 25`,
+          [ctx.tenantId]
+        ),
+        client.query<{
+          id: string;
+          name: string;
+          phone: string | null;
+          email: string | null;
+          product_interest: string | null;
+          source: string | null;
+          campaign: string | null;
+          custom_fields: Record<string, any> | null;
+        }>(
+          `SELECT id, name, phone, email, product_interest, source, campaign, custom_fields
+           FROM leads WHERE tenant_id = $1 AND is_deleted = false
+           ORDER BY created_at DESC LIMIT 2000`,
           [ctx.tenantId]
         ),
       ]);
+
+      const rows = rowsRes.rows;
+      const total = rows.length;
+      let withPhone = 0;
+      let withEmail = 0;
+      let maleCount = 0;
+      let femaleCount = 0;
+      let withCompany = 0;
+      let withJobTitle = 0;
+      let withIndustry = 0;
+      let withIntake = 0;
+      let withBirthday = 0;
+      const companies = new Map<string, number>();
+      const programs = new Map<string, number>();
+      const intakes = new Map<string, number>();
+      const industries = new Map<string, number>();
+      const jobTitles = new Map<string, number>();
+      const cities = new Map<string, number>();
+      const uniqueEmails = new Set<string>();
+
+      for (const r of rows) {
+        const cf = r.custom_fields && typeof r.custom_fields === 'object' ? r.custom_fields : {};
+        if (r.phone && String(r.phone).trim()) withPhone++;
+        if (r.email && String(r.email).trim()) {
+          withEmail++;
+          uniqueEmails.add(String(r.email).trim().toLowerCase());
+        } else if (r.phone) {
+          uniqueEmails.add(String(r.phone).trim());
+        } else {
+          uniqueEmails.add(r.id);
+        }
+
+        const gender = String(cf.gender || cf.gioi_tinh || '').toLowerCase();
+        if (gender === 'male' || gender === 'nam' || gender === 'm') maleCount++;
+        else if (gender === 'female' || gender === 'nữ' || gender === 'nu' || gender === 'f') femaleCount++;
+
+        const prog = String(r.product_interest || cf.program || cf.school || 'Sản phẩm / Dịch vụ chung').trim();
+        programs.set(prog, (programs.get(prog) || 0) + 1);
+
+        const intake = String(cf.intake || r.campaign || '').trim();
+        if (intake) {
+          withIntake++;
+          intakes.set(intake, (intakes.get(intake) || 0) + 1);
+        }
+
+        const comp = String(cf.company || '').trim();
+        if (comp) {
+          withCompany++;
+          companies.set(comp, (companies.get(comp) || 0) + 1);
+        }
+
+        const jt = String(cf.job_title || cf.position || '').trim();
+        if (jt) {
+          withJobTitle++;
+          jobTitles.set(jt, (jobTitles.get(jt) || 0) + 1);
+        }
+
+        const ind = String(cf.industry || '').trim();
+        if (ind) {
+          withIndustry++;
+          industries.set(ind, (industries.get(ind) || 0) + 1);
+        }
+
+        const city = String(cf.city || cf.province || cf.area || '').trim();
+        if (city) {
+          cities.set(city, (cities.get(city) || 0) + 1);
+        }
+        if (cf.birthday || cf.dob) withBirthday++;
+      }
+
+      const toBreakdown = (m: Map<string, number>, limit = 12) =>
+        Array.from(m.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, limit)
+          .map(([label, count]) => ({
+            label,
+            count,
+            pct: total > 0 ? Math.round((count / total) * 100) : 0,
+          }));
+
+      const withGender = maleCount + femaleCount;
+      const unknownGenderCount = Math.max(0, total - withGender);
+      const byOwner = ownerRes.rows.map((o) => ({
+        ...o,
+        owner_id: o.owner_id || 'unassigned',
+        pct: total > 0 ? Math.round((o.count / total) * 100) : 0,
+      }));
+      const bySchoolProgram = toBreakdown(programs);
+      const byIntake = toBreakdown(intakes);
+      const byIndustry = toBreakdown(industries);
+      const topJobTitles = toBreakdown(jobTitles, 10);
+      const topCompanies = toBreakdown(companies, 10);
+      const byCity = toBreakdown(cities, 10);
+
       return {
+        segment: 'lead',
         by_stage: stageRes.rows,
         by_source: srcRes.rows,
-        summary: totalRes.rows[0] || { total: 0, hot: 0, qualified: 0 },
+        summary: {
+          total: total,
+          total_profiles: total,
+          unique_persons: uniqueEmails.size || total,
+          multi_course_persons: 0,
+          with_phone: withPhone,
+          with_email: withEmail,
+          with_gender: withGender,
+          male_count: maleCount,
+          female_count: femaleCount,
+          unknown_gender_count: unknownGenderCount,
+          avg_age: 0,
+          with_job_title: withJobTitle,
+          with_company: withCompany,
+          with_industry: withIndustry,
+          with_intake: withIntake,
+          with_birthday: withBirthday,
+          distinct_companies: companies.size,
+          distinct_intakes: intakes.size,
+          distinct_schools: programs.size,
+        },
+        by_school_program: bySchoolProgram,
+        by_intake: byIntake,
+        by_owner: byOwner,
+        by_gender: [
+          { label: 'Nam', count: maleCount, pct: total > 0 ? Math.round((maleCount / total) * 100) : 0 },
+          { label: 'Nữ', count: femaleCount, pct: total > 0 ? Math.round((femaleCount / total) * 100) : 0 },
+          { label: 'Chưa rõ', count: unknownGenderCount, pct: total > 0 ? Math.round((unknownGenderCount / total) * 100) : 0 },
+        ],
+        by_age_group: [],
+        by_job_group: [],
+        top_job_titles: topJobTitles,
+        by_industry: byIndustry,
+        top_companies: topCompanies,
+        by_city: byCity,
+        multi_course_students: [],
+        data_completeness: [
+          { field: 'phone', label: 'Số điện thoại', filled: withPhone, total, pct: total > 0 ? Math.round((withPhone / total) * 100) : 0 },
+          { field: 'email', label: 'Email', filled: withEmail, total, pct: total > 0 ? Math.round((withEmail / total) * 100) : 0 },
+          { field: 'product_interest', label: 'Sản phẩm quan tâm', filled: total - (programs.get('Sản phẩm / Dịch vụ chung') || 0), total, pct: total > 0 ? Math.round(((total - (programs.get('Sản phẩm / Dịch vụ chung') || 0)) / total) * 100) : 0 },
+          { field: 'company', label: 'Công ty / Tổ chức', filled: withCompany, total, pct: total > 0 ? Math.round((withCompany / total) * 100) : 0 },
+        ],
+        filter_options: {
+          schools: bySchoolProgram.map((x) => ({ value: x.label, label: x.label, count: x.count })),
+          intakes: byIntake.map((x) => ({ value: x.label, label: x.label, count: x.count })),
+          owners: byOwner.map((o) => ({ value: o.owner_id, label: o.label, avatar: o.avatar, count: o.count })),
+          job_groups: [],
+          industries: byIndustry.map((x) => ({ value: x.label, label: x.label, count: x.count })),
+        },
       };
     });
     ok(res, data);

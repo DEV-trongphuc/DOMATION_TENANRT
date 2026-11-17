@@ -102,6 +102,10 @@ campaignsRouter.get('/ses-quota', requirePermission('mkt_campaigns', 'view'), as
       const bounceRatePct = sentCnt > 0 ? Number(((bounceCnt / sentCnt) * 100).toFixed(2)) : 0;
       const complaintRatePct = sentCnt > 0 ? Number(((unsubCnt / sentCnt) * 100).toFixed(2)) : 0;
 
+      const remaining24h = Math.max(0, max24hSend - sentCnt);
+      const usagePct = max24hSend > 0 ? Number(Math.min(100, (sentCnt / max24hSend) * 100).toFixed(1)) : 0;
+      const reputationStatus = bounceRatePct >= 5 ? 'at_risk' : bounceRatePct >= 2 ? 'warning' : 'healthy';
+
       return {
         configured: vault.configured,
         provider: vault.integrationType || 'sandbox',
@@ -109,12 +113,29 @@ campaignsRouter.get('/ses-quota', requirePermission('mkt_campaigns', 'view'), as
         from_email: String(vault.config.from_email || vault.config.fromEmail || ''),
         max_24h_send: max24hSend,
         sent_last_24h: sentCnt,
-        remaining_24h: Math.max(0, max24hSend - sentCnt),
-        usage_pct: max24hSend > 0 ? Number(Math.min(100, (sentCnt / max24hSend) * 100).toFixed(1)) : 0,
+        remaining_24h: remaining24h,
+        usage_pct: usagePct,
         max_send_rate_per_sec: maxSendRate,
         bounce_rate_pct: bounceRatePct,
         complaint_rate_pct: complaintRatePct,
-        reputation_status: bounceRatePct >= 5 ? 'at_risk' : bounceRatePct >= 2 ? 'warning' : 'healthy',
+        reputation_status: reputationStatus,
+        is_ses: vault.integrationType === 'aws_ses',
+        region: String(vault.config.region || vault.config.aws_region || 'ap-southeast-1'),
+        smtp_host: String(vault.config.smtp_host || vault.config.host || ''),
+        overall_status: !vault.configured ? 'not_configured' : reputationStatus,
+        local: {
+          sent_1h: 0,
+          max_per_hour: max24hSend,
+          limit_per_hour: max24hSend,
+        },
+        aws: {
+          remaining: remaining24h,
+          usage_pct: usagePct,
+          max_24h: max24hSend,
+          sent_24h: sentCnt,
+          max_rate: maxSendRate,
+          is_fallback: !vault.configured,
+        },
         spf_verified: Boolean(vault.config.spf_verified ?? vault.configured),
         dkim_verified: Boolean(vault.config.dkim_verified ?? vault.configured),
         dmarc_verified: Boolean(vault.config.dmarc_verified ?? vault.configured),

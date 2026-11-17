@@ -90,6 +90,8 @@ contacts360Router.get(
       const lifecycleStage = String(req.query.lifecycle_stage || '').trim();
       const pipelineId = String(req.query.pipeline_id || '').trim();
       const stageId = String(req.query.stage_id || '').trim();
+      const stageSlug = String(req.query.stage_slug || '').trim().toLowerCase();
+      const leadStatusFilter = String(req.query.lead_status || '').trim().toLowerCase();
       const ownerId = String(req.query.owner_id || '').trim();
       const companyId = String(req.query.company_id || '').trim();
       const tagFilter = String(req.query.tag || '').trim();
@@ -119,6 +121,7 @@ contacts360Router.get(
               uncontacted_count: 0,
               total_revenue_vnd: 0,
             },
+            stage_counts: { all: 0, lost: 0, won: 0, nurture: 0, uncontacted: 0 },
             pipelines: [],
             stages: [],
             tags: [],
@@ -162,8 +165,35 @@ contacts360Router.get(
           pIdx++;
         }
         if (stageId) {
-          conds.push(`l.stage_id = $${pIdx}`);
-          vals.push(stageId);
+          const isStageUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(stageId);
+          if (isStageUuid) {
+            conds.push(`l.stage_id = $${pIdx}`);
+            vals.push(stageId);
+            pIdx++;
+          } else {
+            const stLow = stageId.toLowerCase();
+            if (stLow === 'nurture') {
+              conds.push(`(LOWER(COALESCE(l.status, '')) IN ('nurture', 're_nurture', 'nurturing') OR EXISTS (SELECT 1 FROM tenant_pipeline_stages ps_f WHERE ps_f.tenant_id = l.tenant_id AND ps_f.id = l.stage_id AND LOWER(COALESCE(ps_f.stage_key, '')) LIKE '%nurture%'))`);
+            } else if (stLow === 'lost') {
+              conds.push(`(LOWER(COALESCE(l.status, '')) IN ('lost', 'unqualified') OR EXISTS (SELECT 1 FROM tenant_pipeline_stages ps_f WHERE ps_f.tenant_id = l.tenant_id AND ps_f.id = l.stage_id AND (ps_f.is_lost_stage = true OR LOWER(COALESCE(ps_f.stage_key, '')) = 'lost')))`);
+            } else {
+              conds.push(`EXISTS (SELECT 1 FROM tenant_pipeline_stages ps_f WHERE ps_f.tenant_id = l.tenant_id AND ps_f.id = l.stage_id AND LOWER(COALESCE(ps_f.stage_key, '')) = $${pIdx})`);
+              vals.push(stLow);
+              pIdx++;
+            }
+          }
+        } else if (stageSlug) {
+          conds.push(`EXISTS (SELECT 1 FROM tenant_pipeline_stages ps_f WHERE ps_f.tenant_id = l.tenant_id AND ps_f.id = l.stage_id AND LOWER(COALESCE(ps_f.stage_key, '')) = $${pIdx})`);
+          vals.push(stageSlug);
+          pIdx++;
+        }
+        if (leadStatusFilter === 'nurture') {
+          conds.push(`(LOWER(COALESCE(l.status, '')) IN ('nurture', 're_nurture', 'nurturing') OR EXISTS (SELECT 1 FROM tenant_pipeline_stages ps_f WHERE ps_f.tenant_id = l.tenant_id AND ps_f.id = l.stage_id AND LOWER(COALESCE(ps_f.stage_key, '')) LIKE '%nurture%'))`);
+        } else if (leadStatusFilter === 'lost') {
+          conds.push(`(LOWER(COALESCE(l.status, '')) IN ('lost', 'unqualified') OR EXISTS (SELECT 1 FROM tenant_pipeline_stages ps_f WHERE ps_f.tenant_id = l.tenant_id AND ps_f.id = l.stage_id AND (ps_f.is_lost_stage = true OR LOWER(COALESCE(ps_f.stage_key, '')) = 'lost')))`);
+        } else if (leadStatusFilter && leadStatusFilter !== 'all') {
+          conds.push(`LOWER(COALESCE(l.status, '')) = $${pIdx}`);
+          vals.push(leadStatusFilter);
           pIdx++;
         }
         if (ownerId) {
@@ -206,7 +236,7 @@ contacts360Router.get(
 
         const whereStr = conds.join(' AND ');
 
-        const [kpiRes, rowsRes, pipelinesRes, stagesRes, tagsRes, staffRes, companiesRes] =
+        const [kpiRes, rowsRes, pipelinesRes, stagesRes, stageStatsRes, tagsRes, staffRes, companiesRes] =
           await Promise.all([
             client.query<{
               total_contacts: string | number;
@@ -250,6 +280,26 @@ contacts360Router.get(
             client.query(
               'SELECT id, pipeline_id, stage_key, stage_name, color_hex, stage_order, is_won_stage, is_lost_stage FROM tenant_pipeline_stages WHERE tenant_id = $1 ORDER BY stage_order ASC',
               [ctx.tenantId]
+            ),
+            client.query<{
+              stage_id: string | null;
+              status: string | null;
+              lifecycle_stage: string | null;
+              is_accepted: boolean | null;
+              never_engaged: number;
+              cnt: string | number;
+            }>(
+              `SELECT l.stage_id,
+                      l.status,
+                      l.lifecycle_stage,
+                      l.is_accepted,
+                      CASE WHEN l.last_engaged_at IS NULL THEN 1 ELSE 0 END AS never_engaged,
+                      COUNT(*)::int AS cnt
+               FROM leads l
+               WHERE ${scopeSql.clause} AND l.is_deleted = false
+               GROUP BY l.stage_id, l.status, l.lifecycle_stage, l.is_accepted,
+                        CASE WHEN l.last_engaged_at IS NULL THEN 1 ELSE 0 END`,
+              scopeSql.values
             ),
             client.query(
               'SELECT id, name, slug, color_hex, category FROM tenant_tags WHERE tenant_id = $1 ORDER BY name ASC',
@@ -300,6 +350,52 @@ contacts360Router.get(
           };
         });
 
+        const stageCounts: Record<string, number> = {
+          all: 0,
+          lost: 0,
+          won: 0,
+          nurture: 0,
+          uncontacted: 0,
+        };
+        const stageById = new Map<string, any>();
+        for (const st of stagesRes.rows) {
+          const stId = String(st.id);
+          stageById.set(stId, st);
+          stageCounts[stId] = 0;
+          if (st.stage_key) {
+            stageCounts[String(st.stage_key)] = 0;
+          }
+        }
+        for (const row of stageStatsRes.rows) {
+          const cnt = Number(row.cnt || 0);
+          if (cnt <= 0) continue;
+          stageCounts.all += cnt;
+          const st = row.stage_id ? stageById.get(String(row.stage_id)) : null;
+          if (st) {
+            const stId = String(st.id);
+            stageCounts[stId] = (stageCounts[stId] || 0) + cnt;
+            if (st.stage_key) {
+              const sk = String(st.stage_key);
+              stageCounts[sk] = (stageCounts[sk] || 0) + cnt;
+            }
+          }
+          const stKeyLow = String(st?.stage_key || '').toLowerCase();
+          const leadStLow = String(row.status || '').toLowerCase();
+          const lifeLow = String(row.lifecycle_stage || '').toLowerCase();
+          if (Boolean(st?.is_lost_stage) || leadStLow === 'lost' || leadStLow === 'unqualified' || stKeyLow === 'lost') {
+            stageCounts.lost += cnt;
+          }
+          if (Boolean(st?.is_won_stage) || ['won', 'customer', 'enrolled'].includes(leadStLow) || ['customer', 'evangelist'].includes(lifeLow)) {
+            stageCounts.won += cnt;
+          }
+          if (['nurture', 're_nurture', 'nurturing'].includes(leadStLow) || stKeyLow.includes('nurture')) {
+            stageCounts.nurture += cnt;
+          }
+          if (Number(row.never_engaged || 0) === 1 && !row.is_accepted) {
+            stageCounts.uncontacted += cnt;
+          }
+        }
+
         const kRow = kpiRes.rows[0];
         return {
           items,
@@ -314,6 +410,7 @@ contacts360Router.get(
             uncontacted_count: Number(kRow?.uncontacted_count || 0),
             total_revenue_vnd: Number(kRow?.total_revenue_vnd || 0),
           },
+          stage_counts: stageCounts,
           pipelines: pipelinesRes.rows,
           stages: stagesRes.rows,
           tags: tagsRes.rows,

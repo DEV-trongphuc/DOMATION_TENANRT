@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { getDatabasePool, type DbClient } from '../../core/database/db-adapter.ts';
 import { withSystemPrivilege } from '../../core/database/transaction.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import { sendApiError } from '../../core/security/rbac.ts';
 
 const initializedPools = new WeakSet<object>();
@@ -111,13 +112,15 @@ async function runPostgresHrmApprovalsDdl(client: DbClient): Promise<void> {
       code VARCHAR(80) NOT NULL,
       name VARCHAR(200) NOT NULL,
       description TEXT,
-      category VARCHAR(40) NOT NULL DEFAULT 'leave'
-        CHECK (category IN ('leave', 'overtime', 'cash_advance', 'expense', 'purchase_order', 'sales_order', 'contract', 'custom_form', 'attendance_explanation')),
+      category VARCHAR(40) NOT NULL DEFAULT 'leave',
+      category_label VARCHAR(120),
       form_schema JSONB NOT NULL DEFAULT '[]'::jsonb,
       icon_name VARCHAR(60) NOT NULL DEFAULT 'FileCheck',
       color_hex VARCHAR(20) NOT NULL DEFAULT '#1E40FF',
       require_attachment BOOLEAN NOT NULL DEFAULT false,
       auto_approve_if_creator_is_approver BOOLEAN NOT NULL DEFAULT true,
+      default_watcher_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      default_watcher_roles JSONB NOT NULL DEFAULT '[]'::jsonb,
       is_active BOOLEAN NOT NULL DEFAULT true,
       created_by UUID,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -125,6 +128,10 @@ async function runPostgresHrmApprovalsDdl(client: DbClient): Promise<void> {
       CONSTRAINT uk_tenant_approval_workflows_tenant_id UNIQUE (tenant_id, id),
       CONSTRAINT uk_tenant_approval_workflows_code UNIQUE (tenant_id, code)
     );
+    ALTER TABLE tenant_approval_workflows DROP CONSTRAINT IF EXISTS tenant_approval_workflows_category_check;
+    ALTER TABLE tenant_approval_workflows ADD COLUMN IF NOT EXISTS category_label VARCHAR(120);
+    ALTER TABLE tenant_approval_workflows ADD COLUMN IF NOT EXISTS default_watcher_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_approval_workflows ADD COLUMN IF NOT EXISTS default_watcher_roles JSONB NOT NULL DEFAULT '[]'::jsonb;
     CREATE INDEX IF NOT EXISTS idx_appr_wf_tenant_cat ON tenant_approval_workflows(tenant_id, category, is_active);
 
     CREATE TABLE IF NOT EXISTS tenant_approval_workflow_steps (
@@ -875,6 +882,9 @@ async function runPostgresHrmApprovalsDdl(client: DbClient): Promise<void> {
 
 async function runMariaDbHrmApprovalsDdl(client: DbClient): Promise<void> {
   await addMariaDbColumnSafe(client, 'tenant_branches', 'manager_user_id', 'VARCHAR(36) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_approval_workflows', 'category_label', 'VARCHAR(120) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_approval_workflows', 'default_watcher_ids', 'JSON NULL');
+  await addMariaDbColumnSafe(client, 'tenant_approval_workflows', 'default_watcher_roles', 'JSON NULL');
 
   const statements = [
     `CREATE TABLE IF NOT EXISTS tenant_approval_workflows (
@@ -884,11 +894,14 @@ async function runMariaDbHrmApprovalsDdl(client: DbClient): Promise<void> {
       name VARCHAR(200) NOT NULL,
       description TEXT NULL,
       category VARCHAR(40) NOT NULL DEFAULT 'leave',
+      category_label VARCHAR(120) NULL,
       form_schema JSON NOT NULL,
       icon_name VARCHAR(60) NOT NULL DEFAULT 'FileCheck',
       color_hex VARCHAR(20) NOT NULL DEFAULT '#1E40FF',
       require_attachment TINYINT(1) NOT NULL DEFAULT 0,
       auto_approve_if_creator_is_approver TINYINT(1) NOT NULL DEFAULT 1,
+      default_watcher_ids JSON NULL,
+      default_watcher_roles JSON NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       created_by VARCHAR(36) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -1502,131 +1515,150 @@ export async function ensureHrmApprovalsSchemaMiddleware(
   }
 }
 
+export const DEFAULT_APPROVAL_WORKFLOW_TEMPLATES = [
+  {
+    code: 'WF_LEAVE_STANDARD',
+    name: 'Đơn xin nghỉ phép / Nghỉ việc riêng',
+    description: 'Luồng phê duyệt nghỉ phép tự động định tuyến đến Trưởng phòng / Quản lý trực tiếp.',
+    category: 'leave',
+    category_label: 'Nghỉ phép',
+    color_hex: '#1E40FF',
+    icon_name: 'Calendar',
+    form_schema: [
+      {
+        key: 'leave_type',
+        label: 'Loại nghỉ phép',
+        type: 'select',
+        required: true,
+        options: ['Nghỉ phép năm (hưởng nguyên lương)', 'Nghỉ bù tăng ca', 'Nghỉ việc riêng không lương', 'Nghỉ chế độ BHXH'],
+      },
+      { key: 'total_days', label: 'Số ngày nghỉ', type: 'number', required: true },
+      { key: 'handover_person', label: 'Người nhận bàn giao công việc', type: 'text', required: false },
+    ],
+    steps: [
+      {
+        step_order: 1,
+        step_name: 'Trưởng bộ phận duyệt công việc',
+        approver_type: 'department_head',
+        min_amount_threshold: 0,
+        max_amount_threshold: null,
+        approval_mode: 'any_one',
+        fallback_strategy: 'tenant_admin',
+        sla_hours: 24,
+      },
+    ],
+  },
+  {
+    code: 'WF_EXPENSE_MULTI_STEP',
+    name: 'Đề nghị thanh toán / Tạm ứng chi phí',
+    description: 'Luồng phê duyệt đa cấp tự động kích hoạt cấp Giám đốc Chi nhánh theo ngưỡng số tiền cấu hình.',
+    category: 'expense',
+    category_label: 'Chi phí & Thanh toán',
+    color_hex: '#0284C7',
+    icon_name: 'Receipt',
+    form_schema: [
+      {
+        key: 'expense_category',
+        label: 'Khoản mục chi phí',
+        type: 'select',
+        required: true,
+        options: ['Chi phí vận hành', 'Chi phí Marketing / Sự kiện', 'Công tác phí', 'Mua sắm thiết bị', 'Thanh toán nhà cung cấp'],
+      },
+      { key: 'beneficiary_bank', label: 'Ngân hàng thụ hưởng', type: 'text', required: false },
+      { key: 'beneficiary_account', label: 'Số tài khoản nhận', type: 'text', required: false },
+    ],
+    steps: [
+      {
+        step_order: 1,
+        step_name: 'Trưởng phòng xác nhận nghiệp vụ',
+        approver_type: 'department_head',
+        min_amount_threshold: 0,
+        max_amount_threshold: null,
+        approval_mode: 'any_one',
+        fallback_strategy: 'escalate_parent_dept',
+        sla_hours: 24,
+      },
+      {
+        step_order: 2,
+        step_name: 'Giám đốc Chi nhánh phê duyệt ngân sách',
+        approver_type: 'branch_director',
+        min_amount_threshold: 10000000,
+        max_amount_threshold: null,
+        approval_mode: 'any_one',
+        fallback_strategy: 'tenant_admin',
+        sla_hours: 48,
+      },
+    ],
+  },
+  {
+    code: 'WF_OVERTIME_REQUEST',
+    name: 'Đăng ký làm thêm giờ (OT)',
+    description: 'Xác nhận giờ tăng ca để tự động đồng bộ vào Bảng công & Bảng lương cuối kỳ.',
+    category: 'overtime',
+    category_label: 'Tăng ca (OT)',
+    color_hex: '#059669',
+    icon_name: 'Clock',
+    form_schema: [
+      { key: 'ot_hours', label: 'Số giờ đăng ký OT', type: 'number', required: true },
+      {
+        key: 'ot_day_type',
+        label: 'Loại ngày làm thêm',
+        type: 'select',
+        required: true,
+        options: ['Ngày thường (150%)', 'Ngày nghỉ hàng tuần (200%)', 'Ngày Lễ / Tết (300%)'],
+      },
+    ],
+    steps: [
+      {
+        step_order: 1,
+        step_name: 'Quản lý trực tiếp xác nhận OT',
+        approver_type: 'direct_manager',
+        min_amount_threshold: 0,
+        max_amount_threshold: null,
+        approval_mode: 'any_one',
+        fallback_strategy: 'tenant_admin',
+        sla_hours: 16,
+      },
+    ],
+  },
+];
+
 /**
- * Seeds default dynamic approval workflows per tenant ONLY when the tenant has 0 workflows.
- * 100% configurable in DB, zero hardcoded person IDs or fixed thresholds.
+ * Seeds default dynamic approval workflows per tenant ONLY on initial bootstrap
+ * when `approvals_custom_mode`, `approvals_custom_only`, `approvals_initialized`,
+ * and `approvals_starter_dismissed` are all unset and workflow count is 0.
+ * Once deleted or switched to custom mode, starter workflows are NEVER auto-reseeded.
  */
 export async function ensureDefaultApprovalWorkflowsInTx(
   client: DbClient,
   tenantId: string
 ): Promise<void> {
+  const tenantRes = await client.query<{ slug: string; settings: unknown }>(
+    'SELECT slug, settings FROM tenants WHERE id = $1 LIMIT 1',
+    [tenantId]
+  );
+  const tenantRow = tenantRes.rows[0];
+  const rawSettings = parseJsonSafe<Record<string, unknown>>(tenantRow?.settings, {});
+  if (
+    rawSettings.approvals_custom_only === true ||
+    rawSettings.approvals_custom_mode === true ||
+    rawSettings.approvals_initialized === true ||
+    rawSettings.approvals_starter_dismissed === true
+  ) {
+    return;
+  }
   const cntRes = await client.query<{ cnt: number }>(
     'SELECT COUNT(*)::int AS cnt FROM tenant_approval_workflows WHERE tenant_id = $1',
     [tenantId]
   );
   if (Number(cntRes.rows[0]?.cnt || 0) > 0) return;
 
-  const templates = [
-    {
-      code: 'WF_LEAVE_STANDARD',
-      name: 'Đơn xin nghỉ phép / Nghỉ việc riêng',
-      description: 'Luồng phê duyệt nghỉ phép tự động định tuyến đến Trưởng phòng / Quản lý trực tiếp.',
-      category: 'leave',
-      color_hex: '#1E40FF',
-      icon_name: 'Calendar',
-      form_schema: [
-        {
-          key: 'leave_type',
-          label: 'Loại nghỉ phép',
-          type: 'select',
-          required: true,
-          options: ['Nghỉ phép năm (hưởng nguyên lương)', 'Nghỉ bù tăng ca', 'Nghỉ việc riêng không lương', 'Nghỉ chế độ BHXH'],
-        },
-        { key: 'total_days', label: 'Số ngày nghỉ', type: 'number', required: true },
-        { key: 'handover_person', label: 'Người nhận bàn giao công việc', type: 'text', required: false },
-      ],
-      steps: [
-        {
-          step_order: 1,
-          step_name: 'Trưởng bộ phận duyệt công việc',
-          approver_type: 'department_head',
-          min_amount_threshold: 0,
-          max_amount_threshold: null,
-          approval_mode: 'any_one',
-          fallback_strategy: 'tenant_admin',
-          sla_hours: 24,
-        },
-      ],
-    },
-    {
-      code: 'WF_EXPENSE_MULTI_STEP',
-      name: 'Đề nghị thanh toán / Tạm ứng chi phí',
-      description: 'Luồng phê duyệt đa cấp tự động kích hoạt cấp Giám đốc Chi nhánh theo ngưỡng số tiền cấu hình.',
-      category: 'expense',
-      color_hex: '#0284C7',
-      icon_name: 'Receipt',
-      form_schema: [
-        {
-          key: 'expense_category',
-          label: 'Khoản mục chi phí',
-          type: 'select',
-          required: true,
-          options: ['Chi phí vận hành', 'Chi phí Marketing / Sự kiện', 'Công tác phí', 'Mua sắm thiết bị', 'Thanh toán nhà cung cấp'],
-        },
-        { key: 'beneficiary_bank', label: 'Ngân hàng thụ hưởng', type: 'text', required: false },
-        { key: 'beneficiary_account', label: 'Số tài khoản nhận', type: 'text', required: false },
-      ],
-      steps: [
-        {
-          step_order: 1,
-          step_name: 'Trưởng phòng xác nhận nghiệp vụ',
-          approver_type: 'department_head',
-          min_amount_threshold: 0,
-          max_amount_threshold: null,
-          approval_mode: 'any_one',
-          fallback_strategy: 'escalate_parent_dept',
-          sla_hours: 24,
-        },
-        {
-          step_order: 2,
-          step_name: 'Giám đốc Chi nhánh phê duyệt ngân sách',
-          approver_type: 'branch_director',
-          min_amount_threshold: 10000000,
-          max_amount_threshold: null,
-          approval_mode: 'any_one',
-          fallback_strategy: 'tenant_admin',
-          sla_hours: 48,
-        },
-      ],
-    },
-    {
-      code: 'WF_OVERTIME_REQUEST',
-      name: 'Đăng ký làm thêm giờ (OT)',
-      description: 'Xác nhận giờ tăng ca để tự động đồng bộ vào Bảng công & Bảng lương cuối kỳ.',
-      category: 'overtime',
-      color_hex: '#059669',
-      icon_name: 'Clock',
-      form_schema: [
-        { key: 'ot_hours', label: 'Số giờ đăng ký OT', type: 'number', required: true },
-        {
-          key: 'ot_day_type',
-          label: 'Loại ngày làm thêm',
-          type: 'select',
-          required: true,
-          options: ['Ngày thường (150%)', 'Ngày nghỉ hàng tuần (200%)', 'Ngày Lễ / Tết (300%)'],
-        },
-      ],
-      steps: [
-        {
-          step_order: 1,
-          step_name: 'Quản lý trực tiếp xác nhận OT',
-          approver_type: 'direct_manager',
-          min_amount_threshold: 0,
-          max_amount_threshold: null,
-          approval_mode: 'any_one',
-          fallback_strategy: 'tenant_admin',
-          sla_hours: 16,
-        },
-      ],
-    },
-  ];
-
-  for (const tpl of templates) {
+  for (const tpl of DEFAULT_APPROVAL_WORKFLOW_TEMPLATES) {
     const wfId = crypto.randomUUID();
     await client.query(
       `INSERT INTO tenant_approval_workflows (
-         id, tenant_id, code, name, description, category, form_schema, icon_name, color_hex, is_active
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, true)`,
+         id, tenant_id, code, name, description, category, category_label, form_schema, icon_name, color_hex, is_active
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, true)`,
       [
         wfId,
         tenantId,
@@ -1634,6 +1666,7 @@ export async function ensureDefaultApprovalWorkflowsInTx(
         tpl.name,
         tpl.description,
         tpl.category,
+        tpl.category_label,
         JSON.stringify(tpl.form_schema),
         tpl.icon_name,
         tpl.color_hex,
@@ -1661,6 +1694,22 @@ export async function ensureDefaultApprovalWorkflowsInTx(
         ]
       );
     }
+  }
+
+  const nextSettings = { ...rawSettings, approvals_initialized: true };
+  if (client.dialect === 'mariadb') {
+    await client.query(
+      'UPDATE tenants SET settings = $2, updated_at = CURRENT_TIMESTAMP(6) WHERE id = $1',
+      [tenantId, JSON.stringify(nextSettings)]
+    );
+  } else {
+    await client.query(
+      'UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1',
+      [tenantId, JSON.stringify(nextSettings)]
+    );
+  }
+  if (tenantRow?.slug) {
+    tenantRedis.invalidateTenantCache(tenantId, tenantRow.slug);
   }
 }
 

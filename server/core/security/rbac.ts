@@ -1190,12 +1190,32 @@ export function extractRequestedTenantSlug(req: Request): string | null {
 export async function requireTenantAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.header('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    const xAuthToken = req.header('X-Auth-Token');
+    const queryToken = typeof req.query?.token === 'string' ? req.query.token.trim() : '';
+    const actionQuery = String(req.query?.action || '').trim();
+    const isSseQueryAuth =
+      Boolean(queryToken) &&
+      (req.path === '/api.php' ||
+        req.path.includes('sse') ||
+        req.path.endsWith('/chat/stream') ||
+        actionQuery === 'get_sse_updates' ||
+        actionQuery === 'chat/stream');
+    const bearerMatch = authHeader ? authHeader.match(/^\s*Bearer\s+(.+)$/i) : null;
+    let token = '';
+    if (bearerMatch && bearerMatch[1]) {
+      token = bearerMatch[1].trim();
+    } else if (xAuthToken && xAuthToken.trim()) {
+      token = xAuthToken.trim();
+    } else if (isSseQueryAuth) {
+      token = queryToken;
+    } else if (tenantStorage.getStore()) {
+      next();
+      return;
+    } else {
       sendApiError(res, 401, 'AUTHENTICATION_REQUIRED', 'Vui lòng đăng nhập để truy cập tài nguyên này.');
       return;
     }
 
-    const token = authHeader.slice(7).trim();
     let claims;
     try {
       claims = verifyTenantAccessToken(token);

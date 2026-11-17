@@ -242,7 +242,7 @@ financeCompatRouter.get(
                 COALESCE(SUM(l.total_revenue_vnd), 0)::bigint AS revenue_vnd
          FROM users u
          LEFT JOIN leads l ON l.tenant_id = u.tenant_id AND l.assigned_to = u.id AND l.is_deleted = false
-         WHERE u.tenant_id = $1 AND u.is_active = true
+         WHERE u.tenant_id = $1 AND COALESCE(u.is_system_bot, false) = false
          GROUP BY u.id, u.full_name, u.avatar_url
          ORDER BY revenue_vnd DESC, lead_count DESC LIMIT 20`,
         [ctx.tenantId]

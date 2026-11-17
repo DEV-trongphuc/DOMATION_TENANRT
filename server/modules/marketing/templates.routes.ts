@@ -23,19 +23,29 @@ export const templatesRouter = Router();
 templatesRouter.use(requireEntitlement('mkt_templates'));
 
 function mapTemplateRow(row: Record<string, unknown>) {
+  const bodyStyleObj = parseJsonCol<EmailBodyStyleDto>(row.body_style, {});
+  const compiledHtml = String(row.compiled_html || '');
+  const savedBlocks = parseJsonCol<EmailBlockDto[]>(row.saved_blocks_json, []);
+  const groupId = row.group_id ? String(row.group_id) : null;
+  const groupName = row.group_name ? String(row.group_name) : null;
   return {
     id: String(row.id),
     tenant_id: String(row.tenant_id),
-    group_id: row.group_id ? String(row.group_id) : null,
-    group_name: row.group_name ? String(row.group_name) : null,
+    group_id: groupId,
+    groupId,
+    group_name: groupName,
+    groupName,
     name: String(row.name || ''),
     subject: String(row.subject || ''),
     preheader: String(row.preheader || ''),
     category: String(row.category || 'general'),
     blocks: parseJsonCol<EmailBlockDto[]>(row.blocks_json, []),
-    saved_blocks: parseJsonCol<EmailBlockDto[]>(row.saved_blocks_json, []),
-    body_style: parseJsonCol<EmailBodyStyleDto>(row.body_style, {}),
-    compiled_html: String(row.compiled_html || ''),
+    saved_blocks: savedBlocks,
+    savedBlocks,
+    body_style: bodyStyleObj,
+    bodyStyle: bodyStyleObj,
+    compiled_html: compiledHtml,
+    htmlContent: compiledHtml,
     thumbnail_url: row.thumbnail_url ? String(row.thumbnail_url) : null,
     spam_score: Number(row.spam_score || 0),
     merge_tags: parseJsonCol<string[]>(row.merge_tags, []),
@@ -44,6 +54,7 @@ function mapTemplateRow(row: Record<string, unknown>) {
     created_by: row.created_by ? String(row.created_by) : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    lastModified: row.updated_at || row.created_at,
   };
 }
 
@@ -179,7 +190,8 @@ templatesRouter.delete('/groups/:id', requirePermission('mkt_templates', 'delete
 templatesRouter.post('/compile', requirePermission('mkt_templates', 'view'), async (req, res) => {
   try {
     const blocks: EmailBlockDto[] = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
-    const bodyStyle: EmailBodyStyleDto = req.body?.body_style && typeof req.body.body_style === 'object' ? req.body.body_style : {};
+    const rawStyle = req.body?.body_style ?? req.body?.bodyStyle;
+    const bodyStyle: EmailBodyStyleDto = rawStyle && typeof rawStyle === 'object' ? rawStyle : {};
     const subject = String(req.body?.subject || '');
     const title = String(req.body?.name || subject || 'DOMATION Email');
 
@@ -203,12 +215,14 @@ templatesRouter.post('/validate', requirePermission('mkt_templates', 'view'), as
   try {
     const ctx = getTenantContext();
     const blocks: EmailBlockDto[] = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
+    const rawStyleValidate = req.body?.body_style ?? req.body?.bodyStyle;
     const bodyStyle: EmailBodyStyleDto =
-      req.body?.body_style && typeof req.body.body_style === 'object' ? req.body.body_style : {};
+      rawStyleValidate && typeof rawStyleValidate === 'object' ? rawStyleValidate : {};
     const subject = String(req.body?.subject || '');
+    const rawHtmlValidate = req.body?.compiled_html ?? req.body?.htmlContent;
     const compiledHtml =
-      typeof req.body?.compiled_html === 'string' && req.body.compiled_html.trim()
-        ? req.body.compiled_html
+      typeof rawHtmlValidate === 'string' && rawHtmlValidate.trim()
+        ? rawHtmlValidate
         : compileEmailBlocksToHtml(blocks, bodyStyle, subject || 'DOMATION Email');
 
     const spam = analyzeEmailSpamScore(subject, blocks, compiledHtml);
@@ -616,16 +630,19 @@ templatesRouter.post('/', requirePermission('mkt_templates', 'create'), async (r
     const subject = String(req.body?.subject || name).trim();
     const preheader = String(req.body?.preheader || '').trim();
     const category = String(req.body?.category || 'general').trim();
-    const groupId = req.body?.group_id ? String(req.body.group_id) : null;
+    const rawGroupCreate = req.body?.group_id ?? req.body?.groupId;
+    const groupId = rawGroupCreate ? String(rawGroupCreate) : null;
     const visibility = String(req.body?.visibility || 'company');
     const status = String(req.body?.status || 'active');
     const blocks: EmailBlockDto[] = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
+    const rawStyleCreate = req.body?.body_style ?? req.body?.bodyStyle;
     const bodyStyle: EmailBodyStyleDto =
-      req.body?.body_style && typeof req.body.body_style === 'object' ? req.body.body_style : {};
+      rawStyleCreate && typeof rawStyleCreate === 'object' ? rawStyleCreate : {};
 
+    const rawHtmlCreate = req.body?.compiled_html ?? req.body?.htmlContent;
     const compiledHtml =
-      typeof req.body?.compiled_html === 'string' && req.body.compiled_html.trim()
-        ? req.body.compiled_html
+      typeof rawHtmlCreate === 'string' && rawHtmlCreate.trim()
+        ? rawHtmlCreate
         : compileEmailBlocksToHtml(blocks, bodyStyle, subject || name);
     const spam = analyzeEmailSpamScore(subject, blocks, compiledHtml);
 
@@ -717,19 +734,22 @@ templatesRouter.put('/:id', requirePermission('mkt_templates', 'edit'), async (r
         req.body?.preheader !== undefined ? String(req.body.preheader).trim() : String(existing.preheader || '');
       const category =
         req.body?.category !== undefined ? String(req.body.category).trim() : String(existing.category || 'general');
+      const rawGroupUpdate = req.body?.group_id !== undefined ? req.body.group_id : req.body?.groupId;
       const groupId =
-        req.body?.group_id !== undefined ? (req.body.group_id ? String(req.body.group_id) : null) : existing.group_id;
+        rawGroupUpdate !== undefined ? (rawGroupUpdate ? String(rawGroupUpdate) : null) : existing.group_id;
       const blocks: EmailBlockDto[] = Array.isArray(req.body?.blocks)
         ? req.body.blocks
         : parseJsonCol<EmailBlockDto[]>(existing.blocks_json, []);
+      const rawStyleUpdate = req.body?.body_style ?? req.body?.bodyStyle;
       const bodyStyle: EmailBodyStyleDto =
-        req.body?.body_style && typeof req.body.body_style === 'object'
-          ? req.body.body_style
+        rawStyleUpdate && typeof rawStyleUpdate === 'object'
+          ? rawStyleUpdate
           : parseJsonCol<EmailBodyStyleDto>(existing.body_style, {});
 
+      const rawHtmlUpdate = req.body?.compiled_html ?? req.body?.htmlContent;
       const compiledHtml =
-        typeof req.body?.compiled_html === 'string' && req.body.compiled_html.trim()
-          ? req.body.compiled_html
+        typeof rawHtmlUpdate === 'string' && rawHtmlUpdate.trim()
+          ? rawHtmlUpdate
           : compileEmailBlocksToHtml(blocks, bodyStyle, subject || name);
       const spam = analyzeEmailSpamScore(subject, blocks, compiledHtml);
       const detectedTags = Array.from(
@@ -886,10 +906,10 @@ templatesRouter.get('/:id/acl', requirePermission('mkt_templates', 'view'), asyn
           'SELECT * FROM mkt_template_acl WHERE tenant_id = $1 AND template_id = $2 ORDER BY created_at ASC',
           [ctx.tenantId, req.params.id]
         ),
-        client.query('SELECT id, name, code FROM tenant_roles WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
+        client.query('SELECT id, name, role_key, role_key AS code FROM tenant_roles WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
         client.query('SELECT id, name FROM tenant_departments WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
         client.query('SELECT id, name FROM tenant_teams WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
-        client.query('SELECT id, full_name, email FROM users WHERE tenant_id = $1 AND is_active = true ORDER BY full_name ASC LIMIT 100', [ctx.tenantId]),
+        client.query('SELECT id, full_name, email FROM users WHERE tenant_id = $1 AND COALESCE(is_system_bot, false) = false ORDER BY full_name ASC LIMIT 100', [ctx.tenantId]),
       ]);
 
       return {

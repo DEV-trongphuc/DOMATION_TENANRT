@@ -694,12 +694,17 @@ export async function switchTenantSaasPackageInTx(
     switched_at: new Date().toISOString(),
   };
 
-  const mergedSettings = normalizeTenantSettings({
+  const normalizedSettings = normalizeTenantSettings({
     ...curSettings,
     industry_key: nextIndustryKey,
     education_addon: nextEduAddon,
     enable_ideas_mascot: nextMascot,
   });
+  // Preserve custom tenant JSONB settings (e.g., approval_categories, approvals_custom_mode, custom_fields, company_name)
+  const mergedSettings = {
+    ...curSettings,
+    ...normalizedSettings,
+  };
 
   const nextUpgradeStatus =
     targetPkg === 'domation_promax'

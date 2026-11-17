@@ -238,6 +238,28 @@ audiencesRouter.get('/field-catalog', async (_req, res) => {
   }
 });
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function cleanParam(v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s || ['all', 'undefined', 'null'].includes(s.toLowerCase())) return null;
+  return s;
+}
+
+function parseCriteriaInput(raw: unknown): unknown {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+  return raw;
+}
+
 // ============================================================================
 // 2. Live Preview for "Tệp Logic" AST (`POST /api/v1/audiences/preview`)
 // ============================================================================
@@ -245,7 +267,8 @@ audiencesRouter.post('/preview', requirePermission('audiences', 'view'), async (
   try {
     const ctx = getTenantContext();
     const cfg = await getTenantSettingsCached(ctx.tenantId);
-    const { filter_branches, audience_id, exclude_audience_ids, limit = 20 } = req.body || {};
+    const { filter_branches, criteria, groups, audience_id, exclude_audience_ids, limit = 20 } = req.body || {};
+    const rawBranches = parseCriteriaInput(filter_branches ?? criteria ?? groups ?? []);
     const safeLimit = Math.min(100, Math.max(1, Number(limit || 20)));
 
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -255,7 +278,7 @@ audiencesRouter.post('/preview', requirePermission('audiences', 'view'), async (
           rbac.effectivePermissions.leads?.actions.unmask_phone
       );
 
-      const compiled = compileSegmentWhereSql(ctx.tenantId, filter_branches, {
+      const compiled = compileSegmentWhereSql(ctx.tenantId, rawBranches, {
         audienceIdForExclusions: audience_id ? String(audience_id) : null,
         extraExcludeAudienceIds: Array.isArray(exclude_audience_ids) ? exclude_audience_ids : undefined,
       });
@@ -287,6 +310,7 @@ audiencesRouter.post('/preview', requirePermission('audiences', 'view'), async (
 
       return {
         count,
+        total: count,
         has_rules: compiled.hasRules,
         items: maskedSamples,
         sample_members: maskedSamples,
@@ -306,10 +330,15 @@ audiencesRouter.get('/contacts', requirePermission('audiences', 'view'), async (
   try {
     const ctx = getTenantContext();
     const cfg = await getTenantSettingsCached(ctx.tenantId);
-    const statusFilter = req.query.status ? String(req.query.status).trim() : null;
-    const lifecycleFilter = req.query.lifecycle_stage ? String(req.query.lifecycle_stage).trim() : null;
-    const tagId = req.query.tag_id ? String(req.query.tag_id).trim() : null;
-    const search = req.query.search ? String(req.query.search).trim() : null;
+    const statusFilter = cleanParam(req.query.status);
+    const lifecycleFilter = cleanParam(req.query.lifecycle_stage);
+    const tagFilterRaw = cleanParam(req.query.tag_id) || cleanParam(req.query.tag);
+    const salespersonFilter = cleanParam(req.query.salesperson);
+    const listIdFilter = cleanParam(req.query.list_id);
+    const segmentIdFilter = cleanParam(req.query.segment_id);
+    const hasPhoneOnly = String(req.query.has_phone || '').trim() === '1';
+    const sortParam = String(req.query.sort || '').trim().toLowerCase();
+    const search = cleanParam(req.query.search);
     const page = Math.max(1, Number(req.query.page || 1));
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
     const offset = (page - 1) * limit;
@@ -342,15 +371,78 @@ audiencesRouter.get('/contacts', requirePermission('audiences', 'view'), async (
         params.push(lifecycleFilter);
         where += ` AND l.lifecycle_stage = $${params.length}`;
       }
-      if (tagId) {
-        params.push(tagId);
-        where += ` AND EXISTS (SELECT 1 FROM lead_tags lt WHERE lt.tenant_id = $1 AND lt.lead_id = l.id AND lt.tag_id = $${params.length}::uuid)`;
+      if (tagFilterRaw) {
+        const tagParts = tagFilterRaw
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (tagParts.length > 0) {
+          const tagLowerParts = tagParts.map((s) => s.toLowerCase());
+          params.push(tagParts);
+          const rawIdx = `$${params.length}`;
+          params.push(tagLowerParts);
+          const lowerIdx = `$${params.length}`;
+          where += ` AND EXISTS (
+            SELECT 1 FROM lead_tags lt
+            INNER JOIN tenant_tags tt ON tt.tenant_id = lt.tenant_id AND tt.id = lt.tag_id
+            WHERE lt.tenant_id = $1 AND lt.lead_id = l.id
+              AND (lt.tag_id::text = ANY(${rawIdx}::text[]) OR LOWER(tt.slug) = ANY(${lowerIdx}::text[]) OR LOWER(tt.name) = ANY(${lowerIdx}::text[]))
+          )`;
+        }
+      }
+      if (salespersonFilter && UUID_REGEX.test(salespersonFilter)) {
+        params.push(salespersonFilter);
+        where += ` AND l.assigned_to = $${params.length}::uuid`;
+      }
+      if (hasPhoneOnly) {
+        where += ` AND COALESCE(TRIM(l.phone), '') <> ''`;
+      }
+      if (listIdFilter && UUID_REGEX.test(listIdFilter)) {
+        params.push(listIdFilter);
+        where += ` AND EXISTS (SELECT 1 FROM tenant_audience_members tam_l WHERE tam_l.tenant_id = $1 AND tam_l.audience_id = $${params.length}::uuid AND tam_l.lead_id = l.id)`;
+      }
+      if (segmentIdFilter && UUID_REGEX.test(segmentIdFilter)) {
+        const segRowRes = await client.query<{ audience_type: string; filter_branches: unknown }>(
+          'SELECT audience_type, filter_branches FROM tenant_audiences WHERE tenant_id = $1 AND id = $2::uuid LIMIT 1',
+          [ctx.tenantId, segmentIdFilter]
+        );
+        const segRow = segRowRes.rows[0];
+        if (!segRow) {
+          where += ' AND 1 = 0';
+        } else if (segRow.audience_type === 'dynamic_logic') {
+          const parsedBranches = parseCriteriaInput(segRow.filter_branches);
+          const segCompiled = compileSegmentWhereSql(ctx.tenantId, parsedBranches);
+          const matchedRes = await client.query<{ id: string }>(
+            `SELECT l.id
+             FROM leads l
+             LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+             WHERE ${segCompiled.whereClause}`,
+            segCompiled.params
+          );
+          const matchedIds = matchedRes.rows.map((r) => String(r.id));
+          if (matchedIds.length === 0) {
+            where += ' AND 1 = 0';
+          } else {
+            params.push(matchedIds);
+            where += ` AND l.id::text = ANY($${params.length}::text[])`;
+          }
+        } else {
+          params.push(segmentIdFilter);
+          where += ` AND EXISTS (SELECT 1 FROM tenant_audience_members tam_s WHERE tam_s.tenant_id = $1 AND tam_s.audience_id = $${params.length}::uuid AND tam_s.lead_id = l.id)`;
+        }
       }
       if (search) {
         params.push(`%${search}%`);
         const pIdx = `$${params.length}`;
         where += ` AND (l.name ILIKE ${pIdx} OR COALESCE(l.phone, '') ILIKE ${pIdx} OR COALESCE(l.email, '') ILIKE ${pIdx} OR COALESCE(l.campaign, '') ILIKE ${pIdx})`;
       }
+
+      const orderByClause =
+        sortParam === 'oldest'
+          ? 'l.created_at ASC'
+          : sortParam === 'score_desc' || sortParam === 'lead_score'
+            ? 'l.lead_score DESC NULLS LAST, l.created_at DESC'
+            : 'l.created_at DESC';
 
       const [cntRes, rowsRes] = await Promise.all([
         client.query<{ total: number }>(`SELECT COUNT(*)::int AS total FROM leads l WHERE ${where}`, params),
@@ -363,7 +455,7 @@ audiencesRouter.get('/contacts', requirePermission('audiences', 'view'), async (
            FROM leads l
            LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
            WHERE ${where}
-           ORDER BY l.created_at DESC
+           ORDER BY ${orderByClause}
            LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
           [...params, limit, offset]
         ),
@@ -737,9 +829,17 @@ audiencesRouter.post('/', requirePermission('audiences', 'create'), async (req, 
     }
 
     const validTypes = new Set(['static_data', 'sync_data', 'dynamic_logic']);
+    const parsedFilterBranches =
+      b.filter_branches !== undefined
+        ? parseCriteriaInput(b.filter_branches)
+        : b.criteria !== undefined
+          ? parseCriteriaInput(b.criteria)
+          : [];
     const audType = validTypes.has(String(b.audience_type || ''))
       ? String(b.audience_type)
-      : 'static_data';
+      : b.criteria !== undefined
+        ? 'dynamic_logic'
+        : 'static_data';
     const id = crypto.randomUUID();
 
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -754,7 +854,7 @@ audiencesRouter.post('/', requirePermission('audiences', 'create'), async (req, 
           name,
           b.description ? String(b.description).trim() : null,
           audType,
-          JSON.stringify(b.filter_branches ?? []),
+          JSON.stringify(parsedFilterBranches ?? []),
           JSON.stringify(b.sync_config && typeof b.sync_config === 'object' ? b.sync_config : {}),
           Boolean(b.auto_push_to_sale_round),
           b.target_round_id || null,
@@ -844,8 +944,16 @@ const updateAudienceHandler = async (req: any, res: any) => {
     const ctx = getTenantContext();
     const b = req.body || {};
     const validTypes = new Set(['static_data', 'sync_data', 'dynamic_logic']);
+    const parsedUpdateBranches =
+      b.filter_branches !== undefined
+        ? parseCriteriaInput(b.filter_branches)
+        : b.criteria !== undefined
+          ? parseCriteriaInput(b.criteria)
+          : undefined;
     const nextType =
-      b.audience_type && validTypes.has(String(b.audience_type)) ? String(b.audience_type) : null;
+      b.audience_type && validTypes.has(String(b.audience_type))
+        ? String(b.audience_type)
+        : undefined;
 
     const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
       const r = await client.query(
@@ -868,8 +976,8 @@ const updateAudienceHandler = async (req: any, res: any) => {
           b.name ? String(b.name).trim() : null,
           b.description !== undefined,
           b.description ? String(b.description).trim() : null,
-          nextType,
-          b.filter_branches !== undefined ? JSON.stringify(b.filter_branches) : null,
+          nextType || null,
+          parsedUpdateBranches !== undefined ? JSON.stringify(parsedUpdateBranches) : null,
           b.sync_config !== undefined ? JSON.stringify(b.sync_config) : null,
           typeof b.auto_push_to_sale_round === 'boolean' ? b.auto_push_to_sale_round : null,
           b.target_round_id !== undefined,

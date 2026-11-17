@@ -1022,3 +1022,866 @@ export async function discoverMetaTokenAssets(
         : 'Token hợp lệ nhưng chưa có Tài khoản QC nào được gán quyền cho Token này.',
   };
 }
+
+export interface MetaOverviewDateWindow {
+  since: string;
+  until: string;
+  prevSince: string;
+  prevUntil: string;
+  isAllTime: boolean;
+}
+
+function toVnIsoDate(d: Date): string {
+  const vnMs = d.getTime() + 7 * 3600_000;
+  return new Date(vnMs).toISOString().slice(0, 10);
+}
+
+function addDaysIso(isoDate: string, deltaDays: number): string {
+  const dt = new Date(`${isoDate}T00:00:00Z`);
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  return dt.toISOString().slice(0, 10);
+}
+
+export function resolveOverviewDateWindow(
+  dateRangeRaw?: string,
+  fromDateRaw?: string,
+  toDateRaw?: string
+): MetaOverviewDateWindow {
+  const today = toVnIsoDate(new Date());
+  const range = String(dateRangeRaw || '30days').trim().toLowerCase();
+
+  let since = addDaysIso(today, -29);
+  let until = today;
+  let isAllTime = false;
+
+  if (range === 'custom' && fromDateRaw && toDateRaw) {
+    since = String(fromDateRaw).slice(0, 10);
+    until = String(toDateRaw).slice(0, 10);
+  } else if (range === 'today') {
+    since = today;
+    until = today;
+  } else if (range === 'yesterday') {
+    const y = addDaysIso(today, -1);
+    since = y;
+    until = y;
+  } else if (range === '7days' || range === 'last_7d' || range === 'last_7_days') {
+    since = addDaysIso(today, -6);
+    until = today;
+  } else if (range === '30days' || range === 'last_30d' || range === 'last_30_days') {
+    since = addDaysIso(today, -29);
+    until = today;
+  } else if (range === 'this_week') {
+    const dt = new Date(`${today}T00:00:00Z`);
+    const day = dt.getUTCDay();
+    const diffMon = day === 0 ? -6 : 1 - day;
+    since = addDaysIso(today, diffMon);
+    until = today;
+  } else if (range === 'last_week') {
+    const dt = new Date(`${today}T00:00:00Z`);
+    const day = dt.getUTCDay();
+    const diffMon = day === 0 ? -6 : 1 - day;
+    const thisMon = addDaysIso(today, diffMon);
+    since = addDaysIso(thisMon, -7);
+    until = addDaysIso(thisMon, -1);
+  } else if (range === 'two_weeks_ago') {
+    const dt = new Date(`${today}T00:00:00Z`);
+    const day = dt.getUTCDay();
+    const diffMon = day === 0 ? -6 : 1 - day;
+    const thisMon = addDaysIso(today, diffMon);
+    since = addDaysIso(thisMon, -14);
+    until = addDaysIso(thisMon, -8);
+  } else if (range === 'this_month') {
+    since = `${today.slice(0, 7)}-01`;
+    until = today;
+  } else if (range === 'last_month') {
+    const dt = new Date(`${today.slice(0, 7)}-01T00:00:00Z`);
+    dt.setUTCMonth(dt.getUTCMonth() - 1);
+    since = dt.toISOString().slice(0, 10);
+    const endDt = new Date(`${today.slice(0, 7)}-01T00:00:00Z`);
+    endDt.setUTCDate(endDt.getUTCDate() - 1);
+    until = endDt.toISOString().slice(0, 10);
+  } else if (range === 'this_quarter') {
+    const m = Number(today.slice(5, 7)) - 1;
+    const qStartMonth = String(Math.floor(m / 3) * 3 + 1).padStart(2, '0');
+    since = `${today.slice(0, 4)}-${qStartMonth}-01`;
+    until = today;
+  } else if (range === 'this_year') {
+    since = `${today.slice(0, 4)}-01-01`;
+    until = today;
+  } else if (range === 'all_time' || range === 'all') {
+    since = '2020-01-01';
+    until = today;
+    isAllTime = true;
+  } else if (fromDateRaw && toDateRaw) {
+    since = String(fromDateRaw).slice(0, 10);
+    until = String(toDateRaw).slice(0, 10);
+  }
+
+  const startMs = new Date(`${since}T00:00:00Z`).getTime();
+  const endMs = new Date(`${until}T00:00:00Z`).getTime();
+  const spanDays = Math.max(1, Math.round((endMs - startMs) / 86_400_000) + 1);
+  const prevUntil = addDaysIso(since, -1);
+  const prevSince = addDaysIso(prevUntil, -(spanDays - 1));
+
+  return { since, until, prevSince, prevUntil, isAllTime };
+}
+
+async function safeMetaSavepointQuery(client: DbClient, sql: string, params: unknown[]): Promise<any[]> {
+  const sp = `sp_meta_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  try {
+    await client.query(`SAVEPOINT ${sp}`);
+    const res = await client.query(sql, params);
+    await client.query(`RELEASE SAVEPOINT ${sp}`);
+    return res.rows || [];
+  } catch {
+    try {
+      await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+    } catch {
+      // ignore
+    }
+    return [];
+  }
+}
+
+export async function buildMetaAdsOverviewInTx(
+  client: DbClient,
+  tenantId: string,
+  filters: {
+    ad_account_id?: string;
+    date_range?: string;
+    from_date?: string;
+    to_date?: string;
+    campaign_id?: string;
+    owner_id?: string;
+  },
+  maskRow?: (row: Record<string, any>) => Record<string, any>
+) {
+  const metaSummary = await getMetaAdsConfigSummary(client, tenantId);
+  const accounts = metaSummary.accounts || [];
+  const win = resolveOverviewDateWindow(filters.date_range, filters.from_date, filters.to_date);
+
+  if (accounts.length === 0) {
+    return {
+      configured: false,
+      accounts: [],
+      summary: {
+        account_id: '',
+        account_name: 'Chưa kết nối tài khoản Meta',
+        since: win.since,
+        until: win.until,
+        spend: 0,
+        attributed_spend: 0,
+        account_total_spend: 0,
+        prev_spend: 0,
+        spend_change_pct: 0,
+        lead_goal_spend: 0,
+        meta_leads: 0,
+        account_meta_leads: 0,
+        prev_meta_leads: 0,
+        leads_change_pct: 0,
+        meta_cpl: 0,
+        account_meta_cpl: 0,
+        cpl: 0,
+        crm_cpl: 0,
+        cost_per_new_1_2: 0,
+        cpq: 0,
+        cpq_3_12: 0,
+        cpw: 0,
+        impressions: 0,
+        prev_impressions: 0,
+        impressions_change_pct: 0,
+        reach: 0,
+        prev_reach: 0,
+        reach_change_pct: 0,
+        frequency: 0,
+        cpm: 0,
+        clicks: 0,
+        cpc: 0,
+        ctr: 0,
+        total_leads: 0,
+        entry_stage_leads: 0,
+        qualified_stage_leads: 0,
+        won_stage_leads: 0,
+        lost_stage_leads: 0,
+        nurture_stage_leads: 0,
+        new_1_2_leads: 0,
+        new_1_2_pct: 0,
+        qualified_3_12_leads: 0,
+        qualified_3_12_pct: 0,
+        won_leads: 0,
+        won_pct: 0,
+        qualified_leads: 0,
+        qualified_pct: 0,
+        uncontacted_leads: 0,
+        contacted_leads: 0,
+        contacted_pct: 0,
+        assigned_leads: 0,
+        assigned_pct: 0,
+        paid_leads: 0,
+        organic_leads: 0,
+        instant_form_leads: 0,
+        actual_revenue: 0,
+        roas: 0,
+        campaigns_count: 0,
+        active_campaigns_count: 0,
+        adsets_count: 0,
+        active_adsets_count: 0,
+        ads_count: 0,
+        active_ads_count: 0,
+        forms_count: 0,
+        valid_phone_pct: 0,
+        survey_completed_pct: 0,
+      },
+      stage_breakdown: [],
+      daily_trend: [],
+      campaigns: [],
+      by_campaign: [],
+      adsets: [],
+      by_adset: [],
+      ads: [],
+      by_ad: [],
+      hierarchy: [],
+      meta_goal_chart: [],
+      funnel_stages: [],
+      pipeline_stages_catalog: [],
+      top_advisors: [],
+      attributed_leads: [],
+    };
+  }
+
+  const rawAcctParam = String(filters.ad_account_id || '').trim();
+  const matchedByRef =
+    rawAcctParam && rawAcctParam.toLowerCase() !== 'all'
+      ? accounts.find(
+          (a) =>
+            a.id === rawAcctParam ||
+            a.ad_account_id === normalizeAdAccountId(rawAcctParam)
+        )
+      : null;
+  const selectedAdAccountId =
+    rawAcctParam && rawAcctParam.toLowerCase() !== 'all'
+      ? matchedByRef?.ad_account_id || normalizeAdAccountId(rawAcctParam)
+      : '';
+
+  const displayAccountId = selectedAdAccountId
+    ? selectedAdAccountId
+    : accounts.length === 1
+      ? accounts[0].ad_account_id
+      : 'all';
+  const displayAccountName = selectedAdAccountId
+    ? matchedByRef?.name || `act_${selectedAdAccountId}`
+    : accounts.length === 1
+      ? accounts[0].name
+      : `Tất cả (${accounts.length} tài khoản Meta)`;
+
+  const campaignFilter =
+    filters.campaign_id && filters.campaign_id !== 'all' ? String(filters.campaign_id).trim() : '';
+  const ownerFilter =
+    filters.owner_id && filters.owner_id !== 'all' ? String(filters.owner_id).trim() : '';
+
+  const insParams: unknown[] = [tenantId];
+  let insWhere = 'tenant_id = $1';
+  if (selectedAdAccountId) {
+    insParams.push(selectedAdAccountId);
+    insWhere += ` AND ad_account_id = $${insParams.length}`;
+  }
+  if (!win.isAllTime) {
+    insParams.push(win.since, win.until);
+    insWhere += ` AND date_stop >= $${insParams.length - 1}::date AND date_start <= $${insParams.length}::date`;
+  }
+  if (campaignFilter) {
+    insParams.push(campaignFilter);
+    insWhere += ` AND campaign_id = $${insParams.length}`;
+  }
+
+  const prevParams: unknown[] = [tenantId, win.prevSince, win.prevUntil];
+  let prevWhere = 'tenant_id = $1 AND date_stop >= $2::date AND date_start <= $3::date';
+  if (selectedAdAccountId) {
+    prevParams.push(selectedAdAccountId);
+    prevWhere += ` AND ad_account_id = $${prevParams.length}`;
+  }
+  if (campaignFilter) {
+    prevParams.push(campaignFilter);
+    prevWhere += ` AND campaign_id = $${prevParams.length}`;
+  }
+
+  const [insRes, prevRes, stagesRes] = await Promise.all([
+    client.query(
+      `SELECT ad_account_id, date_start, date_stop, campaign_id, campaign_name,
+              adset_id, adset_name, ad_id, ad_name,
+              spend, impressions, clicks, reach, ctr, cpc, cpm, frequency, meta_leads,
+              thumbnail_url, image_url, creative_title, creative_body, story_id, optimization_goal
+       FROM meta_ads_insights
+       WHERE ${insWhere}
+       ORDER BY date_start ASC, spend DESC`,
+      insParams
+    ),
+    win.isAllTime
+      ? Promise.resolve({ rows: [{ spend: 0, impressions: 0, reach: 0, meta_leads: 0 }] })
+      : client.query(
+          `SELECT COALESCE(SUM(spend), 0)::numeric AS spend,
+                  COALESCE(SUM(impressions), 0)::int AS impressions,
+                  COALESCE(SUM(reach), 0)::int AS reach,
+                  COALESCE(SUM(meta_leads), 0)::int AS meta_leads
+           FROM meta_ads_insights
+           WHERE ${prevWhere}`,
+          prevParams
+        ),
+    client.query<{
+      id: string;
+      pipeline_id: string;
+      stage_key: string;
+      stage_name: string;
+      stage_order: number;
+      color_hex: string;
+      is_won_stage: boolean;
+      is_lost_stage: boolean;
+      funnel_category: string;
+    }>(
+      `SELECT id, pipeline_id, stage_key, stage_name, stage_order, color_hex,
+              is_won_stage, is_lost_stage, funnel_category
+       FROM tenant_pipeline_stages
+       WHERE tenant_id = $1
+       ORDER BY stage_order ASC, created_at ASC`,
+      [tenantId]
+    ),
+  ]);
+
+  const insightRows = insRes.rows;
+  const acctAdIds = Array.from(new Set(insightRows.map((r) => String(r.ad_id || '')).filter(Boolean)));
+  const acctCampaignIds = Array.from(new Set(insightRows.map((r) => String(r.campaign_id || '')).filter(Boolean)));
+
+  const leadParams: unknown[] = [tenantId];
+  let leadWhere = 'l.tenant_id = $1 AND l.is_deleted = false';
+  if (!win.isAllTime) {
+    leadParams.push(win.since, win.until);
+    leadWhere += ` AND l.created_at::date BETWEEN $${leadParams.length - 1}::date AND $${leadParams.length}::date`;
+  }
+  if (campaignFilter) {
+    leadParams.push(campaignFilter);
+    leadWhere += ` AND l.campaign_id = $${leadParams.length}`;
+  }
+  if (ownerFilter) {
+    leadParams.push(ownerFilter);
+    leadWhere += ` AND l.assigned_to::text = $${leadParams.length}`;
+  }
+  if (selectedAdAccountId) {
+    if (acctAdIds.length === 0 && acctCampaignIds.length === 0) {
+      leadWhere += ' AND 1 = 0';
+    } else {
+      const orParts: string[] = [];
+      if (acctAdIds.length > 0) {
+        leadParams.push(acctAdIds);
+        orParts.push(`l.ad_id = ANY($${leadParams.length}::text[])`);
+      }
+      if (acctCampaignIds.length > 0) {
+        leadParams.push(acctCampaignIds);
+        orParts.push(`l.campaign_id = ANY($${leadParams.length}::text[])`);
+      }
+      leadWhere += ` AND (${orParts.join(' OR ')})`;
+    }
+  }
+
+  const leadsRes = await client.query(
+    `SELECT l.id, l.name, l.phone, l.email, l.source, l.campaign, l.campaign_id, l.adset_id, l.ad_id, l.form_id,
+            l.stage_id, l.assigned_to, l.is_accepted, l.quality_status, l.lead_score, l.total_revenue_vnd, l.created_at,
+            u.full_name AS owner_name, u.avatar_url AS owner_avatar
+     FROM leads l
+     LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
+     WHERE ${leadWhere}
+     ORDER BY l.created_at DESC
+     LIMIT 5000`,
+    leadParams
+  );
+
+  const leadRows = leadsRes.rows;
+  const leadIds = leadRows.map((l) => String(l.id));
+
+  // Optional Deals + Sales Orders revenue attribution (only adds when lead.total_revenue_vnd === 0 to avoid double-counting)
+  const dealRevByLead = new Map<string, number>();
+  const soRevByLead = new Map<string, number>();
+  if (leadIds.length > 0) {
+    const [dealRows, soRows] = await Promise.all([
+      safeMetaSavepointQuery(
+        client,
+        `SELECT lead_id, COALESCE(SUM(amount_vnd), 0)::bigint AS rev
+         FROM tenant_deals
+         WHERE tenant_id = $1 AND stage = 'won' AND lead_id = ANY($2::uuid[])
+         GROUP BY lead_id`,
+        [tenantId, leadIds]
+      ),
+      safeMetaSavepointQuery(
+        client,
+        `SELECT lead_id, COALESCE(SUM(paid_vnd), 0)::bigint AS rev
+         FROM tenant_sales_orders
+         WHERE tenant_id = $1 AND status <> 'cancelled' AND paid_vnd > 0 AND lead_id = ANY($2::uuid[])
+         GROUP BY lead_id`,
+        [tenantId, leadIds]
+      ),
+    ]);
+    for (const r of dealRows) {
+      if (r.lead_id) dealRevByLead.set(String(r.lead_id), Number(r.rev || 0));
+    }
+    for (const r of soRows) {
+      if (r.lead_id) soRevByLead.set(String(r.lead_id), Number(r.rev || 0));
+    }
+  }
+
+  // Classify stages dynamically from tenant_pipeline_stages
+  const stageMetaMap = new Map<
+    string,
+    {
+      stage_id: string;
+      stage_key: string;
+      stage_name: string;
+      stage_order: number;
+      color_hex: string;
+      category: 'entry' | 'qualified' | 'won' | 'lost' | 'nurture';
+      count: number;
+    }
+  >();
+
+  for (const st of stagesRes.rows) {
+    const isWon = Boolean(st.is_won_stage) || st.funnel_category === 'closed_won';
+    const isLost = Boolean(st.is_lost_stage) || st.funnel_category === 'closed_lost';
+    const isNurture = !isWon && !isLost && st.funnel_category === 'nurturing';
+    const isEntry =
+      !isWon &&
+      !isLost &&
+      !isNurture &&
+      (st.funnel_category === 'new_uncontacted' || Number(st.stage_order) <= 2);
+    const category: 'entry' | 'qualified' | 'won' | 'lost' | 'nurture' = isWon
+      ? 'won'
+      : isLost
+        ? 'lost'
+        : isNurture
+          ? 'nurture'
+          : isEntry
+            ? 'entry'
+            : 'qualified';
+    stageMetaMap.set(String(st.id), {
+      stage_id: String(st.id),
+      stage_key: String(st.stage_key || st.id),
+      stage_name: String(st.stage_name || st.stage_key || 'Stage'),
+      stage_order: Number(st.stage_order || 0),
+      color_hex: String(st.color_hex || '#1E40FF'),
+      category,
+      count: 0,
+    });
+  }
+
+  let totalLeads = 0;
+  let entryStageLeads = 0;
+  let qualifiedStageLeads = 0;
+  let wonStageLeads = 0;
+  let lostStageLeads = 0;
+  let nurtureStageLeads = 0;
+  let assignedLeads = 0;
+  let contactedLeads = 0;
+  let paidLeads = 0;
+  let instantFormLeads = 0;
+  let validPhoneCount = 0;
+  let actualRevenue = 0;
+
+  const leadsByAd = new Map<string, any[]>();
+  const leadsByCampaign = new Map<string, any[]>();
+  const leadsByAdset = new Map<string, any[]>();
+  const advisorMap = new Map<
+    string,
+    { id: string; user_id: string; name: string; avatar: string; leads: number; qualified: number; won: number; revenue: number }
+  >();
+
+  for (const l of leadRows) {
+    totalLeads += 1;
+    const lid = String(l.id);
+    const stInfo = l.stage_id ? stageMetaMap.get(String(l.stage_id)) : undefined;
+    if (stInfo) {
+      stInfo.count += 1;
+      if (stInfo.category === 'entry') entryStageLeads += 1;
+      else if (stInfo.category === 'qualified') qualifiedStageLeads += 1;
+      else if (stInfo.category === 'won') wonStageLeads += 1;
+      else if (stInfo.category === 'lost') lostStageLeads += 1;
+      else if (stInfo.category === 'nurture') nurtureStageLeads += 1;
+    } else {
+      entryStageLeads += 1;
+    }
+
+    if (l.assigned_to) assignedLeads += 1;
+    if (l.is_accepted) contactedLeads += 1;
+    const srcLower = String(l.source || '').toLowerCase();
+    const isPaid = Boolean(l.ad_id || l.campaign_id || srcLower.includes('facebook') || srcLower.includes('meta'));
+    if (isPaid) paidLeads += 1;
+    if (l.form_id) instantFormLeads += 1;
+    if (l.phone && String(l.phone).trim().length >= 8) validPhoneCount += 1;
+
+    const leadRev = Math.max(
+      Number(l.total_revenue_vnd || 0),
+      dealRevByLead.get(lid) || 0,
+      soRevByLead.get(lid) || 0
+    );
+    actualRevenue += leadRev;
+
+    if (l.assigned_to) {
+      const uid = String(l.assigned_to);
+      if (!advisorMap.has(uid)) {
+        advisorMap.set(uid, {
+          id: uid,
+          user_id: uid,
+          name: String(l.owner_name || 'Chuyên viên'),
+          avatar: String(l.owner_avatar || ''),
+          leads: 0,
+          qualified: 0,
+          won: 0,
+          revenue: 0,
+        });
+      }
+      const adv = advisorMap.get(uid)!;
+      adv.leads += 1;
+      if (stInfo?.category === 'qualified' || stInfo?.category === 'won') adv.qualified += 1;
+      if (stInfo?.category === 'won') adv.won += 1;
+      adv.revenue += leadRev;
+    }
+
+    const baseLeadDto = {
+      id: lid,
+      contact_id: lid,
+      full_name: String(l.name || ''),
+      phone: l.phone ? String(l.phone) : '',
+      email: l.email ? String(l.email) : '',
+      ad_id: l.ad_id ? String(l.ad_id) : '',
+      adset_id: l.adset_id ? String(l.adset_id) : '',
+      campaign_id: l.campaign_id ? String(l.campaign_id) : '',
+      stage_id: l.stage_id ? String(l.stage_id) : '',
+      stage_key: stInfo?.stage_key || 'new',
+      stage_name: stInfo?.stage_name || 'Mới tiếp nhận',
+      stage_category: stInfo?.category || 'entry',
+      owner_name: String(l.owner_name || 'Chưa phân bổ'),
+      revenue_vnd: leadRev,
+      created_at: l.created_at,
+    };
+    const finalLeadDto = maskRow ? maskRow(baseLeadDto) : baseLeadDto;
+
+    if (l.ad_id) {
+      const arr = leadsByAd.get(String(l.ad_id)) || [];
+      arr.push(finalLeadDto);
+      leadsByAd.set(String(l.ad_id), arr);
+    }
+    if (l.adset_id) {
+      const arr = leadsByAdset.get(String(l.adset_id)) || [];
+      arr.push(finalLeadDto);
+      leadsByAdset.set(String(l.adset_id), arr);
+    }
+    if (l.campaign_id) {
+      const arr = leadsByCampaign.get(String(l.campaign_id)) || [];
+      arr.push(finalLeadDto);
+      leadsByCampaign.set(String(l.campaign_id), arr);
+    }
+  }
+
+  // Aggregate Meta Ads Insights
+  let spend = 0;
+  let impressions = 0;
+  let clicks = 0;
+  let reach = 0;
+  let metaLeads = 0;
+
+  const dailyMap = new Map<string, { date: string; spend: number; impressions: number; clicks: number; meta_leads: number; crm_leads: number }>();
+  const campaignMap = new Map<string, any>();
+  const adsetMap = new Map<string, any>();
+  const adMap = new Map<string, any>();
+  const goalMap = new Map<string, { goal: string; label: string; spend: number; leads: number; impressions: number; clicks: number }>();
+
+  for (const row of insightRows) {
+    const rSpend = Number(row.spend || 0);
+    const rImp = Number(row.impressions || 0);
+    const rClicks = Number(row.clicks || 0);
+    const rReach = Number(row.reach || 0);
+    const rLeads = Number(row.meta_leads || 0);
+
+    spend += rSpend;
+    impressions += rImp;
+    clicks += rClicks;
+    reach += rReach;
+    metaLeads += rLeads;
+
+    const dKey = String(row.date_start instanceof Date ? row.date_start.toISOString().slice(0, 10) : row.date_start || '').slice(0, 10);
+    if (dKey) {
+      const dEntry = dailyMap.get(dKey) || { date: dKey, spend: 0, impressions: 0, clicks: 0, meta_leads: 0, crm_leads: 0 };
+      dEntry.spend += rSpend;
+      dEntry.impressions += rImp;
+      dEntry.clicks += rClicks;
+      dEntry.meta_leads += rLeads;
+      dailyMap.set(dKey, dEntry);
+    }
+
+    const goalKey = String(row.optimization_goal || 'LEAD_GENERATION');
+    const gEntry = goalMap.get(goalKey) || { goal: goalKey, label: goalKey, spend: 0, leads: 0, impressions: 0, clicks: 0 };
+    gEntry.spend += rSpend;
+    gEntry.leads += rLeads;
+    gEntry.impressions += rImp;
+    gEntry.clicks += rClicks;
+    goalMap.set(goalKey, gEntry);
+
+    const cmpId = String(row.campaign_id || '');
+    if (cmpId) {
+      const cEntry = campaignMap.get(cmpId) || {
+        id: cmpId,
+        campaign_id: cmpId,
+        name: String(row.campaign_name || `Campaign ${cmpId}`),
+        ad_account_id: String(row.ad_account_id || ''),
+        spend: 0,
+        impressions: 0,
+        clicks: 0,
+        reach: 0,
+        meta_leads: 0,
+      };
+      cEntry.spend += rSpend;
+      cEntry.impressions += rImp;
+      cEntry.clicks += rClicks;
+      cEntry.reach += rReach;
+      cEntry.meta_leads += rLeads;
+      campaignMap.set(cmpId, cEntry);
+    }
+
+    const asId = String(row.adset_id || '');
+    if (asId) {
+      const asEntry = adsetMap.get(asId) || {
+        id: asId,
+        adset_id: asId,
+        campaign_id: cmpId,
+        campaign_name: String(row.campaign_name || ''),
+        name: String(row.adset_name || `AdSet ${asId}`),
+        spend: 0,
+        impressions: 0,
+        clicks: 0,
+        reach: 0,
+        meta_leads: 0,
+      };
+      asEntry.spend += rSpend;
+      asEntry.impressions += rImp;
+      asEntry.clicks += rClicks;
+      asEntry.reach += rReach;
+      asEntry.meta_leads += rLeads;
+      adsetMap.set(asId, asEntry);
+    }
+
+    const adId = String(row.ad_id || '');
+    if (adId) {
+      const aEntry = adMap.get(adId) || {
+        id: adId,
+        ad_id: adId,
+        adset_id: asId,
+        adset_name: String(row.adset_name || ''),
+        campaign_id: cmpId,
+        campaign_name: String(row.campaign_name || ''),
+        ad_account_id: String(row.ad_account_id || ''),
+        name: String(row.ad_name || `Ad ${adId}`),
+        thumbnail_url: row.thumbnail_url || '',
+        image_url: row.image_url || '',
+        creative_title: row.creative_title || '',
+        creative_body: row.creative_body || '',
+        story_id: row.story_id || '',
+        optimization_goal: row.optimization_goal || 'LEAD_GENERATION',
+        spend: 0,
+        impressions: 0,
+        clicks: 0,
+        reach: 0,
+        meta_leads: 0,
+      };
+      aEntry.spend += rSpend;
+      aEntry.impressions += rImp;
+      aEntry.clicks += rClicks;
+      aEntry.reach += rReach;
+      aEntry.meta_leads += rLeads;
+      adMap.set(adId, aEntry);
+    }
+  }
+
+  // Merge CRM lead daily counts into daily_trend
+  for (const l of leadRows) {
+    const dKey = toVnIsoDate(new Date(String(l.created_at)));
+    const dEntry = dailyMap.get(dKey) || { date: dKey, spend: 0, impressions: 0, clicks: 0, meta_leads: 0, crm_leads: 0 };
+    dEntry.crm_leads += 1;
+    dailyMap.set(dKey, dEntry);
+  }
+  const dailyTrend = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+  const enrichMetrics = (item: any, matchedLeads: any[]) => {
+    const lCount = matchedLeads.length;
+    const qualCount = matchedLeads.filter((x) => x.stage_category === 'qualified' || x.stage_category === 'won').length;
+    const wonCount = matchedLeads.filter((x) => x.stage_category === 'won').length;
+    const rev = matchedLeads.reduce((s, x) => s + Number(x.revenue_vnd || 0), 0);
+    const stageCounts: Record<string, number> = {};
+    for (const x of matchedLeads) {
+      const sk = String(x.stage_key || 'new');
+      stageCounts[sk] = (stageCounts[sk] || 0) + 1;
+    }
+    const denomLeads = lCount > 0 ? lCount : Number(item.meta_leads || 0);
+    return {
+      ...item,
+      leads: denomLeads,
+      crm_leads: lCount,
+      qualified: qualCount,
+      won: wonCount,
+      revenue: rev,
+      cpl: denomLeads > 0 ? Math.round(item.spend / denomLeads) : 0,
+      cpq: qualCount > 0 ? Math.round(item.spend / qualCount) : 0,
+      roas: item.spend > 0 ? Number((rev / item.spend).toFixed(2)) : 0,
+      ctr: item.impressions > 0 ? Number(((item.clicks / item.impressions) * 100).toFixed(2)) : 0,
+      cpc: item.clicks > 0 ? Math.round(item.spend / item.clicks) : 0,
+      stage_counts: stageCounts,
+      attributed_leads: matchedLeads,
+    };
+  };
+
+  const campaigns = Array.from(campaignMap.values())
+    .map((c) => enrichMetrics(c, leadsByCampaign.get(c.campaign_id) || []))
+    .sort((a, b) => b.spend - a.spend);
+  const adsets = Array.from(adsetMap.values())
+    .map((a) => enrichMetrics(a, leadsByAdset.get(a.adset_id) || []))
+    .sort((a, b) => b.spend - a.spend);
+  const ads = Array.from(adMap.values())
+    .map((ad) => enrichMetrics(ad, leadsByAd.get(ad.ad_id) || []))
+    .sort((a, b) => b.spend - a.spend);
+
+  const hierarchy = campaigns.map((cmp) => ({
+    ...cmp,
+    adsets: adsets
+      .filter((as) => as.campaign_id === cmp.campaign_id)
+      .map((as) => ({
+        ...as,
+        ads: ads.filter((ad) => ad.adset_id === as.adset_id),
+      })),
+  }));
+
+  const stageBreakdown = Array.from(stageMetaMap.values()).map((st) => ({
+    ...st,
+    pct: totalLeads > 0 ? Math.round((st.count / totalLeads) * 1000) / 10 : 0,
+  }));
+
+  const prevRow = prevRes.rows[0] || { spend: 0, impressions: 0, reach: 0, meta_leads: 0 };
+  const prevSpend = Number(prevRow.spend || 0);
+  const prevImp = Number(prevRow.impressions || 0);
+  const prevReach = Number(prevRow.reach || 0);
+  const prevMetaLeads = Number(prevRow.meta_leads || 0);
+  const pctChange = (cur: number, prev: number) => (prev > 0 ? Math.round(((cur - prev) / prev) * 1000) / 10 : 0);
+
+  const roas = spend > 0 ? Number((actualRevenue / spend).toFixed(2)) : 0;
+  const effectiveLeadDenom = totalLeads > 0 ? totalLeads : metaLeads;
+  const cpl = effectiveLeadDenom > 0 ? Math.round(spend / effectiveLeadDenom) : 0;
+  const metaCpl = metaLeads > 0 ? Math.round(spend / metaLeads) : 0;
+  const cpq = qualifiedStageLeads > 0 ? Math.round(spend / qualifiedStageLeads) : 0;
+  const cpw = wonStageLeads > 0 ? Math.round(spend / wonStageLeads) : 0;
+
+  return {
+    configured: true,
+    accounts,
+    summary: {
+      account_id: displayAccountId,
+      account_name: displayAccountName,
+      since: win.since,
+      until: win.until,
+      spend,
+      attributed_spend: spend,
+      account_total_spend: spend,
+      prev_spend: prevSpend,
+      spend_change_pct: pctChange(spend, prevSpend),
+      lead_goal_spend: spend,
+      meta_leads: metaLeads,
+      account_meta_leads: metaLeads,
+      prev_meta_leads: prevMetaLeads,
+      leads_change_pct: pctChange(metaLeads, prevMetaLeads),
+      meta_cpl: metaCpl,
+      account_meta_cpl: metaCpl,
+      cpl,
+      crm_cpl: totalLeads > 0 ? Math.round(spend / totalLeads) : 0,
+      cost_per_new_1_2: entryStageLeads > 0 ? Math.round(spend / entryStageLeads) : 0,
+      cpq,
+      cpq_3_12: cpq,
+      cpw,
+      impressions,
+      prev_impressions: prevImp,
+      impressions_change_pct: pctChange(impressions, prevImp),
+      reach,
+      prev_reach: prevReach,
+      reach_change_pct: pctChange(reach, prevReach),
+      frequency: reach > 0 ? Number((impressions / reach).toFixed(2)) : 0,
+      cpm: impressions > 0 ? Math.round((spend / impressions) * 1000) : 0,
+      clicks,
+      cpc: clicks > 0 ? Math.round(spend / clicks) : 0,
+      ctr: impressions > 0 ? Number(((clicks / impressions) * 100).toFixed(2)) : 0,
+      total_leads: totalLeads,
+      entry_stage_leads: entryStageLeads,
+      qualified_stage_leads: qualifiedStageLeads,
+      won_stage_leads: wonStageLeads,
+      lost_stage_leads: lostStageLeads,
+      nurture_stage_leads: nurtureStageLeads,
+      new_1_2_leads: entryStageLeads,
+      new_1_2_pct: totalLeads > 0 ? Math.round((entryStageLeads / totalLeads) * 1000) / 10 : 0,
+      qualified_3_12_leads: qualifiedStageLeads,
+      qualified_3_12_pct: totalLeads > 0 ? Math.round((qualifiedStageLeads / totalLeads) * 1000) / 10 : 0,
+      won_leads: wonStageLeads,
+      won_pct: totalLeads > 0 ? Math.round((wonStageLeads / totalLeads) * 1000) / 10 : 0,
+      qualified_leads: qualifiedStageLeads + wonStageLeads,
+      qualified_pct: totalLeads > 0 ? Math.round(((qualifiedStageLeads + wonStageLeads) / totalLeads) * 1000) / 10 : 0,
+      uncontacted_leads: Math.max(0, totalLeads - contactedLeads),
+      contacted_leads: contactedLeads,
+      contacted_pct: totalLeads > 0 ? Math.round((contactedLeads / totalLeads) * 1000) / 10 : 0,
+      assigned_leads: assignedLeads,
+      assigned_pct: totalLeads > 0 ? Math.round((assignedLeads / totalLeads) * 1000) / 10 : 0,
+      paid_leads: paidLeads,
+      organic_leads: Math.max(0, totalLeads - paidLeads),
+      instant_form_leads: instantFormLeads,
+      actual_revenue: actualRevenue,
+      roas,
+      campaigns_count: campaigns.length,
+      active_campaigns_count: campaigns.length,
+      adsets_count: adsets.length,
+      active_adsets_count: adsets.length,
+      ads_count: ads.length,
+      active_ads_count: ads.length,
+      forms_count: Array.from(new Set(leadRows.map((l) => l.form_id).filter(Boolean))).length,
+      valid_phone_pct: totalLeads > 0 ? Math.round((validPhoneCount / totalLeads) * 1000) / 10 : 0,
+      survey_completed_pct: 0,
+    },
+    stage_breakdown: stageBreakdown,
+    daily_trend: dailyTrend,
+    campaigns,
+    by_campaign: campaigns,
+    adsets,
+    by_adset: adsets,
+    ads,
+    by_ad: ads,
+    hierarchy,
+    meta_goal_chart: Array.from(goalMap.values()),
+    funnel_stages: stageBreakdown.map((s) => ({ name: s.stage_name, count: s.count, pct: s.pct, color: s.color_hex })),
+    pipeline_stages_catalog: stageBreakdown.map((s) => ({
+      key: s.stage_key,
+      stage_id: s.stage_id,
+      stage_order: s.stage_order,
+      stage_name: s.stage_name,
+      bucket: s.category === 'entry' ? 'new_1_2' : s.category === 'qualified' ? 'qualified_3_12' : s.category === 'won' ? 'win_13_14' : s.category,
+      count: s.count,
+      color_hex: s.color_hex,
+    })),
+    top_advisors: Array.from(advisorMap.values()).sort((a, b) => b.leads - a.leads),
+    attributed_leads: leadRows.slice(0, 200).map((l) => {
+      const stInfo = l.stage_id ? stageMetaMap.get(String(l.stage_id)) : undefined;
+      const dto = {
+        id: String(l.id),
+        contact_id: String(l.id),
+        full_name: String(l.name || ''),
+        phone: l.phone ? String(l.phone) : '',
+        email: l.email ? String(l.email) : '',
+        ad_id: l.ad_id ? String(l.ad_id) : '',
+        ad_name: l.ad_id ? adMap.get(String(l.ad_id))?.name || String(l.ad_id) : '',
+        campaign_id: l.campaign_id ? String(l.campaign_id) : '',
+        stage_key: stInfo?.stage_key || 'new',
+        stage_name: stInfo?.stage_name || 'Mới tiếp nhận',
+        owner_name: String(l.owner_name || 'Chưa phân bổ'),
+        created_at: l.created_at,
+      };
+      return maskRow ? maskRow(dto) : dto;
+    }),
+  };
+}

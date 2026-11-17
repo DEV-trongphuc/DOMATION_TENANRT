@@ -75,42 +75,160 @@ export interface FlowTraceEntry {
   timestamp: string;
 }
 
-function evaluateConditionOnLead(
-  lead: Record<string, unknown>,
-  config: Record<string, unknown>
-): boolean {
-  const field = String(config.field || 'lead_score').trim();
-  const op = String(config.operator || config.op || 'gte').trim().toLowerCase();
-  const expected = config.value;
+function resolveLeadFieldValue(lead: Record<string, unknown>, rawField: string): unknown {
+  const field = String(rawField || 'lead_score').trim();
+  const fieldLower = field.toLowerCase();
+  const cf = parseJsonCol<Record<string, unknown>>(lead.custom_fields, {});
 
-  let actual: unknown;
-  if (field.startsWith('custom_fields.')) {
-    const cfKey = field.slice('custom_fields.'.length);
-    const cf = parseJsonCol<Record<string, unknown>>(lead.custom_fields, {});
-    actual = cf[cfKey];
-  } else if (field === 'tags') {
-    actual = Array.isArray(lead.tags) ? lead.tags : [];
-  } else {
-    actual = lead[field];
+  if (fieldLower.startsWith('custom_fields.') || fieldLower.startsWith('cf.') || fieldLower.startsWith('custom.')) {
+    const cfKey = field.replace(/^(?:custom_fields|cf|custom)\./i, '').trim();
+    return cf[cfKey];
+  }
+  if (fieldLower === 'firstname' || fieldLower === 'first_name') {
+    return cf.first_name ?? cf.firstName ?? lead.name ?? '';
+  }
+  if (fieldLower === 'lastname' || fieldLower === 'last_name') {
+    return cf.last_name ?? cf.lastName ?? lead.name ?? '';
+  }
+  if (fieldLower === 'phonenumber' || fieldLower === 'phone_number' || fieldLower === 'phone') {
+    return lead.phone ?? lead.phone_number ?? '';
+  }
+  if (fieldLower === 'crm_stage_id' || fieldLower === 'crm_stage_is' || fieldLower === 'stage_id') {
+    return lead.stage_id ?? lead.stage_key ?? lead.stage_name ?? '';
+  }
+  if (fieldLower === 'crm_lead_status' || fieldLower === 'status') {
+    return lead.status ?? lead.lifecycle_stage ?? '';
+  }
+  if (fieldLower === 'crm_temperature' || fieldLower === 'crm_temperature_is') {
+    return cf.temperature ?? lead.quality_status ?? (Number(lead.lead_score || 0) >= 70 ? 'hot' : Number(lead.lead_score || 0) >= 30 ? 'warm' : 'cold');
+  }
+  if (fieldLower === 'crm_owner_id' || fieldLower === 'salesperson' || fieldLower === 'crm_assigned_to' || fieldLower === 'assigned_to') {
+    return lead.assigned_to ?? '';
+  }
+  if (fieldLower === 'erp_deal_value' || fieldLower === 'crm_expected_revenue' || fieldLower === 'total_revenue_vnd') {
+    return lead.total_revenue_vnd ?? cf.deal_value ?? 0;
+  }
+  if (fieldLower === 'leadscore' || fieldLower === 'lead_score' || fieldLower === 'score') {
+    return lead.lead_score ?? 0;
+  }
+  if (fieldLower === 'lastactivitydays' || fieldLower === 'inactive_days' || fieldLower === 'days_since_engaged') {
+    const refTs = lead.last_engaged_at || lead.updated_at || lead.created_at;
+    if (!refTs) return 0;
+    const diffMs = Date.now() - new Date(String(refTs)).getTime();
+    return Number.isFinite(diffMs) ? Math.max(0, Math.floor(diffMs / 86_400_000)) : 0;
+  }
+  if (fieldLower === 'crm_program' || fieldLower === 'product_interest') {
+    return lead.product_interest ?? '';
+  }
+  if (fieldLower === 'has_email') {
+    return Boolean(lead.email && String(lead.email).trim().length > 0);
+  }
+  if (fieldLower === 'has_phone') {
+    return Boolean(lead.phone && String(lead.phone).trim().length > 0);
+  }
+  if (fieldLower === 'tags' || fieldLower === 'tag') {
+    return Array.isArray(lead.tags) ? lead.tags : [];
+  }
+  return lead[field] !== undefined ? lead[field] : cf[field];
+}
+
+function evaluateSingleConditionRule(
+  lead: Record<string, unknown>,
+  rule: Record<string, unknown>
+): boolean {
+  const field = String(rule.field || 'lead_score').trim();
+  const fieldLower = field.toLowerCase();
+  const op = String(rule.operator || rule.op || 'gte').trim().toLowerCase();
+  const expected = rule.value !== undefined ? rule.value : rule.val;
+  const actual = resolveLeadFieldValue(lead, field);
+
+  if (fieldLower === 'crm_lead_status') {
+    const normStatus = String(lead.status || '').toLowerCase();
+    const expLower = String(expected || '').toLowerCase();
+    const matched =
+      expLower === 'active'
+        ? normStatus === 'assigned' || normStatus === 'unassigned_pending'
+        : expLower === 'nurture'
+          ? normStatus === 'marketing_nurture'
+          : expLower === 'lost'
+            ? normStatus === 'archived' || normStatus === 'rejected' || normStatus === 'blacklisted'
+            : normStatus === expLower;
+    return op === 'is_not' || op === 'neq' || op === '!=' || op === 'not_equals' ? !matched : matched;
   }
 
+  if (op === 'is_empty' || op === 'empty') {
+    if (Array.isArray(actual)) return actual.length === 0;
+    return actual === null || actual === undefined || String(actual).trim().length === 0;
+  }
+  if (op === 'is_not_empty' || op === 'not_empty') {
+    if (Array.isArray(actual)) return actual.length > 0;
+    return actual !== null && actual !== undefined && String(actual).trim().length > 0;
+  }
   if (op === 'gte' || op === '>=') return Number(actual || 0) >= Number(expected || 0);
-  if (op === 'gt' || op === '>') return Number(actual || 0) > Number(expected || 0);
+  if (op === 'gt' || op === '>' || op === 'greater_than') return Number(actual || 0) > Number(expected || 0);
   if (op === 'lte' || op === '<=') return Number(actual || 0) <= Number(expected || 0);
-  if (op === 'lt' || op === '<') return Number(actual || 0) < Number(expected || 0);
+  if (op === 'lt' || op === '<' || op === 'less_than') return Number(actual || 0) < Number(expected || 0);
   if (op === 'contains') {
     if (Array.isArray(actual)) {
       return actual.map((x) => String(x).toLowerCase()).includes(String(expected || '').toLowerCase());
     }
     return String(actual || '').toLowerCase().includes(String(expected || '').toLowerCase());
   }
-  if (op === 'neq' || op === '!=') {
+  if (op === 'not_contains') {
+    if (Array.isArray(actual)) {
+      return !actual.map((x) => String(x).toLowerCase()).includes(String(expected || '').toLowerCase());
+    }
+    return !String(actual || '').toLowerCase().includes(String(expected || '').toLowerCase());
+  }
+  if (op === 'starts_with') {
+    return String(actual || '').toLowerCase().startsWith(String(expected || '').toLowerCase());
+  }
+  if (op === 'ends_with') {
+    return String(actual || '').toLowerCase().endsWith(String(expected || '').toLowerCase());
+  }
+  if (op === 'in' || op === 'in_list') {
+    const arr = Array.isArray(expected)
+      ? expected.map((v) => String(v).trim().toLowerCase())
+      : String(expected || '').split(',').map((v) => v.trim().toLowerCase()).filter(Boolean);
+    return arr.includes(String(actual ?? '').trim().toLowerCase());
+  }
+  if (op === 'not_in' || op === 'not_in_list') {
+    const arr = Array.isArray(expected)
+      ? expected.map((v) => String(v).trim().toLowerCase())
+      : String(expected || '').split(',').map((v) => v.trim().toLowerCase()).filter(Boolean);
+    return !arr.includes(String(actual ?? '').trim().toLowerCase());
+  }
+  if (op === 'neq' || op === '!=' || op === 'is_not' || op === 'not_equals') {
     return String(actual ?? '').toLowerCase() !== String(expected ?? '').toLowerCase();
   }
-  if (op === 'not_empty') {
-    return actual !== null && actual !== undefined && String(actual).trim().length > 0;
-  }
   return String(actual ?? '').toLowerCase() === String(expected ?? '').toLowerCase();
+}
+
+function evaluateConditionOnLead(
+  lead: Record<string, unknown>,
+  config: Record<string, unknown>
+): boolean {
+  const groupObj =
+    config.conditionGroup && typeof config.conditionGroup === 'object'
+      ? (config.conditionGroup as Record<string, unknown>)
+      : null;
+  if (groupObj && Array.isArray(groupObj.conditions)) {
+    const logic = String(groupObj.logic || 'AND').toUpperCase();
+    const conds = groupObj.conditions as Array<Record<string, unknown>>;
+    if (conds.length === 0) return false;
+    return logic === 'OR'
+      ? conds.some((c) => evaluateConditionOnLead(lead, c))
+      : conds.every((c) => evaluateConditionOnLead(lead, c));
+  }
+  if (Array.isArray(config.conditions)) {
+    const logic = String(config.logic || 'AND').toUpperCase();
+    const conds = config.conditions as Array<Record<string, unknown>>;
+    if (conds.length === 0) return false;
+    return logic === 'OR'
+      ? conds.some((c) => evaluateConditionOnLead(lead, c))
+      : conds.every((c) => evaluateConditionOnLead(lead, c));
+  }
+  return evaluateSingleConditionRule(lead, config);
 }
 
 /**

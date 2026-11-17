@@ -11,7 +11,9 @@ import {
   sendApiError,
 } from '../../core/security/rbac.ts';
 import { slugifyCode } from '../org-rbac/org-rbac.service.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import {
+  DEFAULT_APPROVAL_WORKFLOW_TEMPLATES,
   ensureDefaultApprovalWorkflowsInTx,
   ensureHrmApprovalsSchemaMiddleware,
   parseJsonSafe,
@@ -23,17 +25,114 @@ import {
   resolveDynamicApprovalStepsInTx,
 } from './approval-engine.ts';
 
-const VALID_CATEGORIES = new Set([
-  'leave',
-  'overtime',
-  'cash_advance',
-  'expense',
-  'purchase_order',
-  'sales_order',
-  'contract',
-  'custom_form',
-  'attendance_explanation',
-]);
+function normalizeWorkflowCategory(raw: unknown): string {
+  const cleaned = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40);
+  return cleaned || 'custom_form';
+}
+
+function normalizeStringArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return Array.from(new Set(raw.map((v) => String(v || '').trim()).filter(Boolean)));
+}
+
+async function markApprovalsCustomOnlyInTx(client: any, tenantId: string, flag = true): Promise<void> {
+  const tRes = await client.query(
+    'SELECT slug, settings FROM tenants WHERE id = $1 LIMIT 1',
+    [tenantId]
+  );
+  const row = tRes.rows[0] as { slug?: string; settings?: unknown } | undefined;
+  if (!row) return;
+  const cur = parseJsonSafe<Record<string, unknown>>(row.settings, {});
+  const next = {
+    ...cur,
+    approvals_custom_only: flag,
+    approvals_custom_mode: flag,
+    approvals_initialized: true,
+  };
+  await client.query('UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1', [
+    tenantId,
+    JSON.stringify(next),
+  ]);
+  if (row.slug) tenantRedis.invalidateTenantCache(tenantId, row.slug);
+}
+
+interface ApprovalCategoryDto {
+  key: string;
+  label: string;
+  color: string;
+  description: string;
+  sort_order: number;
+}
+
+async function saveApprovalCategoriesInTx(
+  client: any,
+  tenantId: string,
+  categories: ApprovalCategoryDto[]
+): Promise<ApprovalCategoryDto[]> {
+  const tRes = await client.query(
+    'SELECT slug, settings FROM tenants WHERE id = $1 LIMIT 1',
+    [tenantId]
+  );
+  const row = tRes.rows[0];
+  const cur = parseJsonSafe<Record<string, unknown>>(row?.settings, {});
+  const next = {
+    ...cur,
+    approval_categories: categories,
+    approvals_custom_only: true,
+    approvals_custom_mode: true,
+    approvals_initialized: true,
+  };
+  await client.query('UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1', [
+    tenantId,
+    JSON.stringify(next),
+  ]);
+  if (row?.slug) tenantRedis.invalidateTenantCache(tenantId, row.slug);
+  return categories;
+}
+
+async function listApprovalCategoriesInTx(client: any, tenantId: string) {
+  const [tRes, wfCatsRes] = await Promise.all([
+    client.query('SELECT settings FROM tenants WHERE id = $1 LIMIT 1', [tenantId]),
+    client.query(
+      `SELECT DISTINCT category, category_label FROM tenant_approval_workflows WHERE tenant_id = $1 ORDER BY category ASC`,
+      [tenantId]
+    ),
+  ]);
+  const rawSettings = parseJsonSafe<Record<string, unknown>>(tRes.rows[0]?.settings, {});
+  const configured = Array.isArray(rawSettings.approval_categories)
+    ? (rawSettings.approval_categories as Array<Record<string, unknown>>)
+    : [];
+  const catMap = new Map<string, { key: string; label: string; color?: string; description?: string; sort_order: number }>();
+  configured.forEach((c, idx) => {
+    const k = normalizeWorkflowCategory(c?.key ?? c?.id);
+    if (!k) return;
+    catMap.set(k, {
+      key: k,
+      label: String(c?.label || c?.name || k).trim(),
+      color: c?.color ? String(c.color).trim() : '#1E40FF',
+      description: c?.description ? String(c.description).trim() : '',
+      sort_order: Number(c?.sort_order ?? idx + 1),
+    });
+  });
+  for (const r of wfCatsRes.rows) {
+    const k = normalizeWorkflowCategory(r.category);
+    if (!catMap.has(k)) {
+      catMap.set(k, {
+        key: k,
+        label: r.category_label ? String(r.category_label).trim() : k,
+        color: '#1E40FF',
+        description: '',
+        sort_order: catMap.size + 1,
+      });
+    }
+  }
+  return Array.from(catMap.values()).sort((a, b) => a.sort_order - b.sort_order);
+}
 
 const VALID_APPROVER_TYPES = new Set([
   'direct_manager',
@@ -60,7 +159,7 @@ approvalsRouter.get('/overview', requirePermission('approvals', 'view'), async (
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       await ensureDefaultApprovalWorkflowsInTx(client, ctx.tenantId);
 
-      const [inboxCnt, mineStats, wfCnt, delCnt, usersRes, rolesRes, deptsRes, branchesRes] =
+      const [inboxCnt, mineStats, wfCnt, delCnt, usersRes, rolesRes, deptsRes, teamsRes, branchesRes] =
         await Promise.all([
           client.query<{ cnt: number }>(
             `SELECT COUNT(*)::int AS cnt
@@ -91,9 +190,9 @@ approvalsRouter.get('/overview', requirePermission('approvals', 'view'), async (
             [ctx.tenantId]
           ),
           client.query(
-            `SELECT id, full_name, email, role, role_id, branch_id, department_id, team_id
+            `SELECT id, full_name, email, role, role_id, branch_id, department_id, team_id, position_id, reports_to_user_id, avatar_url
              FROM users
-             WHERE tenant_id = $1 AND is_system_bot = false
+             WHERE tenant_id = $1 AND COALESCE(is_system_bot, false) = false
              ORDER BY full_name ASC`,
             [ctx.tenantId]
           ),
@@ -106,11 +205,16 @@ approvalsRouter.get('/overview', requirePermission('approvals', 'view'), async (
             [ctx.tenantId]
           ),
           client.query(
+            'SELECT id, code, name, department_id, branch_id, leader_user_id FROM tenant_teams WHERE tenant_id = $1 AND is_active = true ORDER BY name ASC',
+            [ctx.tenantId]
+          ),
+          client.query(
             'SELECT id, code, name, manager_user_id, is_headquarters FROM tenant_branches WHERE tenant_id = $1 AND is_active = true ORDER BY is_headquarters DESC, name ASC',
             [ctx.tenantId]
           ),
         ]);
 
+      const categories = await listApprovalCategoriesInTx(client, ctx.tenantId);
       const st = mineStats.rows[0] || { pending_mine: 0, approved_total: 0, rejected_total: 0 };
       return {
         summary: {
@@ -121,10 +225,12 @@ approvalsRouter.get('/overview', requirePermission('approvals', 'view'), async (
           active_workflows: Number(wfCnt.rows[0]?.cnt || 0),
           active_delegations: Number(delCnt.rows[0]?.cnt || 0),
         },
+        categories,
         directory: {
           users: usersRes.rows,
           roles: rolesRes.rows,
           departments: deptsRes.rows,
+          teams: teamsRes.rows,
           branches: branchesRes.rows,
         },
       };
@@ -133,6 +239,148 @@ approvalsRouter.get('/overview', requirePermission('approvals', 'view'), async (
     res.json({ success: true, data });
   } catch (err: any) {
     sendApiError(res, 500, 'APPROVALS_OVERVIEW_FAILED', err?.message || 'Không thể tải tổng quan phê duyệt.');
+  }
+});
+
+approvalsRouter.get(['/categories', '/workflows/categories'], requirePermission('approvals', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const categories = await withTenantTransaction(ctx.tenantId, (client) =>
+      listApprovalCategoriesInTx(client, ctx.tenantId)
+    );
+    res.json({ success: true, data: categories });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_APPROVAL_CATEGORIES_FAILED', err?.message || 'Không thể tải thể loại quy trình.');
+  }
+});
+
+approvalsRouter.post(['/categories', '/workflows/categories'], requirePermission('approvals', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const label = String(b.label || b.name || b.key || '').trim();
+    if (!label) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Tên thể loại quy trình không được để trống.');
+      return;
+    }
+    const key = normalizeWorkflowCategory(b.key ?? b.id ?? label);
+    const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const existing = await listApprovalCategoriesInTx(client, ctx.tenantId);
+      const list: ApprovalCategoryDto[] = existing.map((c, idx) => ({
+        key: c.key,
+        label: c.label,
+        color: c.color || '#1E40FF',
+        description: c.description || '',
+        sort_order: Number(c.sort_order ?? idx + 1),
+      }));
+      const item: ApprovalCategoryDto = {
+        key,
+        label,
+        color: b.color ? String(b.color).trim() : '#1E40FF',
+        description: b.description ? String(b.description).trim() : '',
+        sort_order: Number(b.sort_order ?? list.length + 1),
+      };
+      const idx = list.findIndex((c) => c.key === key);
+      if (idx >= 0) {
+        list[idx] = { ...list[idx], ...item };
+      } else {
+        list.push(item);
+      }
+      await saveApprovalCategoriesInTx(client, ctx.tenantId, list);
+      return { category: item, categories: list };
+    });
+    res.status(201).json({ success: true, data: saved });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_APPROVAL_CATEGORY_FAILED', err?.message || 'Không thể tạo thể loại quy trình.');
+  }
+});
+
+approvalsRouter.put(['/categories', '/workflows/categories'], requirePermission('approvals', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const rawCats = Array.isArray(req.body?.categories) ? req.body.categories : Array.isArray(req.body) ? req.body : [];
+    const normalized: ApprovalCategoryDto[] = rawCats
+      .map((c: any, idx: number) => {
+        const key = normalizeWorkflowCategory(c?.key ?? c?.id ?? c?.label);
+        const label = String(c?.label || c?.name || key).trim();
+        if (!label) return null;
+        return {
+          key,
+          label,
+          color: c?.color ? String(c.color).trim() : '#1E40FF',
+          description: c?.description ? String(c.description).trim() : '',
+          sort_order: Number(c?.sort_order ?? idx + 1),
+        };
+      })
+      .filter((x: ApprovalCategoryDto | null): x is ApprovalCategoryDto => Boolean(x));
+
+    const saved = await withTenantTransaction(ctx.tenantId, (client) =>
+      saveApprovalCategoriesInTx(client, ctx.tenantId, normalized)
+    );
+    res.json({ success: true, data: saved });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SAVE_APPROVAL_CATEGORIES_FAILED', err?.message || 'Không thể lưu thể loại quy trình.');
+  }
+});
+
+approvalsRouter.put(['/categories/:key', '/workflows/categories/:key'], requirePermission('approvals', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const key = normalizeWorkflowCategory(req.params.key);
+    const b = req.body || {};
+    const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const existing = await listApprovalCategoriesInTx(client, ctx.tenantId);
+      const list: ApprovalCategoryDto[] = existing.map((c, idx) => ({
+        key: c.key,
+        label: c.label,
+        color: c.color || '#1E40FF',
+        description: c.description || '',
+        sort_order: Number(c.sort_order ?? idx + 1),
+      }));
+      const idx = list.findIndex((c) => c.key === key);
+      const nextLabel = String(b.label || b.name || (idx >= 0 ? list[idx].label : key)).trim();
+      const updatedItem: ApprovalCategoryDto = {
+        key,
+        label: nextLabel,
+        color: b.color ? String(b.color).trim() : (idx >= 0 ? list[idx].color : '#1E40FF'),
+        description: b.description !== undefined ? String(b.description).trim() : (idx >= 0 ? list[idx].description : ''),
+        sort_order: Number(b.sort_order ?? (idx >= 0 ? list[idx].sort_order : list.length + 1)),
+      };
+      if (idx >= 0) list[idx] = updatedItem;
+      else list.push(updatedItem);
+      await saveApprovalCategoriesInTx(client, ctx.tenantId, list);
+      await client.query(
+        'UPDATE tenant_approval_workflows SET category_label = $3, updated_at = clock_timestamp() WHERE tenant_id = $1 AND category = $2',
+        [ctx.tenantId, key, nextLabel]
+      );
+      return { category: updatedItem, categories: list };
+    });
+    res.json({ success: true, data: saved });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_APPROVAL_CATEGORY_FAILED', err?.message || 'Không thể cập nhật thể loại quy trình.');
+  }
+});
+
+approvalsRouter.delete(['/categories/:key', '/workflows/categories/:key'], requirePermission('approvals', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const key = normalizeWorkflowCategory(req.params.key);
+    const remaining = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const existing = await listApprovalCategoriesInTx(client, ctx.tenantId);
+      const filtered: ApprovalCategoryDto[] = existing
+        .filter((c) => c.key !== key)
+        .map((c, idx) => ({
+          key: c.key,
+          label: c.label,
+          color: c.color || '#1E40FF',
+          description: c.description || '',
+          sort_order: Number(c.sort_order ?? idx + 1),
+        }));
+      return saveApprovalCategoriesInTx(client, ctx.tenantId, filtered);
+    });
+    res.json({ success: true, data: { deleted: true, key, categories: remaining } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_APPROVAL_CATEGORY_FAILED', err?.message || 'Không thể xóa thể loại quy trình.');
   }
 });
 
@@ -180,6 +428,8 @@ approvalsRouter.get('/workflows', requirePermission('approvals', 'view'), async 
       return wfRes.rows.map((w) => ({
         ...w,
         form_schema: parseJsonSafe<any[]>(w.form_schema, []),
+        default_watcher_ids: parseJsonSafe<string[]>(w.default_watcher_ids, []),
+        default_watcher_roles: parseJsonSafe<string[]>(w.default_watcher_roles, []),
         require_attachment: toBool(w.require_attachment, false),
         auto_approve_if_creator_is_approver: toBool(w.auto_approve_if_creator_is_approver, true),
         is_active: toBool(w.is_active, true),
@@ -203,18 +453,22 @@ approvalsRouter.post('/workflows', requirePermission('approvals', 'manage_config
       return;
     }
 
-    const category = VALID_CATEGORIES.has(String(b.category || '')) ? String(b.category) : 'custom_form';
+    const category = normalizeWorkflowCategory(b.category);
+    const categoryLabel = b.category_label ? String(b.category_label).trim() : null;
+    const defaultWatcherIds = normalizeStringArray(b.default_watcher_ids);
+    const defaultWatcherRoles = normalizeStringArray(b.default_watcher_roles);
     const wfId = crypto.randomUUID();
     const code = slugifyCode(b.code || `${category}_${wfId.slice(0, 6)}`, 'WF');
     const rawSteps = Array.isArray(b.steps) ? b.steps : [];
 
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await markApprovalsCustomOnlyInTx(client, ctx.tenantId, true);
       await client.query(
         `INSERT INTO tenant_approval_workflows (
-           id, tenant_id, code, name, description, category, form_schema,
+           id, tenant_id, code, name, description, category, category_label, form_schema,
            icon_name, color_hex, require_attachment, auto_approve_if_creator_is_approver,
-           is_active, created_by
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13)`,
+           default_watcher_ids, default_watcher_roles, is_active, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16)`,
         [
           wfId,
           ctx.tenantId,
@@ -222,11 +476,14 @@ approvalsRouter.post('/workflows', requirePermission('approvals', 'manage_config
           name,
           b.description ? String(b.description).trim() : null,
           category,
+          categoryLabel,
           JSON.stringify(Array.isArray(b.form_schema) ? b.form_schema : []),
           b.icon_name ? String(b.icon_name).trim() : 'FileCheck',
           b.color_hex ? String(b.color_hex).trim() : '#1E40FF',
           Boolean(b.require_attachment),
           b.auto_approve_if_creator_is_approver !== false,
+          JSON.stringify(defaultWatcherIds),
+          JSON.stringify(defaultWatcherRoles),
           b.is_active !== false,
           ctx.userId,
         ]
@@ -296,6 +553,8 @@ approvalsRouter.post('/workflows', requirePermission('approvals', 'manage_config
       return {
         ...wfRow.rows[0],
         form_schema: parseJsonSafe<any[]>(wfRow.rows[0]?.form_schema, []),
+        default_watcher_ids: parseJsonSafe<string[]>(wfRow.rows[0]?.default_watcher_ids, []),
+        default_watcher_roles: parseJsonSafe<string[]>(wfRow.rows[0]?.default_watcher_roles, []),
         steps: stRows.rows,
       };
     });
@@ -319,23 +578,40 @@ const updateWorkflowHandler = async (req: any, res: any) => {
       );
       if (existing.rows.length === 0) return null;
       const cur = existing.rows[0];
+      await markApprovalsCustomOnlyInTx(client, ctx.tenantId, true);
 
-      const nextCategory =
-        b.category && VALID_CATEGORIES.has(String(b.category)) ? String(b.category) : cur.category;
+      const nextCategory = b.category !== undefined ? normalizeWorkflowCategory(b.category) : cur.category;
+      const nextCategoryLabel =
+        b.category_label !== undefined
+          ? (b.category_label ? String(b.category_label).trim() : null)
+          : cur.category_label;
       const nextSchema =
         b.form_schema !== undefined
           ? JSON.stringify(Array.isArray(b.form_schema) ? b.form_schema : [])
           : JSON.stringify(parseJsonSafe<any[]>(cur.form_schema, []));
+      const nextWatcherIds =
+        b.default_watcher_ids !== undefined
+          ? JSON.stringify(normalizeStringArray(b.default_watcher_ids))
+          : JSON.stringify(parseJsonSafe<string[]>(cur.default_watcher_ids, []));
+      const nextWatcherRoles =
+        b.default_watcher_roles !== undefined
+          ? JSON.stringify(normalizeStringArray(b.default_watcher_roles))
+          : JSON.stringify(parseJsonSafe<string[]>(cur.default_watcher_roles, []));
 
       await client.query(
         `UPDATE tenant_approval_workflows
          SET name = $3,
              description = $4,
              category = $5,
-             form_schema = $6::jsonb,
-             color_hex = $7,
-             require_attachment = $8,
-             is_active = $9,
+             category_label = $6,
+             form_schema = $7::jsonb,
+             icon_name = $8,
+             color_hex = $9,
+             require_attachment = $10,
+             auto_approve_if_creator_is_approver = $11,
+             default_watcher_ids = $12::jsonb,
+             default_watcher_roles = $13::jsonb,
+             is_active = $14,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
         [
@@ -344,9 +620,16 @@ const updateWorkflowHandler = async (req: any, res: any) => {
           b.name !== undefined ? String(b.name).trim() : cur.name,
           b.description !== undefined ? (b.description ? String(b.description).trim() : null) : cur.description,
           nextCategory,
+          nextCategoryLabel,
           nextSchema,
+          b.icon_name !== undefined ? String(b.icon_name).trim() : (cur.icon_name || 'FileCheck'),
           b.color_hex !== undefined ? String(b.color_hex).trim() : cur.color_hex,
           b.require_attachment !== undefined ? Boolean(b.require_attachment) : toBool(cur.require_attachment, false),
+          b.auto_approve_if_creator_is_approver !== undefined
+            ? Boolean(b.auto_approve_if_creator_is_approver)
+            : toBool(cur.auto_approve_if_creator_is_approver, true),
+          nextWatcherIds,
+          nextWatcherRoles,
           b.is_active !== undefined ? Boolean(b.is_active) : toBool(cur.is_active, true),
         ]
       );
@@ -405,6 +688,8 @@ const updateWorkflowHandler = async (req: any, res: any) => {
       return {
         ...wfRow.rows[0],
         form_schema: parseJsonSafe<any[]>(wfRow.rows[0]?.form_schema, []),
+        default_watcher_ids: parseJsonSafe<string[]>(wfRow.rows[0]?.default_watcher_ids, []),
+        default_watcher_roles: parseJsonSafe<string[]>(wfRow.rows[0]?.default_watcher_roles, []),
         steps: stRows.rows,
       };
     });
@@ -422,11 +707,159 @@ const updateWorkflowHandler = async (req: any, res: any) => {
 approvalsRouter.put('/workflows/:id', requirePermission('approvals', 'manage_config'), updateWorkflowHandler);
 approvalsRouter.patch('/workflows/:id', requirePermission('approvals', 'manage_config'), updateWorkflowHandler);
 
+const clearAllWorkflowsHandler = async (_req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await markApprovalsCustomOnlyInTx(client, ctx.tenantId, true);
+      await client.query(
+        `DELETE FROM tenant_approval_workflows w
+         WHERE w.tenant_id = $1
+           AND NOT EXISTS (SELECT 1 FROM tenant_approval_requests r WHERE r.tenant_id = w.tenant_id AND r.workflow_id = w.id)`,
+        [ctx.tenantId]
+      );
+      await client.query(
+        `UPDATE tenant_approval_workflows SET is_active = false, updated_at = clock_timestamp() WHERE tenant_id = $1`,
+        [ctx.tenantId]
+      );
+    });
+    res.json({ success: true, data: { cleared: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CLEAR_WORKFLOWS_FAILED', err?.message || 'Không thể xóa danh sách quy trình mẫu.');
+  }
+};
+
+approvalsRouter.post('/workflows/clear', requirePermission('approvals', 'manage_config'), clearAllWorkflowsHandler);
+approvalsRouter.delete('/workflows/all', requirePermission('approvals', 'manage_config'), clearAllWorkflowsHandler);
+
+approvalsRouter.post('/workflows/import-presets', requirePermission('approvals', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const requestedCodes = Array.isArray(req.body?.codes)
+      ? req.body.codes.map((c: unknown) => String(c || '').trim()).filter(Boolean)
+      : [];
+    const templates =
+      requestedCodes.length > 0
+        ? DEFAULT_APPROVAL_WORKFLOW_TEMPLATES.filter((t) => requestedCodes.includes(t.code))
+        : DEFAULT_APPROVAL_WORKFLOW_TEMPLATES;
+
+    const imported = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await markApprovalsCustomOnlyInTx(client, ctx.tenantId, true);
+      const out: any[] = [];
+      for (const tpl of templates) {
+        const existingRes = await client.query<{ id: string; is_active: boolean }>(
+          'SELECT id, is_active FROM tenant_approval_workflows WHERE tenant_id = $1 AND code = $2 LIMIT 1',
+          [ctx.tenantId, tpl.code]
+        );
+        let wfId = existingRes.rows[0]?.id ? String(existingRes.rows[0].id) : '';
+        if (wfId) {
+          await client.query(
+            `UPDATE tenant_approval_workflows
+             SET is_active = true,
+                 name = COALESCE(NULLIF(name, ''), $3),
+                 category_label = COALESCE(category_label, $4),
+                 updated_at = clock_timestamp()
+             WHERE tenant_id = $1 AND id = $2`,
+            [ctx.tenantId, wfId, tpl.name, tpl.category_label]
+          );
+          const stCnt = await client.query<{ cnt: number }>(
+            'SELECT COUNT(*)::int AS cnt FROM tenant_approval_workflow_steps WHERE tenant_id = $1 AND workflow_id = $2',
+            [ctx.tenantId, wfId]
+          );
+          if (Number(stCnt.rows[0]?.cnt || 0) === 0) {
+            for (const st of tpl.steps) {
+              await client.query(
+                `INSERT INTO tenant_approval_workflow_steps (
+                   id, tenant_id, workflow_id, step_order, step_name, approver_type,
+                   min_amount_threshold, max_amount_threshold, approval_mode, fallback_strategy, sla_hours
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [
+                  crypto.randomUUID(),
+                  ctx.tenantId,
+                  wfId,
+                  st.step_order,
+                  st.step_name,
+                  st.approver_type,
+                  st.min_amount_threshold,
+                  st.max_amount_threshold,
+                  st.approval_mode,
+                  st.fallback_strategy,
+                  st.sla_hours,
+                ]
+              );
+            }
+          }
+        } else {
+          wfId = crypto.randomUUID();
+          await client.query(
+            `INSERT INTO tenant_approval_workflows (
+               id, tenant_id, code, name, description, category, category_label, form_schema, icon_name, color_hex, is_active, created_by
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, true, $11)`,
+            [
+              wfId,
+              ctx.tenantId,
+              tpl.code,
+              tpl.name,
+              tpl.description,
+              tpl.category,
+              tpl.category_label,
+              JSON.stringify(tpl.form_schema),
+              tpl.icon_name,
+              tpl.color_hex,
+              ctx.userId,
+            ]
+          );
+          for (const st of tpl.steps) {
+            await client.query(
+              `INSERT INTO tenant_approval_workflow_steps (
+                 id, tenant_id, workflow_id, step_order, step_name, approver_type,
+                 min_amount_threshold, max_amount_threshold, approval_mode, fallback_strategy, sla_hours
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              [
+                crypto.randomUUID(),
+                ctx.tenantId,
+                wfId,
+                st.step_order,
+                st.step_name,
+                st.approver_type,
+                st.min_amount_threshold,
+                st.max_amount_threshold,
+                st.approval_mode,
+                st.fallback_strategy,
+                st.sla_hours,
+              ]
+            );
+          }
+        }
+        const [wfRow, stRows] = await Promise.all([
+          client.query('SELECT * FROM tenant_approval_workflows WHERE tenant_id = $1 AND id = $2', [ctx.tenantId, wfId]),
+          client.query('SELECT * FROM tenant_approval_workflow_steps WHERE tenant_id = $1 AND workflow_id = $2 ORDER BY step_order ASC', [ctx.tenantId, wfId]),
+        ]);
+        if (wfRow.rows[0]) {
+          out.push({
+            ...wfRow.rows[0],
+            form_schema: parseJsonSafe<any[]>(wfRow.rows[0].form_schema, []),
+            default_watcher_ids: parseJsonSafe<string[]>(wfRow.rows[0].default_watcher_ids, []),
+            default_watcher_roles: parseJsonSafe<string[]>(wfRow.rows[0].default_watcher_roles, []),
+            steps: stRows.rows,
+          });
+        }
+      }
+      return out;
+    });
+
+    res.status(201).json({ success: true, data: { imported_count: imported.length, items: imported } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'IMPORT_WORKFLOW_PRESETS_FAILED', err?.message || 'Không thể nhập bộ quy trình mẫu.');
+  }
+});
+
 approvalsRouter.delete('/workflows/:id', requirePermission('approvals', 'manage_config'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const wfId = String(req.params.id);
     await withTenantTransaction(ctx.tenantId, async (client) => {
+      await markApprovalsCustomOnlyInTx(client, ctx.tenantId, true);
       const reqCnt = await client.query<{ cnt: number }>(
         'SELECT COUNT(*)::int AS cnt FROM tenant_approval_requests WHERE tenant_id = $1 AND workflow_id = $2',
         [ctx.tenantId, wfId]
@@ -656,6 +1089,17 @@ approvalsRouter.get('/requests', requirePermission('approvals', 'view'), async (
       } else if (viewMode === 'mine') {
         params.push(ctx.tenantId, ctx.userId);
         where = 'r.tenant_id = $1 AND r.requester_user_id = $2';
+      } else if (viewMode === 'following') {
+        params.push(ctx.tenantId, ctx.userId, JSON.stringify([ctx.userId]));
+        where = `r.tenant_id = $1 AND (
+          r.requester_user_id = $2
+          OR COALESCE(r.form_data->'related_user_ids', '[]'::jsonb) @> $3::jsonb
+          OR COALESCE(r.form_data->'watcher_ids', '[]'::jsonb) @> $3::jsonb
+          OR EXISTS (
+            SELECT 1 FROM tenant_approval_step_logs slf
+            WHERE slf.tenant_id = r.tenant_id AND slf.request_id = r.id AND slf.assigned_user_id = $2
+          )
+        )`;
       } else {
         const scopeSql = rbac.userOrg
           ? await buildGranularScopeWhereClause(client, ctx.tenantId, rbac.userOrg, apprScope, {
@@ -1034,8 +1478,39 @@ approvalsRouter.post('/requests', requirePermission('approvals', 'create'), asyn
       return;
     }
 
-    const result = await withTenantTransaction(ctx.tenantId, (client) =>
-      createApprovalRequestInTx(client, {
+    const result = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const rawFormData = b.form_data && typeof b.form_data === 'object' ? { ...(b.form_data as Record<string, unknown>) } : {};
+      const wfMetaRes = await client.query<{ default_watcher_ids: unknown; default_watcher_roles: unknown }>(
+        'SELECT default_watcher_ids, default_watcher_roles FROM tenant_approval_workflows WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, workflowId]
+      );
+      const wfMeta = wfMetaRes.rows[0];
+      const defIds = parseJsonSafe<string[]>(wfMeta?.default_watcher_ids, []);
+      const defRoles = parseJsonSafe<string[]>(wfMeta?.default_watcher_roles, []);
+      let roleUserIds: string[] = [];
+      if (defRoles.length > 0) {
+        const lowerRoles = defRoles.map((r) => String(r || '').toLowerCase().trim()).filter(Boolean);
+        if (lowerRoles.length > 0) {
+          const uRes = await client.query<{ id: string }>(
+            `SELECT id FROM users
+             WHERE tenant_id = $1
+               AND (LOWER(COALESCE(role, '')) = ANY($2::text[]) OR COALESCE(role_id::text, '') = ANY($2::text[]))
+               AND COALESCE(is_system_bot, false) = false`,
+            [ctx.tenantId, lowerRoles]
+          );
+          roleUserIds = uRes.rows.map((u) => String(u.id));
+        }
+      }
+      const explicitWatchers = normalizeStringArray(b.watcher_ids ?? rawFormData.related_user_ids ?? rawFormData.watcher_ids);
+      const mergedWatchers = Array.from(new Set([...defIds.map(String), ...roleUserIds, ...explicitWatchers])).filter(
+        (uid) => uid && uid !== ctx.userId
+      );
+      if (mergedWatchers.length > 0 || rawFormData.related_user_ids !== undefined) {
+        rawFormData.related_user_ids = mergedWatchers;
+        rawFormData.watcher_ids = mergedWatchers;
+      }
+
+      return createApprovalRequestInTx(client, {
         tenantId: ctx.tenantId,
         workflowId,
         requesterUserId: ctx.userId,
@@ -1045,12 +1520,12 @@ approvalsRouter.post('/requests', requirePermission('approvals', 'create'), asyn
         currency: b.currency,
         startDate: b.start_date || null,
         endDate: b.end_date || null,
-        formData: b.form_data && typeof b.form_data === 'object' ? b.form_data : {},
+        formData: rawFormData,
         attachments: Array.isArray(b.attachments) ? b.attachments : [],
         linkedEntityType: b.linked_entity_type || null,
         linkedEntityId: b.linked_entity_id || null,
-      })
-    );
+      });
+    });
 
     res.status(201).json({
       success: true,

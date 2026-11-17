@@ -136,6 +136,7 @@ export function createApp(): Express {
 
   // MYERP Compatibility API for the cloned MYERP frontend (bridges onto AutoData PG schema + Wave-2 modules)
   app.use('/api/v1/myerp', myerpCompatRouter);
+  app.use('/backend', myerpCompatRouter);
 
   // Pluggable Multi-Product SaaS Ecosystem Modules (Org-RBAC, Audiences, + Wave 2 Slots)
   mountEcosystemModules(app);
