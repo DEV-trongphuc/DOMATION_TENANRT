@@ -14,7 +14,8 @@ PassengerFriendlyErrorPages off
   RewriteEngine On
   RewriteBase /
 
-  # Block direct web access to private server files and embedded DB storage
+  # Block direct web access to private server files and embedded DB storage (allow public SPA /docs/api-v1)
+  RewriteCond %{REQUEST_URI} !^/docs/api-v1(/|$)
   RewriteRule ^(\.env.*|\.autodata-pgdata|server|dist-server|tests|scripts|node_modules|docs|tsconfig\.server\.json|package(-lock)?\.json)(/|$) - [F,L]
 
   # Allow Let's Encrypt AutoSSL validation
