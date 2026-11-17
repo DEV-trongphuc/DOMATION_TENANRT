@@ -573,6 +573,8 @@ router.get('/surveys/:slug', async (req, res) => {
         blocks: parseJsonCol<SurveyBlockItemDto[]>(s.blocks_json, []),
         theme: parseJsonCol(s.theme_json, {}),
         settings: parseJsonCol(s.settings_json, {}),
+        redirect_rules: parseJsonCol(s.redirect_rules_json, []),
+        thank_you: parseJsonCol(s.thank_you_json, {}),
       };
     });
 
@@ -765,6 +767,63 @@ router.post('/surveys/:slug', async (req, res) => {
         );
       }
 
+      const redirectRules = parseJsonCol<Array<Record<string, unknown>>>(
+        survey.redirect_rules_json,
+        Array.isArray(settings.redirect_rules) ? (settings.redirect_rules as Array<Record<string, unknown>>) : []
+      );
+      const baseThankYou = parseJsonCol<Record<string, unknown>>(survey.thank_you_json, {});
+
+      let matchedRedirectUrl: string | null = null;
+      let matchedThankYou: Record<string, unknown> = { ...baseThankYou };
+      let rewardVoucherPoolId: string | null = settings.voucher_campaign_id
+        ? String(settings.voucher_campaign_id)
+        : null;
+
+      for (const rule of redirectRules) {
+        const minSc = Number(rule.minScore ?? rule.min_score ?? 0);
+        const maxSc = Number(rule.maxScore ?? rule.max_score ?? 999999);
+        if (quizScore >= minSc && quizScore <= maxSc) {
+          if (rule.redirectUrl || rule.redirect_url) {
+            matchedRedirectUrl = String(rule.redirectUrl || rule.redirect_url);
+          }
+          if (rule.thankYouTitle || rule.thank_you_title) {
+            matchedThankYou = {
+              ...matchedThankYou,
+              title: String(rule.thankYouTitle || rule.thank_you_title),
+              message: String(rule.thankYouMessage || rule.thank_you_message || matchedThankYou.message || ''),
+            };
+          }
+          if (rule.assignTag || rule.assign_tag) {
+            tagsToApply.add(String(rule.assignTag || rule.assign_tag).trim());
+          }
+          if (rule.voucherCampaignId || rule.voucher_campaign_id) {
+            rewardVoucherPoolId = String(rule.voucherCampaignId || rule.voucher_campaign_id);
+          }
+          break;
+        }
+      }
+
+      let rewardVoucherCode: string | null = null;
+      if (rewardVoucherPoolId) {
+        const vpRes = await client.query<{ id: string; code_prefix: string }>(
+          'SELECT id, code_prefix FROM mkt_voucher_campaigns WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [resolved.tenant_id, rewardVoucherPoolId]
+        );
+        if (vpRes.rows[0]) {
+          rewardVoucherCode = `${String(vpRes.rows[0].code_prefix || 'DOM').toUpperCase()}-${generateShortCode(6).toUpperCase()}`;
+          await client.query(
+            `INSERT INTO mkt_voucher_codes (id, tenant_id, voucher_campaign_id, code, status, lead_id, claimed_at)
+             VALUES ($1, $2, $3, $4, 'claimed', $5, clock_timestamp())
+             ON CONFLICT (tenant_id, code) DO NOTHING`,
+            [crypto.randomUUID(), resolved.tenant_id, vpRes.rows[0].id, rewardVoucherCode, leadId]
+          );
+          await client.query(
+            'UPDATE mkt_voucher_campaigns SET total_codes = total_codes + 1, claimed_codes = claimed_codes + 1 WHERE tenant_id = $1 AND id = $2',
+            [resolved.tenant_id, vpRes.rows[0].id]
+          );
+        }
+      }
+
       const respId = crypto.randomUUID();
       const appliedTagsArr = Array.from(tagsToApply);
       await client.query(
@@ -811,6 +870,9 @@ router.post('/surveys/:slug', async (req, res) => {
         quiz_score: quizScore,
         nps_score: npsScore,
         tags_applied: appliedTagsArr,
+        redirect_url: matchedRedirectUrl,
+        thank_you: matchedThankYou,
+        voucher_code: rewardVoucherCode,
       };
     });
 
@@ -1390,25 +1452,76 @@ router.post('/track', async (req, res) => {
 });
 
 // ============================================================================
-// 7. Public Voucher Claim & Omnichannel Social Webhook Ingress
+// 7. Public Voucher Info & Claim (`/claim/:id` or `/vouchers/:slug`) + Social Ingress
 // ============================================================================
-router.post('/vouchers/:slug/claim', async (req, res) => {
-  try {
-    const slug = String(req.params.slug || '').trim();
-    const resolved = await withSystemPrivilege(async (client) => {
-      const r = await client.query<{ tenant_id: string; pool_id: string }>(
-        `SELECT vc.tenant_id, vc.id AS pool_id
-         FROM mkt_voucher_campaigns vc
-         INNER JOIN tenants t ON t.id = vc.tenant_id
-         WHERE vc.slug = $1 AND vc.status = 'active' AND t.status != 'deleted'
-         LIMIT 1`,
-        [slug]
-      );
-      return r.rows[0] || null;
-    });
+async function resolvePublicVoucherPool(idOrSlug: string): Promise<{ tenant_id: string; pool_id: string; company_name: string } | null> {
+  const clean = String(idOrSlug || '').trim();
+  if (!clean) return null;
+  const isUuid = UUID_REGEX.test(clean);
 
+  return withSystemPrivilege(async (client) => {
+    const cond = isUuid ? 'vc.id = $1' : 'vc.slug = $1';
+    const r = await client.query<{ tenant_id: string; pool_id: string; company_name: string }>(
+      `SELECT vc.tenant_id, vc.id AS pool_id, t.name AS company_name
+       FROM mkt_voucher_campaigns vc
+       INNER JOIN tenants t ON t.id = vc.tenant_id
+       WHERE ${cond} AND vc.status = 'active' AND t.status != 'deleted'
+       LIMIT 1`,
+      [clean]
+    );
+    return r.rows[0] || null;
+  });
+}
+
+router.get('/vouchers/:slug', async (req, res) => {
+  try {
+    const resolved = await resolvePublicVoucherPool(String(req.params.slug || ''));
     if (!resolved) {
       sendApiError(res, 404, 'VOUCHER_CAMPAIGN_NOT_FOUND', 'Chiến dịch ưu đãi không tồn tại hoặc đã kết thúc.');
+      return;
+    }
+
+    const data = await withTenantTransaction(resolved.tenant_id, async (client) => {
+      const pRes = await client.query(
+        'SELECT * FROM mkt_voucher_campaigns WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [resolved.tenant_id, resolved.pool_id]
+      );
+      const p = pRes.rows[0];
+      if (!p) return null;
+      return {
+        id: String(p.id),
+        slug: String(p.slug),
+        name: String(p.name),
+        description: p.description ? String(p.description) : '',
+        company_name: resolved.company_name,
+        discount_type: String(p.discount_type || 'percentage'),
+        discount_value: Number(p.discount_value || 0),
+        min_order_vnd: Number(p.min_order_vnd || 0),
+        expires_at: p.expires_at || null,
+        total_codes: Number(p.total_codes || 0),
+        claimed_codes: Number(p.claimed_codes || 0),
+        qr_design: parseJsonCol(p.qr_design_json, {}),
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_PUBLIC_VOUCHER_FAILED', err?.message || 'Không thể tải thông tin chiến dịch ưu đãi.');
+  }
+});
+
+router.post('/vouchers/:slug/claim', async (req, res) => {
+  try {
+    const resolved = await resolvePublicVoucherPool(String(req.params.slug || ''));
+    if (!resolved) {
+      sendApiError(res, 404, 'VOUCHER_CAMPAIGN_NOT_FOUND', 'Chiến dịch ưu đãi không tồn tại hoặc đã kết thúc.');
+      return;
+    }
+
+    const phoneVal = String(req.body?.phone || '').trim();
+    const emailVal = String(req.body?.email || '').trim().toLowerCase();
+    if (!phoneVal && !emailVal) {
+      sendApiError(res, 422, 'CONTACT_REQUIRED', 'Vui lòng nhập Số điện thoại hoặc Email để nhận mã ưu đãi.');
       return;
     }
 

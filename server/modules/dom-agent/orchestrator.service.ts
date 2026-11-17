@@ -489,6 +489,48 @@ function inferLocalToolsFromMessage(
     pushUnique('crm_stage_distribution');
   }
   if (
+    folded.includes('de xuat') ||
+    folded.includes('xin nghi phep') ||
+    folded.includes('tao don nghi') ||
+    folded.includes('tam ung') ||
+    folded.includes('giao viec') ||
+    folded.includes('tao task')
+  ) {
+    const actType = folded.includes('nghi')
+      ? 'leave'
+      : folded.includes('tam ung')
+        ? 'cash_advance'
+        : folded.includes('chi phi')
+          ? 'expense'
+          : 'task';
+    pushUnique('ops_draft_action_proposal', {
+      action_type: actType,
+      title: prompt.trim().slice(0, 100),
+      reason: prompt.trim(),
+    });
+  }
+  if (folded.includes('hop tac') || folded.includes('chia hoa hong')) {
+    pushUnique('hrm_cooperation_slips_summary');
+  }
+  if (folded.includes('ke toan') || folded.includes('tt200') || folded.includes('tt133') || folded.includes('but toan')) {
+    pushUnique('hrm_accounting_az_journal_summary');
+  }
+  if (folded.includes('phieu luong cua toi') || folded.includes('luong ca nhan')) {
+    pushUnique('hrm_my_payslip_lookup');
+  }
+  if (folded.includes('diem nghen') || folded.includes('qua han duyet') || folded.includes('blocker')) {
+    pushUnique('ops_trace_approval_blocker');
+  }
+  if (folded.includes('databank') || folded.includes('kho du lieu chung')) {
+    pushUnique('crm_public_databank_summary');
+  }
+  if (folded.includes('omnichannel') || folded.includes('da kenh')) {
+    pushUnique('mkt_omnichannel_journey_analytics');
+  }
+  if (folded.includes('bieu do') || folded.includes('phan bo pheu') || folded.includes('chart')) {
+    pushUnique('crm_stage_distribution');
+  }
+  if (
     folded.includes('khach hang') ||
     folded.includes('lead') ||
     folded.includes('danh sach so') ||
@@ -651,12 +693,116 @@ async function tryLiveGeminiOrchestration(params: {
   }
 }
 
+export interface DynamicChartPayload {
+  title: string;
+  subtitle?: string;
+  type: 'bar' | 'hbar' | 'line' | 'area' | 'pie' | 'funnel' | 'table';
+  xAxisKey: string;
+  data: Array<Record<string, string | number>>;
+  series: Array<{ dataKey: string; name: string; color?: string }>;
+}
+
+export interface ActionProposalPayload {
+  action_type: string;
+  title: string;
+  summary: string;
+  params: Record<string, unknown>;
+}
+
+function buildStructuredArtifactsFromTools(
+  toolExecutions: DomToolExecutionResult[]
+): { chartData: DynamicChartPayload | null; actionProposal: ActionProposalPayload | null } {
+  let chartData: DynamicChartPayload | null = null;
+  let actionProposal: ActionProposalPayload | null = null;
+
+  for (const te of toolExecutions) {
+    if (!te.allowed || !te.output) continue;
+    const out = te.output;
+
+    if (out.proposal && typeof out.proposal === 'object') {
+      const p = out.proposal as Record<string, unknown>;
+      actionProposal = {
+        action_type: String(p.action_type || 'task'),
+        title: String(p.title || 'Đề xuất hành động ERP'),
+        summary: String(p.summary || 'Chờ xác nhận thực thi'),
+        params: (p.params && typeof p.params === 'object' ? p.params : {}) as Record<string, unknown>,
+      };
+    }
+
+    if (!chartData && Array.isArray(out.stages) && out.stages.length > 0) {
+      chartData = {
+        title: 'Phân bổ Khách hàng theo Bước Phễu CRM',
+        type: 'funnel',
+        xAxisKey: 'name',
+        data: (out.stages as Array<Record<string, unknown>>).map((s) => ({
+          name: String(s.stage_name || s.name || 'Bước'),
+          value: Number(s.lead_count ?? s.count ?? 0),
+        })),
+        series: [{ dataKey: 'value', name: 'Số lượng hồ sơ', color: '#1E40FF' }],
+      };
+    } else if (!chartData && Array.isArray(out.leaderboard) && out.leaderboard.length > 0) {
+      chartData = {
+        title: 'Bảng xếp hạng Hiệu suất Đội ngũ Tư vấn',
+        type: 'hbar',
+        xAxisKey: 'name',
+        data: (out.leaderboard as Array<Record<string, unknown>>).slice(0, 8).map((r) => ({
+          name: String(r.full_name || r.name || 'Nhân sự'),
+          won: Number(r.won_count ?? r.total_leads ?? 0),
+        })),
+        series: [{ dataKey: 'won', name: 'Chốt thành công', color: '#1E40FF' }],
+      };
+    } else if (!chartData && typeof out.total_inflow_vnd === 'number' && typeof out.total_outflow_vnd === 'number') {
+      chartData = {
+        title: 'Đối chiếu Dòng tiền Thu - Chi & P&L',
+        type: 'bar',
+        xAxisKey: 'name',
+        data: [
+          { name: 'Tổng Thu', value: Math.round(Number(out.total_inflow_vnd || 0)) },
+          { name: 'Tổng Chi', value: Math.round(Number(out.total_outflow_vnd || 0)) },
+          { name: 'Dòng tiền Ròng', value: Math.round(Number(out.net_cashflow_vnd || 0)) },
+        ],
+        series: [{ dataKey: 'value', name: 'Số tiền (VNĐ)', color: '#1E40FF' }],
+      };
+    } else if (!chartData && te.tool_name === 'hrm_pit_bhxh_calculator' && typeof out.gross_salary_vnd === 'number') {
+      chartData = {
+        title: 'Cơ cấu Thu nhập Gross -> Net & Khấu trừ',
+        type: 'pie',
+        xAxisKey: 'name',
+        data: [
+          { name: 'Lương Net thực lĩnh', value: Math.round(Number(out.net_salary_vnd || 0)) },
+          { name: 'BHXH/BHYT/BHTN (10.5%)', value: Math.round(Number(out.employee_insurance_vnd || 0)) },
+          { name: 'Thuế TNCN lũy tiến', value: Math.round(Number(out.pit_tax_vnd || 0)) },
+        ],
+        series: [{ dataKey: 'value', name: 'VNĐ', color: '#1E40FF' }],
+      };
+    } else if (!chartData && te.tool_name === 'mkt_omnichannel_journey_analytics') {
+      chartData = {
+        title: 'Tổng quan Điểm chạm Hành trình Đa kênh',
+        type: 'bar',
+        xAxisKey: 'name',
+        data: [
+          { name: 'Tổng Liên hệ', value: Number(out.total_contacts || 0) },
+          { name: 'Lead Nóng (>=50đ)', value: Number(out.hot_contacts_gte_50 || 0) },
+          { name: 'Tệp Data/Logic', value: Number(out.active_audiences || 0) },
+          { name: 'Chiến dịch', value: Number(out.campaigns_count || 0) },
+          { name: 'Flow Tự động', value: Number(out.active_flows_count || 0) },
+        ],
+        series: [{ dataKey: 'value', name: 'Số lượng', color: '#1E40FF' }],
+      };
+    }
+  }
+
+  return { chartData, actionProposal };
+}
+
 export interface ChatTurnResult {
   thread: Record<string, unknown>;
   user_message: Record<string, unknown>;
   assistant_message: Record<string, unknown>;
   tool_executions: DomToolExecutionResult[];
   citations: RagCitationItem[];
+  chart_data?: DynamicChartPayload | null;
+  action_proposal?: ActionProposalPayload | null;
   engine_mode: 'gemini_byok_live' | 'local_deterministic_orchestrator';
 }
 
@@ -843,11 +989,19 @@ export async function runDomAgentChatTurnInTx(
           ragSearch.filtered_by_department_acl > 0
             ? ` (${ragSearch.filtered_by_department_acl} tài liệu giới hạn riêng cho phòng ban khác đã được lọc bảo mật)`
             : ''
-        }. Bạn có thể chọn một tác vụ nhanh hoặc mở tab **72 Công cụ & Nhật ký RBAC** để kích hoạt trực tiếp.`
+        }. Bạn có thể chọn một tác vụ nhanh hoặc mở tab **80 Công cụ & Nhật ký RBAC** để kích hoạt trực tiếp.`
       );
     }
 
     assistantText = sections.join('\n\n');
+  }
+
+  const { chartData, actionProposal } = buildStructuredArtifactsFromTools(toolExecutions);
+  if (actionProposal && !assistantText.includes('<<<ACTION_PROPOSAL:')) {
+    assistantText = `${assistantText}\n\n<<<ACTION_PROPOSAL: ${JSON.stringify(actionProposal)} >>>`;
+  }
+  if (chartData && !assistantText.includes('<<<CHART_DATA:')) {
+    assistantText = `${assistantText}\n\n<<<CHART_DATA: ${JSON.stringify(chartData)} >>>`;
   }
 
   // Final Server-Side PII Guardrail on Assistant Output
@@ -934,9 +1088,13 @@ export async function runDomAgentChatTurnInTx(
         ...(assistantMsgRes.rows[0] || { id: assistantMsgId, role: 'assistant', content: assistantText }),
         tool_calls: toolExecutions,
         citations,
+        chart_data: chartData,
+        action_proposal: actionProposal,
       },
       tool_executions: toolExecutions,
       citations,
+      chart_data: chartData,
+      action_proposal: actionProposal,
       engine_mode: engineMode,
     },
   };

@@ -8,11 +8,14 @@ import {
   GRANULAR_ACTIONS,
   normalizeActionsMap,
   normalizeDataScope,
+  parseBoolMapSafe,
   requirePermission,
   requireTenantAuth,
   resolveUserEffectivePermissions,
   sendApiError,
 } from '../../core/security/rbac.ts';
+import { executeMasterCron } from '../../cron/master-cron.ts';
+import { ensureOrgRbacSchemaMiddleware } from './schema.ts';
 import {
   INDUSTRY_TERMINOLOGY_PRESETS,
   SAAS_MODULES_CATALOG,
@@ -37,6 +40,44 @@ import { compileSegmentWhereSql } from '../audiences/segment-compiler.ts';
 export const orgRbacRouter = Router();
 
 orgRbacRouter.use(requireTenantAuth);
+orgRbacRouter.use(ensureOrgRbacSchemaMiddleware);
+
+function normalizeIpWhitelistInput(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return Array.from(
+      new Set(
+        raw
+          .map((item) => String(item || '').trim())
+          .filter(Boolean)
+          .slice(0, 100)
+      )
+    );
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return normalizeIpWhitelistInput(parsed);
+        }
+      } catch {
+        // Fallback to comma/newline split
+      }
+    }
+    return Array.from(
+      new Set(
+        trimmed
+          .split(/[\n,;]+/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 100)
+      )
+    );
+  }
+  return [];
+}
 
 // ============================================================================
 // 1. Unified Settings Bootstrap & Effective Permissions
@@ -69,8 +110,12 @@ orgRbacRouter.get('/effective-permissions', async (req, res) => {
       return {
         user_id: targetUserId,
         user_org: resolved.userOrg,
+        is_tenant_owner: Boolean(resolved.userOrg?.is_tenant_owner),
         enabled_modules: resolved.enabledModules,
         effective_permissions: resolved.effectivePermissions,
+        screen_access: resolved.screen_access,
+        quick_actions: resolved.quick_actions,
+        default_route: resolved.default_route,
       };
     });
 
@@ -115,6 +160,8 @@ orgRbacRouter.post('/branches', requirePermission('org_rbac', 'manage_config'), 
     const code = slugifyCode(b.code || name, 'BR');
     const id = crypto.randomUUID();
 
+    const branchIpWhitelist = normalizeIpWhitelistInput(b.branch_ip_whitelist);
+
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
       if (b.is_headquarters) {
         await client.query('UPDATE tenant_branches SET is_headquarters = false WHERE tenant_id = $1', [ctx.tenantId]);
@@ -123,8 +170,8 @@ orgRbacRouter.post('/branches', requirePermission('org_rbac', 'manage_config'), 
         `INSERT INTO tenant_branches (
            id, tenant_id, code, name, legal_entity_name, tax_code,
            representative_name, representative_title, address, phone, email,
-           gps_lat, gps_lng, gps_radius_meters, work_schedule, is_headquarters, is_active
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17)`,
+           gps_lat, gps_lng, gps_radius_meters, work_schedule, branch_ip_whitelist, is_headquarters, is_active
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18)`,
         [
           id,
           ctx.tenantId,
@@ -141,6 +188,7 @@ orgRbacRouter.post('/branches', requirePermission('org_rbac', 'manage_config'), 
           b.gps_lng !== undefined && b.gps_lng !== null && b.gps_lng !== '' ? Number(b.gps_lng) : null,
           Math.max(10, Math.min(50_000, Number(b.gps_radius_meters || 150))),
           JSON.stringify(b.work_schedule && typeof b.work_schedule === 'object' ? b.work_schedule : {}),
+          JSON.stringify(branchIpWhitelist),
           Boolean(b.is_headquarters),
           b.is_active !== false,
         ]
@@ -186,8 +234,9 @@ const updateBranchHandler = async (req: any, res: any) => {
              gps_lng = CASE WHEN $21::boolean THEN $22 ELSE gps_lng END,
              gps_radius_meters = COALESCE($23, gps_radius_meters),
              work_schedule = COALESCE($24::jsonb, work_schedule),
-             is_headquarters = COALESCE($25, is_headquarters),
-             is_active = COALESCE($26, is_active),
+             branch_ip_whitelist = COALESCE($25::jsonb, branch_ip_whitelist),
+             is_headquarters = COALESCE($26, is_headquarters),
+             is_active = COALESCE($27, is_active),
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2
          RETURNING *`,
@@ -216,6 +265,7 @@ const updateBranchHandler = async (req: any, res: any) => {
           b.gps_lng !== null && b.gps_lng !== '' ? Number(b.gps_lng) : null,
           b.gps_radius_meters !== undefined ? Math.max(10, Number(b.gps_radius_meters)) : null,
           b.work_schedule !== undefined ? JSON.stringify(b.work_schedule) : null,
+          b.branch_ip_whitelist !== undefined ? JSON.stringify(normalizeIpWhitelistInput(b.branch_ip_whitelist)) : null,
           typeof b.is_headquarters === 'boolean' ? b.is_headquarters : null,
           typeof b.is_active === 'boolean' ? b.is_active : null,
         ]
@@ -682,13 +732,19 @@ orgRbacRouter.post('/roles', requirePermission('org_rbac', 'manage_config'), asy
     }
     const roleKey = slugifyKeyLower(b.role_key || name, 'role');
     const defaultScope = normalizeDataScope(b.default_data_scope, 'own');
+    const screenAccess = parseBoolMapSafe(b.screen_access);
+    const quickActions = parseBoolMapSafe(b.quick_actions);
+    const defaultRoute = b.default_route ? String(b.default_route).trim().slice(0, 120) || '/' : '/';
     const id = crypto.randomUUID();
 
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
       await ensureDefaultSystemRolesSeeded(client, ctx.tenantId);
       await client.query(
-        `INSERT INTO tenant_roles (id, tenant_id, role_key, name, description, default_data_scope, is_system, is_active)
-         VALUES ($1, $2, $3, $4, $5, $6, false, $7)`,
+        `INSERT INTO tenant_roles (
+           id, tenant_id, role_key, name, description, default_data_scope,
+           screen_access, quick_actions, default_route, is_system, is_active
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, false, $10)`,
         [
           id,
           ctx.tenantId,
@@ -696,6 +752,9 @@ orgRbacRouter.post('/roles', requirePermission('org_rbac', 'manage_config'), asy
           name,
           b.description ? String(b.description).trim() : null,
           defaultScope,
+          JSON.stringify(screenAccess),
+          JSON.stringify(quickActions),
+          defaultRoute,
           b.is_active !== false,
         ]
       );
@@ -721,7 +780,10 @@ const updateRoleHandler = async (req: any, res: any) => {
          SET name = COALESCE($3, name),
              description = CASE WHEN $4::boolean THEN $5 ELSE description END,
              default_data_scope = COALESCE($6, default_data_scope),
-             is_active = COALESCE($7, is_active),
+             screen_access = COALESCE($7::jsonb, screen_access),
+             quick_actions = COALESCE($8::jsonb, quick_actions),
+             default_route = COALESCE($9, default_route),
+             is_active = COALESCE($10, is_active),
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2
          RETURNING *`,
@@ -732,6 +794,9 @@ const updateRoleHandler = async (req: any, res: any) => {
           b.description !== undefined,
           b.description ? String(b.description).trim() : null,
           b.default_data_scope ? normalizeDataScope(b.default_data_scope, 'own') : null,
+          b.screen_access !== undefined ? JSON.stringify(parseBoolMapSafe(b.screen_access)) : null,
+          b.quick_actions !== undefined ? JSON.stringify(parseBoolMapSafe(b.quick_actions)) : null,
+          b.default_route !== undefined ? String(b.default_route || '/').trim().slice(0, 120) || '/' : null,
           typeof b.is_active === 'boolean' ? b.is_active : null,
         ]
       );
@@ -843,14 +908,34 @@ orgRbacRouter.put(
   async (req, res) => {
     try {
       const ctx = getTenantContext();
-      const items = Array.isArray(req.body?.permissions)
-        ? req.body.permissions
-        : Array.isArray(req.body)
-          ? req.body
-          : [];
-      const saved = await withTenantTransaction(ctx.tenantId, (client) =>
-        upsertRolePermissionsBatch(client, ctx.tenantId, req.params.roleId, items)
-      );
+      const b = req.body || {};
+      const items = Array.isArray(b?.permissions)
+        ? b.permissions
+        : Array.isArray(b?.items)
+          ? b.items
+          : Array.isArray(b)
+            ? b
+            : [];
+      const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+        if (b.screen_access !== undefined || b.quick_actions !== undefined || b.default_route !== undefined) {
+          await client.query(
+            `UPDATE tenant_roles
+             SET screen_access = COALESCE($3::jsonb, screen_access),
+                 quick_actions = COALESCE($4::jsonb, quick_actions),
+                 default_route = COALESCE($5, default_route),
+                 updated_at = clock_timestamp()
+             WHERE tenant_id = $1 AND id = $2`,
+            [
+              ctx.tenantId,
+              req.params.roleId,
+              b.screen_access !== undefined ? JSON.stringify(parseBoolMapSafe(b.screen_access)) : null,
+              b.quick_actions !== undefined ? JSON.stringify(parseBoolMapSafe(b.quick_actions)) : null,
+              b.default_route !== undefined ? String(b.default_route || '/').trim().slice(0, 120) || '/' : null,
+            ]
+          );
+        }
+        return upsertRolePermissionsBatch(client, ctx.tenantId, req.params.roleId, items);
+      });
       res.json({ success: true, data: saved });
     } catch (err: any) {
       sendApiError(res, 500, 'SAVE_ROLE_PERMS_FAILED', err?.message || 'Không thể lưu quyền vai trò.');
@@ -1855,3 +1940,903 @@ orgRbacRouter.post(
     }
   }
 );
+
+// ============================================================================
+// 12. Dynamic Custom Fields CRUD (`/api/v1/org-rbac/custom-fields`)
+// ============================================================================
+orgRbacRouter.get('/custom-fields', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const entityType = req.query.entity_type ? String(req.query.entity_type).trim().toLowerCase() : null;
+    const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const params: unknown[] = [ctx.tenantId];
+      let where = 'tenant_id = $1';
+      if (entityType) {
+        params.push(entityType);
+        where += ' AND entity_type = $2';
+      }
+      const r = await client.query(
+        `SELECT * FROM tenant_custom_fields WHERE ${where} ORDER BY entity_type ASC, sort_order ASC, created_at ASC`,
+        params
+      );
+      return r.rows;
+    });
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_CUSTOM_FIELDS_FAILED', err?.message || 'Không thể tải danh sách trường tùy chỉnh.');
+  }
+});
+
+orgRbacRouter.post('/custom-fields', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const fieldLabel = String(b.field_label || b.label || '').trim();
+    if (!fieldLabel) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Nhãn trường tùy chỉnh (field_label) không được để trống.');
+      return;
+    }
+    const entityType = String(b.entity_type || 'lead').trim().toLowerCase();
+    const fieldKey = slugifyKeyLower(b.field_key || fieldLabel, 'cf');
+    const id = crypto.randomUUID();
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO tenant_custom_fields (
+           id, tenant_id, entity_type, field_key, field_label, field_type, options_json,
+           is_required, is_filterable, show_in_table, default_value, validation_regex, placeholder, sort_order, is_active
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15)`,
+        [
+          id,
+          ctx.tenantId,
+          entityType,
+          fieldKey,
+          fieldLabel,
+          String(b.field_type || 'text').trim().toLowerCase(),
+          JSON.stringify(Array.isArray(b.options_json ?? b.options) ? (b.options_json ?? b.options) : []),
+          Boolean(b.is_required),
+          b.is_filterable !== false,
+          b.show_in_table !== false,
+          b.default_value !== undefined && b.default_value !== null ? String(b.default_value) : null,
+          b.validation_regex ? String(b.validation_regex) : null,
+          b.placeholder ? String(b.placeholder).slice(0, 255) : null,
+          Number.isFinite(Number(b.sort_order)) ? Number(b.sort_order) : 0,
+          b.is_active !== false,
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_custom_fields WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_CUSTOM_FIELD_FAILED', err?.message || 'Không thể tạo trường tùy chỉnh.');
+  }
+});
+
+const updateCustomFieldHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE tenant_custom_fields
+         SET field_label = COALESCE($3, field_label),
+             field_type = COALESCE($4, field_type),
+             options_json = COALESCE($5::jsonb, options_json),
+             is_required = COALESCE($6, is_required),
+             is_filterable = COALESCE($7, is_filterable),
+             show_in_table = COALESCE($8, show_in_table),
+             default_value = CASE WHEN $9::boolean THEN $10 ELSE default_value END,
+             validation_regex = CASE WHEN $11::boolean THEN $12 ELSE validation_regex END,
+             placeholder = CASE WHEN $13::boolean THEN $14 ELSE placeholder END,
+             sort_order = COALESCE($15, sort_order),
+             is_active = COALESCE($16, is_active),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          b.field_label ?? b.label ? String(b.field_label ?? b.label).trim() : null,
+          b.field_type ? String(b.field_type).trim().toLowerCase() : null,
+          (b.options_json ?? b.options) !== undefined
+            ? JSON.stringify(Array.isArray(b.options_json ?? b.options) ? (b.options_json ?? b.options) : [])
+            : null,
+          typeof b.is_required === 'boolean' ? b.is_required : null,
+          typeof b.is_filterable === 'boolean' ? b.is_filterable : null,
+          typeof b.show_in_table === 'boolean' ? b.show_in_table : null,
+          b.default_value !== undefined,
+          b.default_value !== null ? String(b.default_value) : null,
+          b.validation_regex !== undefined,
+          b.validation_regex ? String(b.validation_regex) : null,
+          b.placeholder !== undefined,
+          b.placeholder ? String(b.placeholder).slice(0, 255) : null,
+          Number.isFinite(Number(b.sort_order)) ? Number(b.sort_order) : null,
+          typeof b.is_active === 'boolean' ? b.is_active : null,
+        ]
+      );
+      return r.rows[0] || null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'CUSTOM_FIELD_NOT_FOUND', 'Không tìm thấy trường tùy chỉnh.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_CUSTOM_FIELD_FAILED', err?.message || 'Không thể cập nhật trường tùy chỉnh.');
+  }
+};
+orgRbacRouter.put('/custom-fields/:id', requirePermission('settings', 'manage_config'), updateCustomFieldHandler);
+orgRbacRouter.patch('/custom-fields/:id', requirePermission('settings', 'manage_config'), updateCustomFieldHandler);
+
+orgRbacRouter.delete('/custom-fields/:id', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM tenant_custom_fields WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true, id: req.params.id } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_CUSTOM_FIELD_FAILED', err?.message || 'Không thể xóa trường tùy chỉnh.');
+  }
+});
+
+// ============================================================================
+// 13. Lead Scoring Rules CRUD (`/api/v1/org-rbac/lead-scoring-rules`)
+// ============================================================================
+orgRbacRouter.get('/lead-scoring-rules', requirePermission('settings', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM tenant_lead_scoring_rules WHERE tenant_id = $1 ORDER BY priority ASC, created_at ASC',
+        [ctx.tenantId]
+      );
+      return r.rows;
+    });
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_LEAD_SCORING_FAILED', err?.message || 'Không thể tải luật chấm điểm Lead.');
+  }
+});
+
+orgRbacRouter.post('/lead-scoring-rules', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    if (!name) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Tên luật chấm điểm không được để trống.');
+      return;
+    }
+    const id = crypto.randomUUID();
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO tenant_lead_scoring_rules (
+           id, tenant_id, name, description, trigger_type, condition_json,
+           score_delta, max_applications, priority, is_active, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)`,
+        [
+          id,
+          ctx.tenantId,
+          name,
+          b.description ? String(b.description).trim() : null,
+          String(b.trigger_type || 'field_match').trim().toLowerCase(),
+          JSON.stringify(
+            (b.condition_json ?? b.conditions) && typeof (b.condition_json ?? b.conditions) === 'object'
+              ? (b.condition_json ?? b.conditions)
+              : {}
+          ),
+          Math.trunc(Number(b.score_delta ?? b.points ?? 10) || 0),
+          Math.max(1, Math.trunc(Number(b.max_applications ?? 1) || 1)),
+          Math.trunc(Number(b.priority ?? 100) || 100),
+          b.is_active !== false,
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_lead_scoring_rules WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_LEAD_SCORING_FAILED', err?.message || 'Không thể tạo luật chấm điểm Lead.');
+  }
+});
+
+const updateLeadScoringHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE tenant_lead_scoring_rules
+         SET name = COALESCE($3, name),
+             description = CASE WHEN $4::boolean THEN $5 ELSE description END,
+             trigger_type = COALESCE($6, trigger_type),
+             condition_json = COALESCE($7::jsonb, condition_json),
+             score_delta = COALESCE($8, score_delta),
+             max_applications = COALESCE($9, max_applications),
+             priority = COALESCE($10, priority),
+             is_active = COALESCE($11, is_active),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          b.name ? String(b.name).trim() : null,
+          b.description !== undefined,
+          b.description ? String(b.description).trim() : null,
+          b.trigger_type ? String(b.trigger_type).trim().toLowerCase() : null,
+          (b.condition_json ?? b.conditions) !== undefined
+            ? JSON.stringify(
+                (b.condition_json ?? b.conditions) && typeof (b.condition_json ?? b.conditions) === 'object'
+                  ? (b.condition_json ?? b.conditions)
+                  : {}
+              )
+            : null,
+          b.score_delta !== undefined || b.points !== undefined
+            ? Math.trunc(Number(b.score_delta ?? b.points) || 0)
+            : null,
+          b.max_applications !== undefined ? Math.max(1, Math.trunc(Number(b.max_applications) || 1)) : null,
+          b.priority !== undefined ? Math.trunc(Number(b.priority) || 100) : null,
+          typeof b.is_active === 'boolean' ? b.is_active : null,
+        ]
+      );
+      return r.rows[0] || null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'LEAD_SCORING_RULE_NOT_FOUND', 'Không tìm thấy luật chấm điểm.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_LEAD_SCORING_FAILED', err?.message || 'Không thể cập nhật luật chấm điểm.');
+  }
+};
+orgRbacRouter.put('/lead-scoring-rules/:id', requirePermission('settings', 'manage_config'), updateLeadScoringHandler);
+orgRbacRouter.patch('/lead-scoring-rules/:id', requirePermission('settings', 'manage_config'), updateLeadScoringHandler);
+
+orgRbacRouter.delete('/lead-scoring-rules/:id', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM tenant_lead_scoring_rules WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true, id: req.params.id } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_LEAD_SCORING_FAILED', err?.message || 'Không thể xóa luật chấm điểm.');
+  }
+});
+
+// ============================================================================
+// 14. Notification Routing Rules (`/api/v1/org-rbac/notification-rules`)
+// ============================================================================
+orgRbacRouter.get('/notification-rules', requirePermission('settings', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM tenant_notification_rules WHERE tenant_id = $1 ORDER BY event_key ASC, created_at ASC',
+        [ctx.tenantId]
+      );
+      return r.rows;
+    });
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_NOTIFICATION_RULES_FAILED', err?.message || 'Không thể tải cấu hình thông báo.');
+  }
+});
+
+orgRbacRouter.post('/notification-rules', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const eventKey = String(b.event_key || '').trim();
+    const name = String(b.name || eventKey).trim();
+    if (!eventKey || !name) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Cần cung cấp event_key và name cho quy tắc thông báo.');
+      return;
+    }
+    const id = crypto.randomUUID();
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO tenant_notification_rules (
+           id, tenant_id, event_key, name, description, recipient_strategy,
+           target_roles_json, target_departments_json, target_user_ids_json,
+           include_owner, include_team_leader, cc_emails, channels_json, is_active, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb, $14, $15)`,
+        [
+          id,
+          ctx.tenantId,
+          eventKey,
+          name,
+          b.description ? String(b.description).trim() : null,
+          String(b.recipient_strategy || 'assigned_and_managers').trim(),
+          JSON.stringify(Array.isArray(b.target_roles_json ?? b.target_roles) ? (b.target_roles_json ?? b.target_roles) : []),
+          JSON.stringify(
+            Array.isArray(b.target_departments_json ?? b.target_departments)
+              ? (b.target_departments_json ?? b.target_departments)
+              : []
+          ),
+          JSON.stringify(
+            Array.isArray(b.target_user_ids_json ?? b.target_user_ids)
+              ? (b.target_user_ids_json ?? b.target_user_ids)
+              : []
+          ),
+          b.include_owner !== false,
+          Boolean(b.include_team_leader),
+          JSON.stringify(Array.isArray(b.cc_emails) ? b.cc_emails : []),
+          JSON.stringify(
+            (b.channels_json ?? b.channels) && typeof (b.channels_json ?? b.channels) === 'object'
+              ? (b.channels_json ?? b.channels)
+              : { in_app: true, email: false, zalo: false, telegram: false }
+          ),
+          b.is_active !== false,
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_notification_rules WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_NOTIFICATION_RULE_FAILED', err?.message || 'Không thể tạo quy tắc thông báo.');
+  }
+});
+
+const updateNotificationRuleHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE tenant_notification_rules
+         SET event_key = COALESCE($3, event_key),
+             name = COALESCE($4, name),
+             description = CASE WHEN $5::boolean THEN $6 ELSE description END,
+             recipient_strategy = COALESCE($7, recipient_strategy),
+             target_roles_json = COALESCE($8::jsonb, target_roles_json),
+             target_departments_json = COALESCE($9::jsonb, target_departments_json),
+             target_user_ids_json = COALESCE($10::jsonb, target_user_ids_json),
+             include_owner = COALESCE($11, include_owner),
+             include_team_leader = COALESCE($12, include_team_leader),
+             cc_emails = COALESCE($13::jsonb, cc_emails),
+             channels_json = COALESCE($14::jsonb, channels_json),
+             is_active = COALESCE($15, is_active),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          b.event_key ? String(b.event_key).trim() : null,
+          b.name ? String(b.name).trim() : null,
+          b.description !== undefined,
+          b.description ? String(b.description).trim() : null,
+          b.recipient_strategy ? String(b.recipient_strategy).trim() : null,
+          (b.target_roles_json ?? b.target_roles) !== undefined
+            ? JSON.stringify(
+                Array.isArray(b.target_roles_json ?? b.target_roles) ? (b.target_roles_json ?? b.target_roles) : []
+              )
+            : null,
+          (b.target_departments_json ?? b.target_departments) !== undefined
+            ? JSON.stringify(
+                Array.isArray(b.target_departments_json ?? b.target_departments)
+                  ? (b.target_departments_json ?? b.target_departments)
+                  : []
+              )
+            : null,
+          (b.target_user_ids_json ?? b.target_user_ids) !== undefined
+            ? JSON.stringify(
+                Array.isArray(b.target_user_ids_json ?? b.target_user_ids)
+                  ? (b.target_user_ids_json ?? b.target_user_ids)
+                  : []
+              )
+            : null,
+          typeof b.include_owner === 'boolean' ? b.include_owner : null,
+          typeof b.include_team_leader === 'boolean' ? b.include_team_leader : null,
+          b.cc_emails !== undefined ? JSON.stringify(Array.isArray(b.cc_emails) ? b.cc_emails : []) : null,
+          (b.channels_json ?? b.channels) !== undefined
+            ? JSON.stringify(b.channels_json ?? b.channels)
+            : null,
+          typeof b.is_active === 'boolean' ? b.is_active : null,
+        ]
+      );
+      return r.rows[0] || null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'NOTIFICATION_RULE_NOT_FOUND', 'Không tìm thấy quy tắc thông báo.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_NOTIFICATION_RULE_FAILED', err?.message || 'Không thể cập nhật quy tắc thông báo.');
+  }
+};
+orgRbacRouter.put('/notification-rules/:id', requirePermission('settings', 'manage_config'), updateNotificationRuleHandler);
+orgRbacRouter.patch('/notification-rules/:id', requirePermission('settings', 'manage_config'), updateNotificationRuleHandler);
+
+orgRbacRouter.delete('/notification-rules/:id', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM tenant_notification_rules WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true, id: req.params.id } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_NOTIFICATION_RULE_FAILED', err?.message || 'Không thể xóa quy tắc thông báo.');
+  }
+});
+
+// ============================================================================
+// 15. System Email Templates (`/api/v1/org-rbac/email-templates`)
+// ============================================================================
+orgRbacRouter.get('/email-templates', requirePermission('settings', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM tenant_email_templates WHERE tenant_id = $1 ORDER BY is_system DESC, created_at DESC',
+        [ctx.tenantId]
+      );
+      return r.rows;
+    });
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_EMAIL_TEMPLATES_FAILED', err?.message || 'Không thể tải danh sách mẫu Email.');
+  }
+});
+
+orgRbacRouter.post('/email-templates', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    const subjectTemplate = String(b.subject_template || b.subject || '').trim();
+    if (!name || !subjectTemplate) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Tên mẫu Email và tiêu đề (subject_template) là bắt buộc.');
+      return;
+    }
+    const id = crypto.randomUUID();
+    const templateKey = slugifyKeyLower(b.template_key || name, 'tpl');
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO tenant_email_templates (
+           id, tenant_id, template_key, name, category, subject_template, body_html, body_text,
+           variables_json, is_system, is_active, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)`,
+        [
+          id,
+          ctx.tenantId,
+          templateKey,
+          name,
+          String(b.category || 'notification').trim().toLowerCase(),
+          subjectTemplate,
+          String(b.body_html || b.content_html || ''),
+          b.body_text ? String(b.body_text) : null,
+          JSON.stringify(Array.isArray(b.variables_json ?? b.variables) ? (b.variables_json ?? b.variables) : []),
+          Boolean(b.is_system),
+          b.is_active !== false,
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_email_templates WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_EMAIL_TEMPLATE_FAILED', err?.message || 'Không thể tạo mẫu Email.');
+  }
+});
+
+const updateEmailTemplateHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE tenant_email_templates
+         SET name = COALESCE($3, name),
+             category = COALESCE($4, category),
+             subject_template = COALESCE($5, subject_template),
+             body_html = COALESCE($6, body_html),
+             body_text = CASE WHEN $7::boolean THEN $8 ELSE body_text END,
+             variables_json = COALESCE($9::jsonb, variables_json),
+             is_active = COALESCE($10, is_active),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          b.name ? String(b.name).trim() : null,
+          b.category ? String(b.category).trim().toLowerCase() : null,
+          (b.subject_template ?? b.subject) ? String(b.subject_template ?? b.subject).trim() : null,
+          b.body_html !== undefined || b.content_html !== undefined ? String(b.body_html ?? b.content_html) : null,
+          b.body_text !== undefined,
+          b.body_text ? String(b.body_text) : null,
+          (b.variables_json ?? b.variables) !== undefined
+            ? JSON.stringify(Array.isArray(b.variables_json ?? b.variables) ? (b.variables_json ?? b.variables) : [])
+            : null,
+          typeof b.is_active === 'boolean' ? b.is_active : null,
+        ]
+      );
+      return r.rows[0] || null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'EMAIL_TEMPLATE_NOT_FOUND', 'Không tìm thấy mẫu Email.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_EMAIL_TEMPLATE_FAILED', err?.message || 'Không thể cập nhật mẫu Email.');
+  }
+};
+orgRbacRouter.put('/email-templates/:id', requirePermission('settings', 'manage_config'), updateEmailTemplateHandler);
+orgRbacRouter.patch('/email-templates/:id', requirePermission('settings', 'manage_config'), updateEmailTemplateHandler);
+
+orgRbacRouter.delete('/email-templates/:id', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM tenant_email_templates WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true, id: req.params.id } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_EMAIL_TEMPLATE_FAILED', err?.message || 'Không thể xóa mẫu Email.');
+  }
+});
+
+// ============================================================================
+// 16. Dynamic Entity Profile Tabs (`/api/v1/org-rbac/entity-tabs`)
+// ============================================================================
+orgRbacRouter.get('/entity-tabs', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const entityType = req.query.entity_type ? String(req.query.entity_type).trim().toLowerCase() : null;
+    const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const params: unknown[] = [ctx.tenantId];
+      let where = 'tenant_id = $1';
+      if (entityType) {
+        params.push(entityType);
+        where += ' AND entity_type = $2';
+      }
+      const r = await client.query(
+        `SELECT * FROM tenant_entity_tabs WHERE ${where} ORDER BY entity_type ASC, sort_order ASC, created_at ASC`,
+        params
+      );
+      return r.rows;
+    });
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_ENTITY_TABS_FAILED', err?.message || 'Không thể tải danh sách Tab thực thể.');
+  }
+});
+
+orgRbacRouter.post('/entity-tabs', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const label = String(b.label || b.name || '').trim();
+    if (!label) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Tên Tab (label) không được để trống.');
+      return;
+    }
+    const entityType = String(b.entity_type || 'lead').trim().toLowerCase();
+    const tabKey = slugifyKeyLower(b.tab_key || label, 'tab');
+    const id = crypto.randomUUID();
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO tenant_entity_tabs (
+           id, tenant_id, entity_type, tab_key, label, icon_name, tab_type,
+           config_json, allowed_role_ids, sort_order, is_active
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)`,
+        [
+          id,
+          ctx.tenantId,
+          entityType,
+          tabKey,
+          label,
+          String(b.icon_name || 'Layers').trim(),
+          String(b.tab_type || 'fields').trim().toLowerCase(),
+          JSON.stringify(b.config_json && typeof b.config_json === 'object' ? b.config_json : {}),
+          JSON.stringify(Array.isArray(b.allowed_role_ids) ? b.allowed_role_ids : []),
+          Math.trunc(Number(b.sort_order ?? 0) || 0),
+          b.is_active !== false,
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_entity_tabs WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_ENTITY_TAB_FAILED', err?.message || 'Không thể tạo Tab thực thể.');
+  }
+});
+
+const updateEntityTabHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE tenant_entity_tabs
+         SET label = COALESCE($3, label),
+             icon_name = COALESCE($4, icon_name),
+             tab_type = COALESCE($5, tab_type),
+             config_json = COALESCE($6::jsonb, config_json),
+             allowed_role_ids = COALESCE($7::jsonb, allowed_role_ids),
+             sort_order = COALESCE($8, sort_order),
+             is_active = COALESCE($9, is_active),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          (b.label ?? b.name) ? String(b.label ?? b.name).trim() : null,
+          b.icon_name ? String(b.icon_name).trim() : null,
+          b.tab_type ? String(b.tab_type).trim().toLowerCase() : null,
+          b.config_json !== undefined ? JSON.stringify(b.config_json || {}) : null,
+          b.allowed_role_ids !== undefined
+            ? JSON.stringify(Array.isArray(b.allowed_role_ids) ? b.allowed_role_ids : [])
+            : null,
+          b.sort_order !== undefined ? Math.trunc(Number(b.sort_order) || 0) : null,
+          typeof b.is_active === 'boolean' ? b.is_active : null,
+        ]
+      );
+      return r.rows[0] || null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'ENTITY_TAB_NOT_FOUND', 'Không tìm thấy Tab thực thể.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_ENTITY_TAB_FAILED', err?.message || 'Không thể cập nhật Tab thực thể.');
+  }
+};
+orgRbacRouter.put('/entity-tabs/:id', requirePermission('settings', 'manage_config'), updateEntityTabHandler);
+orgRbacRouter.patch('/entity-tabs/:id', requirePermission('settings', 'manage_config'), updateEntityTabHandler);
+
+orgRbacRouter.delete('/entity-tabs/:id', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM tenant_entity_tabs WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true, id: req.params.id } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_ENTITY_TAB_FAILED', err?.message || 'Không thể xóa Tab thực thể.');
+  }
+});
+
+// ============================================================================
+// 17. Tenant Tags Management (`/api/v1/org-rbac/tags`)
+// ============================================================================
+orgRbacRouter.get('/tags', async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query('SELECT * FROM tenant_tags WHERE tenant_id = $1 ORDER BY name ASC', [
+        ctx.tenantId,
+      ]);
+      return r.rows;
+    });
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_TAGS_FAILED', err?.message || 'Không thể tải danh sách nhãn (Tags).');
+  }
+});
+
+orgRbacRouter.post('/tags', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    if (!name) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Tên nhãn (Tag) không được để trống.');
+      return;
+    }
+    const id = crypto.randomUUID();
+    const slug = slugifyKeyLower(b.slug || name, 'tag').slice(0, 100);
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO tenant_tags (id, tenant_id, name, slug, color_hex, category, description)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          id,
+          ctx.tenantId,
+          name.slice(0, 100),
+          slug,
+          String(b.color_hex || b.color || '#1E40FF').slice(0, 20),
+          String(b.category || 'lead').slice(0, 50),
+          b.description ? String(b.description).trim() : null,
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_tags WHERE tenant_id = $1 AND id = $2', [ctx.tenantId, id]);
+      return r.rows[0];
+    });
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_TAG_FAILED', err?.message || 'Không thể tạo nhãn (Tag).');
+  }
+});
+
+const updateTagHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE tenant_tags
+         SET name = COALESCE($3, name),
+             slug = COALESCE($4, slug),
+             color_hex = COALESCE($5, color_hex),
+             category = COALESCE($6, category),
+             description = CASE WHEN $7::boolean THEN $8 ELSE description END,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          b.name ? String(b.name).trim().slice(0, 100) : null,
+          b.slug ? slugifyKeyLower(b.slug, 'tag').slice(0, 100) : null,
+          (b.color_hex ?? b.color) ? String(b.color_hex ?? b.color).slice(0, 20) : null,
+          b.category ? String(b.category).slice(0, 50) : null,
+          b.description !== undefined,
+          b.description ? String(b.description).trim() : null,
+        ]
+      );
+      return r.rows[0] || null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'TAG_NOT_FOUND', 'Không tìm thấy nhãn (Tag).');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_TAG_FAILED', err?.message || 'Không thể cập nhật nhãn (Tag).');
+  }
+};
+orgRbacRouter.put('/tags/:id', requirePermission('settings', 'manage_config'), updateTagHandler);
+orgRbacRouter.patch('/tags/:id', requirePermission('settings', 'manage_config'), updateTagHandler);
+
+orgRbacRouter.delete('/tags/:id', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM tenant_tags WHERE tenant_id = $1 AND id = $2', [ctx.tenantId, req.params.id]);
+    });
+    res.json({ success: true, data: { deleted: true, id: req.params.id } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_TAG_FAILED', err?.message || 'Không thể xóa nhãn (Tag).');
+  }
+});
+
+// ============================================================================
+// 18. Master Cron Monitor & Trigger (`/api/v1/org-rbac/cron-status`)
+// ============================================================================
+const CRON_SUBROUTINES_CATALOG = [
+  { key: 'sla', name: 'SLA Sweeper & Lead Escalation', schedule: '*/1 * * * *' },
+  { key: 'drain', name: 'Unassigned Lead Drainer & Round Redistribution', schedule: '*/2 * * * *' },
+  { key: 'zalo', name: 'Zalo OA Token Auto-Refresher', schedule: '0 * * * *' },
+  { key: 'billing', name: 'Subscription & Trial Expiry Manager', schedule: '0 0 * * *' },
+  { key: 'webhook', name: 'Webhook DLQ Auto-Replay Worker', schedule: '*/5 * * * *' },
+  { key: 'capi', name: 'Meta CAPI Retry Queue Worker', schedule: '*/5 * * * *' },
+];
+
+orgRbacRouter.get('/cron-status', requirePermission('settings', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const runs = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM tenant_cron_runs WHERE tenant_id = $1 ORDER BY started_at DESC LIMIT 50',
+        [ctx.tenantId]
+      );
+      return r.rows;
+    });
+    res.json({
+      success: true,
+      data: {
+        subroutines: CRON_SUBROUTINES_CATALOG,
+        runs,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CRON_STATUS_FAILED', err?.message || 'Không thể tải trạng thái tiến trình tự động.');
+  }
+});
+
+orgRbacRouter.post('/cron-status/run', requirePermission('settings', 'manage_config'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const validKeys = new Set(CRON_SUBROUTINES_CATALOG.map((c) => c.key));
+    const requestedRaw = Array.isArray(req.body?.subroutines)
+      ? req.body.subroutines
+      : req.body?.subroutine_key
+        ? [req.body.subroutine_key]
+        : ['sla', 'drain', 'webhook', 'capi'];
+    const requested = requestedRaw
+      .map((s: unknown) => String(s || '').trim().toLowerCase())
+      .filter((s: string) => validKeys.has(s));
+    const runResult = await executeMasterCron({
+      subroutines: requested.length > 0 ? requested : ['sla', 'drain', 'webhook', 'capi'],
+      tenantId: ctx.tenantId,
+    });
+
+    const recorded = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const id = crypto.randomUUID();
+      const processedCount =
+        runResult.stats.slaBreachedCount +
+        runResult.stats.leadsDrainedCount +
+        runResult.stats.zaloRefreshedCount +
+        runResult.stats.subscriptionsProcessed +
+        runResult.stats.webhooksReplayedCount +
+        runResult.stats.capiRetriedCount;
+      await client.query(
+        `INSERT INTO tenant_cron_runs (
+           id, tenant_id, subroutine_key, status, items_processed, duration_ms,
+           error_message, details_json, triggered_by, started_at, finished_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'manual', clock_timestamp(), clock_timestamp())`,
+        [
+          id,
+          ctx.tenantId,
+          requested.join(',') || 'all',
+          runResult.locked ? 'skipped' : runResult.stats.errors.length > 0 ? 'failed' : 'success',
+          processedCount,
+          runResult.stats.durationMs,
+          runResult.stats.errors.length > 0 ? runResult.stats.errors.join(' | ') : null,
+          JSON.stringify(runResult.stats),
+        ]
+      );
+      const r = await client.query('SELECT * FROM tenant_cron_runs WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+
+    res.json({
+      success: true,
+      data: {
+        locked: runResult.locked,
+        stats: runResult.stats,
+        run_log: recorded,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CRON_RUN_FAILED', err?.message || 'Không thể chạy tiến trình tự động.');
+  }
+});

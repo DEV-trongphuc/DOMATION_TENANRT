@@ -4,7 +4,15 @@ import { hashPassword } from '../core/crypto/password.ts';
 import { withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
-import { requireTenantAuth, requireRoles, sendApiError } from '../core/security/rbac.ts';
+import {
+  checkEffectivePermission,
+  getResolvedUserRbac,
+  requireAnyPermission,
+  requirePermission,
+  requireTenantAuth,
+  sendApiError,
+} from '../core/security/rbac.ts';
+import { type DbClient } from '../core/database/db-adapter.ts';
 import { getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
 import {
   toggleSaleAdministrativeStatus,
@@ -17,17 +25,44 @@ export const usersRouter = Router();
 
 usersRouter.use(requireTenantAuth);
 
-// Lightweight Peer Directory for Lead Reassignment (accessible to Admin, Manager, or Sale when `allow_sale_reassign_lead` is enabled)
-usersRouter.get('/peers', async (_req, res) => {
+async function insertRecallTimelineEvents(
+  client: DbClient,
+  tenantId: string,
+  leadRows: Array<{ id: string }>,
+  eventType: string,
+  actorId: string,
+  actorRole: string,
+  actorName: string,
+  title: string,
+  content: string
+): Promise<void> {
+  const chunkSize = 100;
+  for (let i = 0; i < leadRows.length; i += chunkSize) {
+    const chunk = leadRows.slice(i, i + chunkSize);
+    const values: unknown[] = [];
+    const tuples: string[] = [];
+    for (const r of chunk) {
+      const base = values.length;
+      values.push(tenantId, r.id, eventType, 'system', actorId, actorRole, actorName, title, content, '{}');
+      tuples.push(
+        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`
+      );
+    }
+    if (tuples.length > 0) {
+      await client.query(
+        `INSERT INTO lead_timeline_events (
+           tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+         ) VALUES ${tuples.join(', ')}`,
+        values
+      );
+    }
+  }
+}
+
+// Lightweight Peer Directory for Lead Reassignment (accessible by RBAC `users.view` OR `leads.assign`)
+usersRouter.get('/peers', requireAnyPermission([['users', 'view'], ['leads', 'assign']]), async (_req, res) => {
   try {
     const ctx = getTenantContext();
-    if (ctx.userRole !== 'tenant_admin' && ctx.userRole !== 'manager') {
-      const cfg = await getTenantSettingsCached(ctx.tenantId);
-      if (!cfg.role_permissions.allow_sale_reassign_lead) {
-        sendApiError(res, 403, 'FORBIDDEN_ROLE', 'Tài khoản của bạn chưa được cấp quyền điều chuyển Lead.');
-        return;
-      }
-    }
 
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
       const r = await client.query(
@@ -74,10 +109,12 @@ usersRouter.get('/peers', async (_req, res) => {
   }
 });
 
-// 3.1 List Tenant Staff Roster (Single Hash-Aggregate Pass — Zero Correlated Subqueries)
-usersRouter.get('/', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+// 3.1 List Tenant Staff Roster (Cross-Dialect PG16 & MariaDB 10.6 — Zero ARRAY_AGG)
+usersRouter.get('/', requirePermission('users', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolvedRbac = await getResolvedUserRbac(req);
+    const viewCheck = checkEffectivePermission(resolvedRbac, 'users', 'view');
     const tenantCfg = await getTenantSettingsCached(ctx.tenantId);
     const roleFilter = req.query.role ? String(req.query.role) : null;
     const statusFilter = req.query.status ? String(req.query.status) : null;
@@ -88,6 +125,10 @@ usersRouter.get('/', requireRoles('tenant_admin', 'manager'), async (req, res) =
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       const params: unknown[] = [ctx.tenantId];
       let where = 'u.tenant_id = $1';
+      if (viewCheck.scope === 'own') {
+        params.push(ctx.userId);
+        where += ` AND u.id = $${params.length}`;
+      }
       if (roleFilter) {
         params.push(roleFilter);
         where += ` AND u.role = $${params.length}`;
@@ -98,7 +139,7 @@ usersRouter.get('/', requireRoles('tenant_admin', 'manager'), async (req, res) =
       }
 
       const countRes = await client.query<{ total: number }>(
-        `SELECT COUNT(*)::int AS total
+        `SELECT COUNT(*) AS total
          FROM users u
          LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
          WHERE ${where}`,
@@ -108,93 +149,120 @@ usersRouter.get('/', requireRoles('tenant_admin', 'manager'), async (req, res) =
       params.push(limit, offset);
       const limitIdx = params.length - 1;
       const offsetIdx = params.length;
-      const rowsRes = await client.query(
-        `WITH page_users AS (
-           SELECT
-             u.id, u.full_name, u.email, u.phone, u.role, u.is_external_agency, u.created_at,
-             p.status, p.is_available, p.vacation_mode, p.skipped_credit, p.work_schedule, p.zalo_chat_id,
-             p.is_silent, p.invite_status, p.sheet_sync_url, p.sheet_tab_name
-           FROM users u
-           LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
-           WHERE ${where}
-           ORDER BY u.created_at ASC
-           LIMIT $${limitIdx} OFFSET $${offsetIdx}
-         ),
-         rc_agg AS (
-           SELECT
-             rc.user_id,
-             (ARRAY_AGG(rc.receive_ratio ORDER BY rc.created_at ASC))[1] AS receive_ratio,
-             (ARRAY_AGG(rc.data_per_turn ORDER BY rc.created_at ASC))[1] AS data_per_turn,
-             COALESCE(SUM(rc.leads_received_in_round), 0)::int AS leads_received_in_round,
-             COALESCE(SUM(rc.compensation_count), 0)::int AS compensation_count
-           FROM round_consultants rc
-           WHERE rc.tenant_id = $1 AND rc.user_id IN (SELECT id FROM page_users)
-           GROUP BY rc.user_id
-         ),
-         lead_agg AS (
-           SELECT
-             l.assigned_to AS user_id,
-             COUNT(*)::int AS total_assigned_leads
-           FROM leads l
-           WHERE l.tenant_id = $1 AND l.assigned_to IN (SELECT id FROM page_users) AND l.is_deleted = false
-           GROUP BY l.assigned_to
-         ),
-         cm_agg AS (
-           SELECT
-             cm.consultant_user_id AS user_id,
-             COUNT(*)::int AS co_managers_count
-           FROM consultant_managers cm
-           WHERE cm.tenant_id = $1 AND cm.consultant_user_id IN (SELECT id FROM page_users)
-           GROUP BY cm.consultant_user_id
-         )
-         SELECT
-           pu.id, pu.full_name, pu.email, pu.phone, pu.role, pu.is_external_agency, pu.created_at,
-           pu.status, pu.is_available, pu.vacation_mode, pu.skipped_credit, pu.work_schedule, pu.zalo_chat_id,
-           pu.is_silent, pu.invite_status, pu.sheet_sync_url, pu.sheet_tab_name,
-           COALESCE(rc_agg.receive_ratio, 1) AS receive_ratio,
-           COALESCE(rc_agg.data_per_turn, 1) AS data_per_turn,
-           COALESCE(rc_agg.leads_received_in_round, 0) AS leads_received_in_round,
-           COALESCE(rc_agg.compensation_count, 0) AS compensation_count,
-           COALESCE(lead_agg.total_assigned_leads, 0) AS total_assigned_leads,
-           COALESCE(cm_agg.co_managers_count, 0) AS co_managers_count
-         FROM page_users pu
-         LEFT JOIN rc_agg ON rc_agg.user_id = pu.id
-         LEFT JOIN lead_agg ON lead_agg.user_id = pu.id
-         LEFT JOIN cm_agg ON cm_agg.user_id = pu.id
-         ORDER BY pu.created_at ASC`,
+      const pageUsersRes = await client.query(
+        `SELECT
+           u.id, u.full_name, u.email, u.phone, u.role, u.role_id, u.is_tenant_owner,
+           u.is_external_agency, u.created_at,
+           p.status, p.is_available, p.vacation_mode, p.skipped_credit, p.work_schedule, p.zalo_chat_id,
+           p.is_silent, p.invite_status, p.sheet_sync_url, p.sheet_tab_name
+         FROM users u
+         LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
+         WHERE ${where}
+         ORDER BY u.created_at ASC
+         LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
         params
       );
 
-      const items = rowsRes.rows.map((r) => ({
-        id: r.id,
-        full_name: r.full_name,
-        email: r.email,
-        phone: r.phone,
-        role: r.role,
-        is_external_agency: r.is_external_agency,
-        total_assigned_leads: r.total_assigned_leads,
-        co_managers_count: r.co_managers_count || 0,
-        round_quota: {
-          receive_ratio: r.receive_ratio,
-          data_per_turn: r.data_per_turn,
-          leads_received_in_round: r.leads_received_in_round,
-          compensation_count: r.compensation_count,
-        },
-        profile: {
-          status: r.status || 'active',
-          is_available: r.is_available ?? true,
-          vacation_mode: r.vacation_mode ?? false,
-          skipped_credit: r.skipped_credit ?? 0,
-          work_schedule: r.work_schedule,
-          zalo_chat_id: r.zalo_chat_id,
-          is_silent: Boolean(r.is_silent),
-          invite_status: r.invite_status || 'joined',
-          sheet_sync_url: r.sheet_sync_url || null,
-          sheet_tab_name: r.sheet_tab_name || null,
-        },
-      }));
+      const pageUserIds = pageUsersRes.rows.map((u) => String(u.id));
+      const rcMap = new Map<
+        string,
+        { receive_ratio: number; data_per_turn: number; leads_received_in_round: number; compensation_count: number }
+      >();
+      const leadCountMap = new Map<string, number>();
+      const cmCountMap = new Map<string, number>();
 
-      const total = countRes.rows[0]?.total || 0;
+      if (pageUserIds.length > 0) {
+        const idPlaceholders = pageUserIds.map((_, i) => `$${i + 2}`).join(', ');
+        const [rcRes, leadRes, cmRes] = await Promise.all([
+          client.query<{
+            user_id: string;
+            receive_ratio: number;
+            data_per_turn: number;
+            leads_received_in_round: number;
+            compensation_count: number;
+          }>(
+            `SELECT rc.user_id, rc.receive_ratio, rc.data_per_turn,
+                    rc.leads_received_in_round, rc.compensation_count
+             FROM round_consultants rc
+             WHERE rc.tenant_id = $1 AND rc.user_id IN (${idPlaceholders})
+             ORDER BY rc.created_at ASC`,
+            [ctx.tenantId, ...pageUserIds]
+          ),
+          client.query<{ user_id: string; cnt: number }>(
+            `SELECT l.assigned_to AS user_id, COUNT(*) AS cnt
+             FROM leads l
+             WHERE l.tenant_id = $1 AND l.assigned_to IN (${idPlaceholders}) AND l.is_deleted = false
+             GROUP BY l.assigned_to`,
+            [ctx.tenantId, ...pageUserIds]
+          ),
+          client.query<{ user_id: string; cnt: number }>(
+            `SELECT cm.consultant_user_id AS user_id, COUNT(*) AS cnt
+             FROM consultant_managers cm
+             WHERE cm.tenant_id = $1 AND cm.consultant_user_id IN (${idPlaceholders})
+             GROUP BY cm.consultant_user_id`,
+            [ctx.tenantId, ...pageUserIds]
+          ),
+        ]);
+
+        for (const row of rcRes.rows) {
+          const uid = String(row.user_id);
+          const cur = rcMap.get(uid);
+          if (!cur) {
+            rcMap.set(uid, {
+              receive_ratio: Number(row.receive_ratio || 1),
+              data_per_turn: Number(row.data_per_turn || 1),
+              leads_received_in_round: Number(row.leads_received_in_round || 0),
+              compensation_count: Number(row.compensation_count || 0),
+            });
+          } else {
+            cur.leads_received_in_round += Number(row.leads_received_in_round || 0);
+            cur.compensation_count += Number(row.compensation_count || 0);
+          }
+        }
+        for (const row of leadRes.rows) {
+          leadCountMap.set(String(row.user_id), Number(row.cnt || 0));
+        }
+        for (const row of cmRes.rows) {
+          cmCountMap.set(String(row.user_id), Number(row.cnt || 0));
+        }
+      }
+
+      const items = pageUsersRes.rows.map((r) => {
+        const uid = String(r.id);
+        const rcAgg = rcMap.get(uid) || {
+          receive_ratio: 1,
+          data_per_turn: 1,
+          leads_received_in_round: 0,
+          compensation_count: 0,
+        };
+        return {
+          id: r.id,
+          full_name: r.full_name,
+          email: r.email,
+          phone: r.phone,
+          role: r.role,
+          role_id: r.role_id || null,
+          is_tenant_owner: Boolean(r.is_tenant_owner),
+          is_external_agency: r.is_external_agency,
+          total_assigned_leads: leadCountMap.get(uid) || 0,
+          co_managers_count: cmCountMap.get(uid) || 0,
+          round_quota: rcAgg,
+          profile: {
+            status: r.status || 'active',
+            is_available: r.is_available ?? true,
+            vacation_mode: r.vacation_mode ?? false,
+            skipped_credit: r.skipped_credit ?? 0,
+            work_schedule: r.work_schedule,
+            zalo_chat_id: r.zalo_chat_id,
+            is_silent: Boolean(r.is_silent),
+            invite_status: r.invite_status || 'joined',
+            sheet_sync_url: r.sheet_sync_url || null,
+            sheet_tab_name: r.sheet_tab_name || null,
+          },
+        };
+      });
+
+      const total = Number(countRes.rows[0]?.total || 0);
       return {
         items,
         pagination: {
@@ -211,16 +279,28 @@ usersRouter.get('/', requireRoles('tenant_admin', 'manager'), async (req, res) =
   }
 });
 
-// Op 06 & Op 07: Create Manager / Sale / External Agency Account
-usersRouter.post('/', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+// Create Staff Account (supports custom `role_id` / `role` governed by RBAC Matrix + Privilege Escalation Safeguard)
+usersRouter.post('/', requirePermission('users', 'create'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolvedActor = await getResolvedUserRbac(req);
+    const isOwner = Boolean(resolvedActor.userOrg?.is_tenant_owner);
+    const canManageRoleAssignment =
+      isOwner ||
+      checkEffectivePermission(resolvedActor, 'org_rbac', 'manage_config').allowed ||
+      checkEffectivePermission(resolvedActor, 'users', 'manage_config').allowed;
+
     const {
       full_name,
       email,
       phone,
       password,
       role = 'sale',
+      role_id = null,
+      branch_id = null,
+      department_id = null,
+      team_id = null,
+      position_id = null,
       is_external_agency = false,
       receive_ratio = 1,
       data_per_turn = 1,
@@ -229,17 +309,8 @@ usersRouter.post('/', requireRoles('tenant_admin', 'manager'), async (req, res) 
       zalo_chat_id,
     } = req.body || {};
 
-    // Strict RBAC Matrix Op 05 & Op 06 enforcement:
-    // - Nobody in tenant space can create `tenant_admin` via staff endpoint (Op 05)
-    // - `manager` can ONLY create `sale` accounts, never `manager` or `tenant_admin` (Op 06)
-    if (role !== 'sale' && role !== 'manager') {
-      sendApiError(res, 403, 'FORBIDDEN_ROLE_ASSIGNMENT', 'Chỉ được phép tạo tài khoản Sale/Đại lý hoặc Quản lý (Manager).');
-      return;
-    }
-    if (ctx.userRole === 'manager' && role !== 'sale') {
-      sendApiError(res, 403, 'FORBIDDEN_MANAGER_CREATE_MANAGER', 'Quản lý (Manager) chỉ được phép tạo tài khoản Sale / Đại lý.');
-      return;
-    }
+    let resolvedRoleKey = String(role || 'sale').trim();
+    const requestedRoleId = role_id ? String(role_id).trim() : null;
 
     const cleanName = String(full_name || '').trim();
     const cleanEmail = String(email || '').trim().toLowerCase();
@@ -275,6 +346,48 @@ usersRouter.post('/', requireRoles('tenant_admin', 'manager'), async (req, res) 
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
       await enforceTenantOperationalPolicy(client, ctx.tenantId, 'create_user');
 
+      let targetRoleId: string | null = null;
+      let targetRolePrivileged = false;
+      if (requestedRoleId) {
+        const rRow = await client.query<{ id: string; role_key: string }>(
+          'SELECT id, role_key FROM tenant_roles WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, requestedRoleId]
+        );
+        if (!rRow.rows[0]) {
+          throw new Error('ROLE_NOT_FOUND');
+        }
+        targetRoleId = rRow.rows[0].id;
+        resolvedRoleKey = rRow.rows[0].role_key;
+      } else {
+        const rRow = await client.query<{ id: string; role_key: string }>(
+          'SELECT id, role_key FROM tenant_roles WHERE tenant_id = $1 AND LOWER(role_key) = LOWER($2) LIMIT 1',
+          [ctx.tenantId, resolvedRoleKey]
+        );
+        if (rRow.rows[0]) {
+          targetRoleId = rRow.rows[0].id;
+          resolvedRoleKey = rRow.rows[0].role_key;
+        }
+      }
+
+      if (resolvedRoleKey.toLowerCase() === 'tenant_admin' || resolvedRoleKey.toLowerCase() === 'manager') {
+        targetRolePrivileged = true;
+      } else if (targetRoleId) {
+        const privCheck = await client.query<{ cnt: number }>(
+          `SELECT COUNT(*) AS cnt FROM tenant_role_permissions
+           WHERE tenant_id = $1 AND role_id = $2
+             AND module_key IN ('org_rbac', 'settings', 'users', 'billing')
+             AND data_scope <> 'none'`,
+          [ctx.tenantId, targetRoleId]
+        );
+        if (Number(privCheck.rows[0]?.cnt || 0) > 0) {
+          targetRolePrivileged = true;
+        }
+      }
+
+      if (targetRolePrivileged && !canManageRoleAssignment) {
+        throw new Error('FORBIDDEN_ROLE_ASSIGNMENT');
+      }
+
       const dup = await client.query('SELECT id FROM users WHERE tenant_id = $1 AND LOWER(email) = $2 LIMIT 1', [
         ctx.tenantId,
         cleanEmail,
@@ -289,12 +402,33 @@ usersRouter.post('/', requireRoles('tenant_admin', 'manager'), async (req, res) 
         email: string;
         phone: string | null;
         role: string;
+        role_id: string | null;
+        branch_id: string | null;
+        department_id: string | null;
+        team_id: string | null;
+        position_id: string | null;
         is_external_agency: boolean;
       }>(
-        `INSERT INTO users (tenant_id, email, password_hash, full_name, phone, role, is_external_agency)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, full_name, email, phone, role, is_external_agency`,
-        [ctx.tenantId, cleanEmail, passwordHash, cleanName, normalizedPhone, role, Boolean(is_external_agency)]
+        `INSERT INTO users (
+           tenant_id, email, password_hash, full_name, phone, role, role_id,
+           branch_id, department_id, team_id, position_id, is_tenant_owner, is_external_agency
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12)
+         RETURNING id, full_name, email, phone, role, role_id, branch_id, department_id, team_id, position_id, is_external_agency`,
+        [
+          ctx.tenantId,
+          cleanEmail,
+          passwordHash,
+          cleanName,
+          normalizedPhone,
+          resolvedRoleKey,
+          targetRoleId,
+          branch_id ? String(branch_id).trim() : null,
+          department_id ? String(department_id).trim() : null,
+          team_id ? String(team_id).trim() : null,
+          position_id ? String(position_id).trim() : null,
+          Boolean(is_external_agency),
+        ]
       );
       const newUser = uRes.rows[0];
 
@@ -324,7 +458,7 @@ usersRouter.post('/', requireRoles('tenant_admin', 'manager'), async (req, res) 
       }
 
       // Attach to default active distribution round if role === 'sale'
-      if (role === 'sale') {
+      if (resolvedRoleKey === 'sale') {
         const roundRes = await client.query<{ id: string }>(
           'SELECT id FROM distribution_rounds WHERE tenant_id = $1 AND is_active = true ORDER BY priority ASC LIMIT 1',
           [ctx.tenantId]
@@ -357,6 +491,14 @@ usersRouter.post('/', requireRoles('tenant_admin', 'manager'), async (req, res) 
     res.status(201).json({ success: true, data: created });
   } catch (err: any) {
     const msg = String(err?.message || '');
+    if (msg === 'FORBIDDEN_ROLE_ASSIGNMENT') {
+      sendApiError(res, 403, 'FORBIDDEN_ROLE_ASSIGNMENT', 'Tài khoản không có quyền tạo/gán vai trò quản trị hoặc cao cấp.');
+      return;
+    }
+    if (msg === 'ROLE_NOT_FOUND') {
+      sendApiError(res, 404, 'ROLE_NOT_FOUND', 'Không tìm thấy vai trò trong sơ đồ phân quyền.');
+      return;
+    }
     if (msg.startsWith('SUBSCRIPTION_EXPIRED')) {
       sendApiError(res, 402, 'SUBSCRIPTION_EXPIRED', msg);
       return;
@@ -439,20 +581,16 @@ usersRouter.patch('/me/availability', async (req, res) => {
           for (const r of unacc.rows) {
             slaMembersToCancel.push(`${r.id}:${r.stage_id}`);
           }
-          await client.query(
-            `INSERT INTO lead_timeline_events (
-              tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-            )
-            SELECT $1, unnest($2::uuid[]), 'self_offline_recall', 'system', $3, $4, $5, $6, $7, '{}'::jsonb`,
-            [
-              ctx.tenantId,
-              unacc.rows.map((r) => r.id),
-              ctx.userId,
-              ctx.userRole,
-              ctx.userName || 'Sale',
-              'AUTO_RECALL: Hoàn trả lead chưa tiếp nhận khi Sale bật chế độ Tạm nghỉ / Offline',
-              nextVacation ? 'Sale bật chế độ Nghỉ phép (Vacation Mode)' : 'Sale tắt công tắc nhận số',
-            ]
+          await insertRecallTimelineEvents(
+            client,
+            ctx.tenantId,
+            unacc.rows,
+            'self_offline_recall',
+            ctx.userId,
+            ctx.userRole,
+            ctx.userName || 'Sale',
+            'AUTO_RECALL: Hoàn trả lead chưa tiếp nhận khi Sale bật chế độ Tạm nghỉ / Offline',
+            nextVacation ? 'Sale bật chế độ Nghỉ phép (Vacation Mode)' : 'Sale tắt công tắc nhận số'
           );
         }
       }
@@ -489,7 +627,7 @@ usersRouter.patch('/me/availability', async (req, res) => {
 });
 
 // 3.2 Update Sale Administrative Status (Master Toggle Switch + Session Blacklist)
-usersRouter.post('/:id/admin-status', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+usersRouter.post('/:id/admin-status', requirePermission('users', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const targetUserId = req.params.id;
@@ -538,16 +676,28 @@ usersRouter.post('/:id/admin-status', requireRoles('tenant_admin', 'manager'), a
   }
 });
 
-// Update Consultant Profile, Operational Toggles (by Admin/Manager), Work Schedule, Ratio & Batch Turn
-usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+// Update Consultant Profile, Operational Toggles (by RBAC `users.edit`), Work Schedule, Ratio & Batch Turn
+usersRouter.patch('/:id', requirePermission('users', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolvedActor = await getResolvedUserRbac(req);
+    const isOwner = Boolean(resolvedActor.userOrg?.is_tenant_owner);
+    const canManageRoleOrEmail =
+      isOwner ||
+      checkEffectivePermission(resolvedActor, 'org_rbac', 'manage_config').allowed ||
+      checkEffectivePermission(resolvedActor, 'users', 'manage_config').allowed;
+
     const targetUserId = req.params.id;
     const {
       full_name,
       email,
       phone,
       role,
+      role_id,
+      branch_id,
+      department_id,
+      team_id,
+      position_id,
       password,
       is_external_agency,
       is_available,
@@ -564,8 +714,8 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
 
     let nextEmail: string | null = null;
     if (email !== undefined) {
-      if (ctx.userRole !== 'tenant_admin') {
-        sendApiError(res, 403, 'FORBIDDEN_EMAIL_UPDATE', 'Chỉ Tenant Admin mới được đổi email nhân sự.');
+      if (!canManageRoleOrEmail) {
+        sendApiError(res, 403, 'FORBIDDEN_EMAIL_UPDATE', 'Tài khoản không có quyền đổi email nhân sự.');
         return;
       }
       const cleaned = String(email || '').trim().toLowerCase();
@@ -576,9 +726,9 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
       nextEmail = cleaned;
     }
 
-    if (role !== undefined) {
-      if (ctx.userRole !== 'tenant_admin' || (role !== 'sale' && role !== 'manager')) {
-        sendApiError(res, 403, 'FORBIDDEN_ROLE_ASSIGNMENT', 'Chỉ Tenant Admin mới được đổi vai trò giữa Sale và Manager.');
+    if (role !== undefined || role_id !== undefined) {
+      if (!canManageRoleOrEmail) {
+        sendApiError(res, 403, 'FORBIDDEN_ROLE_ASSIGNMENT', 'Tài khoản không có quyền đổi vai trò nhân sự.');
         return;
       }
     }
@@ -624,6 +774,22 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
         }
       }
 
+      let patchRoleKey: string | null = role ? String(role).trim() : null;
+      let patchRoleId: string | null = role_id ? String(role_id).trim() : null;
+      if (patchRoleId && !patchRoleKey) {
+        const rr = await client.query<{ role_key: string }>(
+          'SELECT role_key FROM tenant_roles WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, patchRoleId]
+        );
+        patchRoleKey = rr.rows[0]?.role_key || null;
+      } else if (patchRoleKey && !patchRoleId) {
+        const rr = await client.query<{ id: string }>(
+          'SELECT id FROM tenant_roles WHERE tenant_id = $1 AND LOWER(role_key) = LOWER($2) LIMIT 1',
+          [ctx.tenantId, patchRoleKey]
+        );
+        patchRoleId = rr.rows[0]?.id || null;
+      }
+
       const uUpd = await client.query<{
         full_name: string;
         role: 'tenant_admin' | 'manager' | 'sale';
@@ -634,17 +800,14 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
              phone = CASE WHEN $4::boolean THEN $5 ELSE phone END,
              is_external_agency = COALESCE($6, is_external_agency),
              role = COALESCE($7, role),
-             role_id = CASE
-               WHEN $7::text IS NOT NULL THEN (
-                 SELECT tr.id FROM tenant_roles tr
-                 WHERE tr.tenant_id = $1 AND LOWER(tr.role_key) = LOWER($7)
-                 LIMIT 1
-               )
-               ELSE role_id
-             END,
-             password_hash = COALESCE($8, password_hash),
-             email = COALESCE($9, email),
-             account_id = CASE WHEN $9::text IS NOT NULL THEN NULL ELSE account_id END,
+             role_id = COALESCE($8, role_id),
+             password_hash = COALESCE($9, password_hash),
+             email = COALESCE($10, email),
+             account_id = CASE WHEN $10::text IS NOT NULL THEN NULL ELSE account_id END,
+             branch_id = CASE WHEN $11::boolean THEN $12 ELSE branch_id END,
+             department_id = CASE WHEN $13::boolean THEN $14 ELSE department_id END,
+             team_id = CASE WHEN $15::boolean THEN $16 ELSE team_id END,
+             position_id = CASE WHEN $17::boolean THEN $18 ELSE position_id END,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2
          RETURNING full_name, role, is_external_agency`,
@@ -655,9 +818,18 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
           hasPhoneUpdate,
           normalizedPhone,
           typeof is_external_agency === 'boolean' ? is_external_agency : null,
-          role || null,
+          patchRoleKey,
+          patchRoleId,
           passwordHash,
           nextEmail,
+          branch_id !== undefined,
+          branch_id ? String(branch_id).trim() : null,
+          department_id !== undefined,
+          department_id ? String(department_id).trim() : null,
+          team_id !== undefined,
+          team_id ? String(team_id).trim() : null,
+          position_id !== undefined,
+          position_id ? String(position_id).trim() : null,
         ]
       );
       const updatedUserRow = uUpd.rows[0] || null;
@@ -746,20 +918,16 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
           for (const r of unacc.rows) {
             slaMembersToCancel.push(`${r.id}:${r.stage_id}`);
           }
-          await client.query(
-            `INSERT INTO lead_timeline_events (
-              tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-            )
-            SELECT $1, unnest($2::uuid[]), 'admin_offline_recall', 'system', $3, $4, $5, $6, $7, '{}'::jsonb`,
-            [
-              ctx.tenantId,
-              unacc.rows.map((r) => r.id),
-              ctx.userId,
-              ctx.userRole,
-              ctx.userName || 'Manager',
-              `AUTO_RECALL: Thu hồi lead chưa tiếp nhận khi tắt Online / bật Nghỉ phép cho ${resolvedFullName}`,
-              prof.vacation_mode ? 'Chuyển sang chế độ Nghỉ phép' : 'Tắt công tắc nhận số Online',
-            ]
+          await insertRecallTimelineEvents(
+            client,
+            ctx.tenantId,
+            unacc.rows,
+            'admin_offline_recall',
+            ctx.userId,
+            ctx.userRole,
+            ctx.userName || 'Manager',
+            `AUTO_RECALL: Thu hồi lead chưa tiếp nhận khi tắt Online / bật Nghỉ phép cho ${resolvedFullName}`,
+            prof.vacation_mode ? 'Chuyển sang chế độ Nghỉ phép' : 'Tắt công tắc nhận số Online'
           );
         }
       }
@@ -773,9 +941,10 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
 
     if (patchOutcome.updatedUserRow) {
       tenantRedis.setCachedUserAuth(ctx.tenantId, targetUserId, {
-        role: patchOutcome.updatedUserRow.role,
+        role: patchOutcome.updatedUserRow.role as any,
         isExternalAgency: Boolean(patchOutcome.updatedUserRow.is_external_agency),
       });
+      tenantRedis.invalidateEffectivePermissions(ctx.tenantId, targetUserId);
     }
     if (passwordHash && targetUserId !== ctx.userId) {
       await tenantRedis.blacklistUser(ctx.tenantId, targetUserId, 'password_changed');
@@ -813,7 +982,10 @@ usersRouter.patch('/:id', requireRoles('tenant_admin', 'manager'), async (req, r
 });
 
 // Op 25: Manual Grant of Compensation Lead Credits
-usersRouter.post('/:id/compensation', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+usersRouter.post(
+  '/:id/compensation',
+  requireAnyPermission([['users', 'edit'], ['rounds', 'edit'], ['users', 'assign']]),
+  async (req, res) => {
   try {
     const ctx = getTenantContext();
     const targetUserId = req.params.id;

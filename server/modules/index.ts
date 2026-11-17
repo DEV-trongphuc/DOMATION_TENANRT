@@ -14,6 +14,7 @@ import { router as financeRouter } from './finance/index.ts';
 import { router as inventoryRouter } from './inventory/index.ts';
 import { router as domAgentRouter } from './dom-agent/index.ts';
 import { router as educationRouter } from './education-addon/index.ts';
+import { router as crm360Router } from './crm-360/index.ts';
 
 export interface ModuleMountSpec {
   key: string;
@@ -47,6 +48,7 @@ const WAVE2_STATIC_SLOTS: ModuleMountSpec[] = [
   { key: 'inventory', mountPath: '/api/v1/inventory', moduleDir: 'inventory', router: inventoryRouter },
   { key: 'dom_agent', mountPath: '/api/v1/dom-agent', moduleDir: 'dom-agent', router: domAgentRouter },
   { key: 'education', mountPath: '/api/v1/education', moduleDir: 'education-addon', router: educationRouter },
+  { key: 'crm_360', mountPath: '/api/v1/crm-360', moduleDir: 'crm-360', router: crm360Router },
 ];
 
 function createSlotDispatcher(spec: ModuleMountSpec): RequestHandler {

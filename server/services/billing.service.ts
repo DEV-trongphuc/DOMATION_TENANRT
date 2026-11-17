@@ -595,11 +595,13 @@ export async function enforceTenantOperationalPolicy(
       );
     }
   } else if (operation === 'ingest_lead') {
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
     const lCntRes = await client.query<{ cnt: number }>(
       `SELECT COUNT(*)::int AS cnt
        FROM leads
-       WHERE tenant_id = $1 AND created_at >= date_trunc('month', clock_timestamp())`,
-      [tenantId]
+       WHERE tenant_id = $1 AND created_at >= $2`,
+      [tenantId, monthStart]
     );
     const currentMonthLeads = Number(lCntRes.rows[0]?.cnt || 0);
     if (currentMonthLeads >= limits.monthly_lead_quota) {

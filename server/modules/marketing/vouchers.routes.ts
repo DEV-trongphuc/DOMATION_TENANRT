@@ -64,6 +64,67 @@ function mapShortLinkRow(row: Record<string, unknown>) {
   };
 }
 
+// LinkClicksTab: Geo / Device / UTM / Referrer Breakdown across Shortlinks
+vouchersRouter.get('/clicks-analytics', requirePermission('mkt_vouchers', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const shortLinkId = req.query.short_link_id ? String(req.query.short_link_id).trim() : '';
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      let sql = `
+        SELECT c.*, sl.title AS short_link_title, sl.short_code
+        FROM mkt_short_link_clicks c
+        INNER JOIN mkt_short_links sl ON sl.tenant_id = c.tenant_id AND sl.id = c.short_link_id
+        WHERE c.tenant_id = $1
+      `;
+      const params: unknown[] = [ctx.tenantId];
+      if (shortLinkId) {
+        params.push(shortLinkId);
+        sql += ` AND c.short_link_id = $2`;
+      }
+      sql += ` ORDER BY c.clicked_at DESC LIMIT 400`;
+
+      const clicksRes = await client.query(sql, params);
+      const byDevice: Record<string, number> = {};
+      const byUtmSource: Record<string, number> = {};
+      const byReferrer: Record<string, number> = {};
+      const uniqueIps = new Set<string>();
+
+      const recentClicks = clicksRes.rows.map((r) => {
+        const dev = String(r.device_type || 'desktop');
+        byDevice[dev] = (byDevice[dev] || 0) + 1;
+        const utm = parseJsonCol<Record<string, unknown>>(r.utm_json, {});
+        const src = String(utm.utm_source || 'direct');
+        byUtmSource[src] = (byUtmSource[src] || 0) + 1;
+        const ref = r.referrer ? String(r.referrer).replace(/^https?:\/\//i, '').split('/')[0] : 'Trực tiếp / QR';
+        byReferrer[ref] = (byReferrer[ref] || 0) + 1;
+        if (r.client_ip) uniqueIps.add(String(r.client_ip));
+        return {
+          ...r,
+          utm,
+        };
+      });
+
+      return {
+        total_clicks: recentClicks.length,
+        unique_visitors: Math.max(uniqueIps.size, recentClicks.length > 0 ? 1 : 0),
+        by_device: Object.entries(byDevice).map(([device, count]) => ({ device, count })),
+        by_utm_source: Object.entries(byUtmSource)
+          .map(([source, count]) => ({ source, count }))
+          .sort((a, b) => b.count - a.count),
+        by_referrer: Object.entries(byReferrer)
+          .map(([referrer, count]) => ({ referrer, count }))
+          .sort((a, b) => b.count - a.count),
+        recent_clicks: recentClicks.slice(0, 60),
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CLICKS_ANALYTICS_FAILED', err?.message || 'Không thể tải thống kê lượt nhấp Shortlink.');
+  }
+});
+
 // List Voucher Pools + Shortlinks
 vouchersRouter.get('/', requirePermission('mkt_vouchers', 'view'), async (_req, res) => {
   try {
@@ -463,6 +524,94 @@ vouchersRouter.post('/redeem', requirePermission('mkt_vouchers', 'edit'), async 
     res.json({ success: true, data: txOut });
   } catch (err: any) {
     sendApiError(res, 500, 'REDEEM_VOUCHER_FAILED', err?.message || 'Không thể gạch mã Voucher.');
+  }
+});
+
+// Update Voucher Pool (`VoucherCampaignModal` & `QRDesignerModal`)
+vouchersRouter.put('/:id', requirePermission('mkt_vouchers', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const exRes = await client.query(
+        'SELECT * FROM mkt_voucher_campaigns WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      const ex = exRes.rows[0];
+      if (!ex) return null;
+
+      const name = req.body?.name !== undefined ? String(req.body.name).trim() : String(ex.name);
+      const description =
+        req.body?.description !== undefined ? String(req.body.description).trim() : ex.description;
+      const discountType =
+        req.body?.discount_type && ['percentage', 'fixed_vnd', 'gift'].includes(String(req.body.discount_type))
+          ? String(req.body.discount_type)
+          : String(ex.discount_type);
+      const discountValue =
+        req.body?.discount_value !== undefined
+          ? Math.max(0, Math.round(Number(req.body.discount_value)))
+          : Number(ex.discount_value || 0);
+      const minOrderVnd =
+        req.body?.min_order_vnd !== undefined
+          ? Math.max(0, Math.round(Number(req.body.min_order_vnd)))
+          : Number(ex.min_order_vnd || 0);
+      const maxUsesPerCode =
+        req.body?.max_uses_per_code !== undefined
+          ? Math.max(1, Math.round(Number(req.body.max_uses_per_code)))
+          : Number(ex.max_uses_per_code || 1);
+      const expiresAt =
+        req.body?.expires_at !== undefined
+          ? req.body.expires_at
+            ? String(req.body.expires_at)
+            : null
+          : ex.expires_at;
+      const status = req.body?.status !== undefined ? String(req.body.status) : String(ex.status);
+      const qrDesign =
+        req.body?.qr_design && typeof req.body.qr_design === 'object'
+          ? req.body.qr_design
+          : parseJsonCol(ex.qr_design_json, {});
+
+      await client.query(
+        `UPDATE mkt_voucher_campaigns
+         SET name = $3,
+             description = $4,
+             discount_type = $5,
+             discount_value = $6,
+             min_order_vnd = $7,
+             max_uses_per_code = $8,
+             expires_at = $9,
+             status = $10,
+             qr_design_json = $11::jsonb,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          name,
+          description,
+          discountType,
+          discountValue,
+          minOrderVnd,
+          maxUsesPerCode,
+          expiresAt,
+          status,
+          JSON.stringify(qrDesign),
+        ]
+      );
+
+      const r = await client.query('SELECT * FROM mkt_voucher_campaigns WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      return mapVoucherPoolRow(r.rows[0]);
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'VOUCHER_POOL_NOT_FOUND', 'Không tìm thấy Chiến dịch Voucher.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_VOUCHER_POOL_FAILED', err?.message || 'Không thể cập nhật Chiến dịch Voucher.');
   }
 });
 

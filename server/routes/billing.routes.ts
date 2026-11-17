@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
-import { requireTenantAuth, requireRoles, sendApiError } from '../core/security/rbac.ts';
+import { requireTenantAuth, requirePermission, sendApiError } from '../core/security/rbac.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import {
   getPlatformBillingCatalog,
@@ -116,7 +116,7 @@ billingRouter.get('/overview', requireTenantAuth, async (_req, res) => {
 });
 
 // Create Wallet Topup Order (Tenant Admin)
-billingRouter.post('/topup', requireTenantAuth, requireRoles('tenant_admin'), async (req, res) => {
+billingRouter.post('/topup', requireTenantAuth, requirePermission('billing', 'manage_config'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const catalog = await getPlatformBillingCatalog();
@@ -205,7 +205,7 @@ billingRouter.post('/topup', requireTenantAuth, requireRoles('tenant_admin'), as
 });
 
 // Subscribe / Renew / Step Upgrade Plan (via instant Wallet Balance or Bank Transfer Request)
-billingRouter.post('/subscribe', requireTenantAuth, requireRoles('tenant_admin'), async (req, res) => {
+billingRouter.post('/subscribe', requireTenantAuth, requirePermission('billing', 'manage_config'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const catalog = await getPlatformBillingCatalog();
@@ -476,7 +476,11 @@ billingRouter.post('/subscribe', requireTenantAuth, requireRoles('tenant_admin')
 });
 
 // Request Seamless Ecosystem Upgrade to DOMATION CRM 360° or Enterprise ERP 5.0
-billingRouter.post(['/upgrade-crm-erp', '/upgrade-request'], requireTenantAuth, requireRoles('tenant_admin'), async (req, res) => {
+billingRouter.post(
+  ['/upgrade-crm-erp', '/upgrade-request'],
+  requireTenantAuth,
+  requirePermission('billing', 'manage_config'),
+  async (req, res) => {
   try {
     const ctx = getTenantContext();
     const catalog = await getPlatformBillingCatalog();
@@ -586,7 +590,7 @@ billingRouter.post(['/upgrade-crm-erp', '/upgrade-request'], requireTenantAuth, 
 
 
 // 1-Click Instant Multi-Product SaaS Package Switch / Upgrade (0s Zero-Migration Unlock!)
-billingRouter.post('/switch-package', requireTenantAuth, requireRoles('tenant_admin'), async (req, res) => {
+billingRouter.post('/switch-package', requireTenantAuth, requirePermission('billing', 'manage_config'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const b = req.body || {};

@@ -1,8 +1,13 @@
-import { Router, type Request, type Response, type NextFunction } from 'express';
+import { Router } from 'express';
 import { withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
-import { requireTenantAuth, requireRoles, sendApiError } from '../core/security/rbac.ts';
+import {
+  requireAnyPermission,
+  requirePermission,
+  requireTenantAuth,
+  sendApiError,
+} from '../core/security/rbac.ts';
 import { isSafeRegexPattern } from '../core/settings/tenant-settings.ts';
 import { getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
 import { enforceTenantOperationalPolicy } from '../services/billing.service.ts';
@@ -11,40 +16,15 @@ export const pipelinesRouter = Router();
 
 pipelinesRouter.use(requireTenantAuth);
 
-/**
- * Enforces `tenant_admin` by default, or allows `manager` when Tenant Admin explicitly enabled
- * `role_permissions.allow_manager_manage_pipelines` in Tenant Settings.
- */
-async function requirePipelineEditor(req: Request, res: Response, next: NextFunction): Promise<void> {
-  try {
-    const ctx = getTenantContext();
-    if (ctx.userRole === 'tenant_admin') {
-      next();
-      return;
-    }
-    if (ctx.userRole === 'manager') {
-      const cfg = await getTenantSettingsCached(ctx.tenantId);
-      if (cfg.role_permissions.allow_manager_manage_pipelines) {
-        next();
-        return;
-      }
-    }
-    sendApiError(
-      res,
-      403,
-      'FORBIDDEN_ROLE',
-      `Vai trò '${ctx.userRole}' không có quyền thực hiện tác vụ này.`
-    );
-  } catch (err: any) {
-    sendApiError(res, 500, 'PERMISSION_CHECK_FAILED', err?.message || 'Lỗi kiểm tra phân quyền Pipeline.');
-  }
-}
+const requirePipelineConfig = requirePermission('pipelines', 'manage_config');
+const requireRoundsWrite = requireAnyPermission([['rounds', 'edit'], ['rounds', 'manage_config']]);
+const requireRoutingWrite = requireAnyPermission([['routing_rules', 'edit'], ['routing_rules', 'manage_config']]);
 
 // ============================================================================
 // Distribution Rounds & Routing Rules Management (Op 09)
 // Placed BEFORE `/:id` routes to prevent Express parameter shadowing
 // ============================================================================
-pipelinesRouter.get('/rounds/list', requireRoles('tenant_admin', 'manager'), async (_req, res) => {
+pipelinesRouter.get('/rounds/list', requirePermission('rounds', 'view'), async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -94,7 +74,7 @@ pipelinesRouter.get('/rounds/list', requireRoles('tenant_admin', 'manager'), asy
   }
 });
 
-pipelinesRouter.post('/rounds', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.post('/rounds', requireRoundsWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const {
@@ -178,7 +158,7 @@ pipelinesRouter.post('/rounds', requireRoles('tenant_admin', 'manager'), async (
   }
 });
 
-pipelinesRouter.patch('/rounds/:roundId', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.patch('/rounds/:roundId', requireRoundsWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const roundId = req.params.roundId;
@@ -227,7 +207,7 @@ pipelinesRouter.patch('/rounds/:roundId', requireRoles('tenant_admin', 'manager'
   }
 });
 
-pipelinesRouter.put('/rounds/:roundId/consultants', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.put('/rounds/:roundId/consultants', requireRoundsWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const roundId = req.params.roundId;
@@ -307,7 +287,7 @@ pipelinesRouter.put('/rounds/:roundId/consultants', requireRoles('tenant_admin',
   }
 });
 
-pipelinesRouter.delete('/rounds/:roundId/consultants/:userId', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.delete('/rounds/:roundId/consultants/:userId', requireRoundsWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -322,7 +302,7 @@ pipelinesRouter.delete('/rounds/:roundId/consultants/:userId', requireRoles('ten
   }
 });
 
-pipelinesRouter.delete('/rounds/:roundId', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.delete('/rounds/:roundId', requireRoundsWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const roundId = req.params.roundId;
@@ -351,7 +331,7 @@ pipelinesRouter.delete('/rounds/:roundId', requireRoles('tenant_admin', 'manager
   }
 });
 
-pipelinesRouter.post('/routing-rules', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.post('/routing-rules', requireRoutingWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const {
@@ -398,7 +378,7 @@ pipelinesRouter.post('/routing-rules', requireRoles('tenant_admin', 'manager'), 
   }
 });
 
-pipelinesRouter.patch('/routing-rules/:ruleId', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.patch('/routing-rules/:ruleId', requireRoutingWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const ruleId = req.params.ruleId;
@@ -454,7 +434,7 @@ pipelinesRouter.patch('/routing-rules/:ruleId', requireRoles('tenant_admin', 'ma
   }
 });
 
-pipelinesRouter.delete('/routing-rules/:ruleId', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+pipelinesRouter.delete('/routing-rules/:ruleId', requireRoutingWrite, async (req, res) => {
   try {
     const ctx = getTenantContext();
     await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -472,7 +452,7 @@ pipelinesRouter.delete('/routing-rules/:ruleId', requireRoles('tenant_admin', 'm
 // ============================================================================
 // 4.1 Get Tenant Pipelines (with ordered stages & custom fields)
 // ============================================================================
-pipelinesRouter.get('/', async (_req, res) => {
+pipelinesRouter.get('/', requirePermission('pipelines', 'view'), async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -522,7 +502,7 @@ pipelinesRouter.get('/', async (_req, res) => {
 });
 
 // Create New Pipeline (Op 19)
-pipelinesRouter.post('/', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.post('/', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { name, description, is_default = false, stages = [], create_default_round = true } = req.body || {};
@@ -634,7 +614,7 @@ pipelinesRouter.post('/', requirePipelineEditor, async (req, res) => {
 });
 
 // Update Pipeline Metadata (name, description, is_default)
-pipelinesRouter.patch('/:id', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.patch('/:id', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const pipelineId = req.params.id;
@@ -676,7 +656,7 @@ pipelinesRouter.patch('/:id', requirePipelineEditor, async (req, res) => {
 });
 
 // Delete Pipeline Safely (migrating leads to remaining default pipeline)
-pipelinesRouter.delete('/:id', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.delete('/:id', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const pipelineId = req.params.id;
@@ -789,7 +769,7 @@ pipelinesRouter.delete('/:id', requirePipelineEditor, async (req, res) => {
 });
 
 // 4.2 Reorder & Update Pipeline Stages (Op 19)
-pipelinesRouter.put('/:id/stages/reorder', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.put('/:id/stages/reorder', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const pipelineId = req.params.id;
@@ -877,7 +857,7 @@ pipelinesRouter.put('/:id/stages/reorder', requirePipelineEditor, async (req, re
 });
 
 // Delete a Stage from Pipeline safely (migrating existing leads to requested or first remaining stage)
-pipelinesRouter.delete('/:id/stages/:stageId', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.delete('/:id/stages/:stageId', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const pipelineId = req.params.id;
@@ -971,7 +951,7 @@ pipelinesRouter.delete('/:id/stages/:stageId', requirePipelineEditor, async (req
 });
 
 // Add Custom Field to Pipeline (Op 19)
-pipelinesRouter.post('/:id/custom-fields', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.post('/:id/custom-fields', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const pipelineId = req.params.id;
@@ -1037,7 +1017,7 @@ pipelinesRouter.post('/:id/custom-fields', requirePipelineEditor, async (req, re
 });
 
 // Edit Custom Field Metadata & Validation Rules
-pipelinesRouter.patch('/:id/custom-fields/:fieldId', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.patch('/:id/custom-fields/:fieldId', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { field_label, field_type, is_required, options_json, stage_visibility, config_json } = req.body || {};
@@ -1091,7 +1071,7 @@ pipelinesRouter.patch('/:id/custom-fields/:fieldId', requirePipelineEditor, asyn
   }
 });
 
-pipelinesRouter.delete('/:id/custom-fields/:fieldId', requirePipelineEditor, async (req, res) => {
+pipelinesRouter.delete('/:id/custom-fields/:fieldId', requirePipelineConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     await withTenantTransaction(ctx.tenantId, async (client) => {

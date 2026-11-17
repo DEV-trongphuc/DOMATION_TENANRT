@@ -4,7 +4,8 @@ import { getTenantContext } from '../core/context/tenant-context.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import {
   requireTenantAuth,
-  requireRoles,
+  requirePermission,
+  requireAnyPermission,
   resolveUserEffectivePermissions,
   sendApiError,
 } from '../core/security/rbac.ts';
@@ -30,6 +31,118 @@ export const analyticsRouter = Router();
 workspaceRouter.use(requireTenantAuth);
 analyticsRouter.use(requireTenantAuth);
 
+const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+function vnMidnightUtc(year: number, month: number, day: number): Date {
+  return new Date(Date.UTC(year, month, day, 0, 0, 0, 0) - VN_OFFSET_MS);
+}
+
+/**
+ * Converts a wall-clock date/time in an IANA timezone to a UTC Date instance cleanly across dialects.
+ */
+export function zonedWallClockToUtc(
+  year: number,
+  month: number,
+  day: number,
+  hour = 0,
+  minute = 0,
+  second = 0,
+  timeZone = 'Asia/Ho_Chi_Minh'
+): Date {
+  const guessMs = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+  const zp = getZonedDateParts(new Date(guessMs), timeZone);
+  if (!zp) return new Date(guessMs - VN_OFFSET_MS);
+  const zonedAsUtc = Date.UTC(zp.year, zp.month - 1, zp.day, zp.hour, zp.minute, second, 0);
+  return new Date(guessMs - (zonedAsUtc - guessMs));
+}
+
+/**
+ * Extracts wall-clock date/time components in any IANA timezone using standard Intl APIs
+ * so analytics grouping runs identically on PostgreSQL 16, PGlite, and MariaDB 10.6.
+ */
+export function getZonedDateParts(
+  input: Date | string | number,
+  timeZone = 'Asia/Ho_Chi_Minh'
+): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  isoDow: number;
+  ymd: string;
+  ddmm: string;
+} | null {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return null;
+
+  const weekdayMap: Record<string, number> = {
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+    Sun: 7,
+  };
+
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      weekday: 'short',
+      hourCycle: 'h23',
+    });
+    const parts = fmt.formatToParts(d);
+    const getPart = (type: string) => parts.find((p) => p.type === type)?.value || '';
+    const year = Number(getPart('year'));
+    const month = Number(getPart('month'));
+    const day = Number(getPart('day'));
+    const hourRaw = Number(getPart('hour'));
+    const hour = hourRaw === 24 ? 0 : hourRaw;
+    const minute = Number(getPart('minute'));
+    const wd = getPart('weekday');
+    const isoDow = weekdayMap[wd] ?? 1;
+    const mmStr = String(month).padStart(2, '0');
+    const ddStr = String(day).padStart(2, '0');
+    return {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      isoDow,
+      ymd: `${year}-${mmStr}-${ddStr}`,
+      ddmm: `${ddStr}/${mmStr}`,
+    };
+  } catch {
+    const shifted = new Date(d.getTime() + VN_OFFSET_MS);
+    const year = shifted.getUTCFullYear();
+    const month = shifted.getUTCMonth() + 1;
+    const day = shifted.getUTCDate();
+    const hour = shifted.getUTCHours();
+    const minute = shifted.getUTCMinutes();
+    const utcDay = shifted.getUTCDay();
+    const isoDow = utcDay === 0 ? 7 : utcDay;
+    const mmStr = String(month).padStart(2, '0');
+    const ddStr = String(day).padStart(2, '0');
+    return {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      isoDow,
+      ymd: `${year}-${mmStr}-${ddStr}`,
+      ddmm: `${ddStr}/${mmStr}`,
+    };
+  }
+}
+
 export function resolveDateBounds(
   preset: string,
   startDate?: string | null,
@@ -37,63 +150,78 @@ export function resolveDateBounds(
 ): { clause: string; params: unknown[] } {
   const norm = String(preset || 'this_month').trim().toLowerCase();
   if (norm === 'all') return { clause: '1=1', params: [] };
+
+  const nowMs = Date.now();
+  const vnNow = new Date(nowMs + VN_OFFSET_MS);
+  const y = vnNow.getUTCFullYear();
+  const m = vnNow.getUTCMonth();
+  const d = vnNow.getUTCDate();
+  const utcDay = vnNow.getUTCDay();
+  const isoDow = utcDay === 0 ? 7 : utcDay;
+
   if (norm === 'today' || norm === 'hôm nay') {
-    return { clause: "created_at >= date_trunc('day', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'", params: [] };
+    return { clause: 'created_at >= $DATE_START', params: [vnMidnightUtc(y, m, d)] };
   }
   if (norm === 'yesterday' || norm === 'hôm qua') {
     return {
-      clause:
-        "created_at >= (date_trunc('day', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') - INTERVAL '1 day') AT TIME ZONE 'Asia/Ho_Chi_Minh' AND created_at < date_trunc('day', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'",
-      params: [],
+      clause: 'created_at >= $DATE_START AND created_at < $DATE_END',
+      params: [vnMidnightUtc(y, m, d - 1), vnMidnightUtc(y, m, d)],
     };
   }
   if (norm === 'this_week' || norm === 'tuần này') {
     return {
-      clause: "created_at >= date_trunc('week', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'",
-      params: [],
+      clause: 'created_at >= $DATE_START',
+      params: [vnMidnightUtc(y, m, d - (isoDow - 1))],
     };
   }
   if (norm === 'last_week' || norm === 'tuần trước') {
+    const thisWeekStart = vnMidnightUtc(y, m, d - (isoDow - 1));
+    const lastWeekStart = vnMidnightUtc(y, m, d - (isoDow - 1) - 7);
     return {
-      clause:
-        "created_at >= (date_trunc('week', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') - INTERVAL '7 days') AT TIME ZONE 'Asia/Ho_Chi_Minh' AND created_at < date_trunc('week', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'",
-      params: [],
+      clause: 'created_at >= $DATE_START AND created_at < $DATE_END',
+      params: [lastWeekStart, thisWeekStart],
     };
   }
   if (norm === '7_days' || norm === '7 ngày qua') {
-    return { clause: "created_at >= clock_timestamp() - INTERVAL '7 days'", params: [] };
+    return { clause: 'created_at >= $DATE_START', params: [new Date(nowMs - 7 * 86400_000)] };
   }
   if (norm === '30_days' || norm === '30 ngày qua') {
-    return { clause: "created_at >= clock_timestamp() - INTERVAL '30 days'", params: [] };
+    return { clause: 'created_at >= $DATE_START', params: [new Date(nowMs - 30 * 86400_000)] };
   }
   if (norm === 'last_month' || norm === 'tháng trước') {
     return {
-      clause:
-        "created_at >= (date_trunc('month', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') - INTERVAL '1 month') AT TIME ZONE 'Asia/Ho_Chi_Minh' AND created_at < date_trunc('month', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'",
-      params: [],
+      clause: 'created_at >= $DATE_START AND created_at < $DATE_END',
+      params: [vnMidnightUtc(y, m - 1, 1), vnMidnightUtc(y, m, 1)],
     };
   }
   if (norm === 'custom' && startDate && endDate) {
-    return {
-      clause: 'created_at >= $DATE_START::timestamptz AND created_at <= $DATE_END::timestamptz',
-      params: [`${startDate}T00:00:00+07:00`, `${endDate}T23:59:59+07:00`],
-    };
+    const startDt = new Date(`${startDate}T00:00:00+07:00`);
+    const endDt = new Date(`${endDate}T23:59:59.999+07:00`);
+    if (!Number.isNaN(startDt.getTime()) && !Number.isNaN(endDt.getTime())) {
+      return {
+        clause: 'created_at >= $DATE_START AND created_at <= $DATE_END',
+        params: [startDt, endDt],
+      };
+    }
   }
   // Default: this_month
   return {
-    clause: "created_at >= date_trunc('month', clock_timestamp() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'",
-    params: [],
+    clause: 'created_at >= $DATE_START',
+    params: [vnMidnightUtc(y, m, 1)],
   };
 }
 
 export function bindDateParams(rawClause: string, params: unknown[], dateInfo: { clause: string; params: unknown[] }): string {
-  if (dateInfo.params.length === 2) {
-    params.push(dateInfo.params[0], dateInfo.params[1]);
-    return dateInfo.clause
-      .replace('$DATE_START', `$${params.length - 1}`)
-      .replace('$DATE_END', `$${params.length}`);
+  let out = dateInfo.clause;
+  if (out.includes('$DATE_START') && dateInfo.params.length >= 1) {
+    params.push(dateInfo.params[0]);
+    out = out.replace('$DATE_START', `$${params.length}`);
   }
-  return dateInfo.clause;
+  if (out.includes('$DATE_END') && dateInfo.params.length >= 2) {
+    params.push(dateInfo.params[1]);
+    out = out.replace('$DATE_END', `$${params.length}`);
+  }
+  return out;
 }
 
 /**
@@ -398,25 +526,21 @@ analyticsRouter.get('/dashboard', async (req, res) => {
         cLeadExtra += ` AND l.assigned_to = $${cParams.length}`;
       }
 
-      const [kpiRes, consultantRes, sourceRes, stageRes, heldRes, ticketRes, recentRes, capiRes, roundRatioRes, pipelineStatsRes, errorByConsultantRes] = await Promise.all([
+      const [kpiRes, consultantRes, sourceRes, stageRes, heldRes, ticketRes, recentRes, capiRes, roundRatioRes, pipelineStatsRes, errorByConsultantRes, leadEventsRes] = await Promise.all([
         client.query(
           `SELECT
-             COUNT(*)::int AS total_leads,
-             COUNT(*) FILTER (WHERE l.status = 'assigned')::int AS assigned_leads,
-             COUNT(*) FILTER (WHERE l.status = 'assigned' AND (l.custom_fields->>'original_status' = 'compensated' OR l.custom_fields->>'is_compensated' = 'true'))::int AS compensated_leads,
-             COUNT(*) FILTER (WHERE l.status = 'unassigned_pending')::int AS unassigned_leads,
-             COUNT(*) FILTER (WHERE l.is_accepted = true)::int AS accepted_leads,
-             COUNT(*) FILTER (WHERE l.is_duplicate_reminder = true OR l.is_duplicated = true)::int AS duplicate_leads,
-             COUNT(*) FILTER (WHERE l.sla_breached = true)::int AS sla_breached_leads,
-             COUNT(*) FILTER (WHERE s.is_won_stage = true)::int AS won_leads,
-             COUNT(*) FILTER (WHERE l.quality_status IN ('Notlead', 'Badtiming'))::int AS below_standard_leads,
-             COUNT(*) FILTER (
-               WHERE EXTRACT(ISODOW FROM l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh') <= 6
-                 AND (EXTRACT(HOUR FROM l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int * 60 + EXTRACT(MINUTE FROM l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int) BETWEEN ${startMins} AND ${endMins}
-             )::int AS in_hours_leads,
-             COALESCE(SUM(l.ai_prompt_tokens + l.ai_completion_tokens), 0)::int AS ai_tokens_used,
-             COUNT(*) FILTER (WHERE l.zalo_notify_status = 'sent')::int AS zalo_sent_count,
-             COUNT(*) FILTER (WHERE l.email_notify_status = 'sent')::int AS email_sent_count
+             COUNT(*) AS total_leads,
+             COALESCE(SUM(CASE WHEN l.status = 'assigned' THEN 1 ELSE 0 END), 0) AS assigned_leads,
+             COALESCE(SUM(CASE WHEN l.status = 'assigned' AND (l.custom_fields->>'original_status' = 'compensated' OR l.custom_fields->>'is_compensated' = 'true') THEN 1 ELSE 0 END), 0) AS compensated_leads,
+             COALESCE(SUM(CASE WHEN l.status = 'unassigned_pending' THEN 1 ELSE 0 END), 0) AS unassigned_leads,
+             COALESCE(SUM(CASE WHEN l.is_accepted = true THEN 1 ELSE 0 END), 0) AS accepted_leads,
+             COALESCE(SUM(CASE WHEN l.is_duplicate_reminder = true OR l.is_duplicated = true THEN 1 ELSE 0 END), 0) AS duplicate_leads,
+             COALESCE(SUM(CASE WHEN l.sla_breached = true THEN 1 ELSE 0 END), 0) AS sla_breached_leads,
+             COALESCE(SUM(CASE WHEN s.is_won_stage = true THEN 1 ELSE 0 END), 0) AS won_leads,
+             COALESCE(SUM(CASE WHEN l.quality_status IN ('Notlead', 'Badtiming') THEN 1 ELSE 0 END), 0) AS below_standard_leads,
+             COALESCE(SUM(l.ai_prompt_tokens + l.ai_completion_tokens), 0) AS ai_tokens_used,
+             COALESCE(SUM(CASE WHEN l.zalo_notify_status = 'sent' THEN 1 ELSE 0 END), 0) AS zalo_sent_count,
+             COALESCE(SUM(CASE WHEN l.email_notify_status = 'sent' THEN 1 ELSE 0 END), 0) AS email_sent_count
            FROM leads l
            LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
            WHERE ${where}`,
@@ -425,8 +549,8 @@ analyticsRouter.get('/dashboard', async (req, res) => {
         client.query(
           `SELECT u.id, u.full_name, u.email, u.is_external_agency,
                   p.is_available, p.vacation_mode,
-                  COUNT(l.id)::int AS lead_count,
-                  COUNT(l.id) FILTER (WHERE l.is_accepted = true)::int AS accepted_count
+                  COUNT(l.id) AS lead_count,
+                  COALESCE(SUM(CASE WHEN l.id IS NOT NULL AND l.is_accepted = true THEN 1 ELSE 0 END), 0) AS accepted_count
            FROM users u
            LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
            LEFT JOIN leads l ON l.tenant_id = u.tenant_id AND l.assigned_to = u.id AND l.is_deleted = false AND (${cDateCond})${cLeadExtra}
@@ -437,23 +561,23 @@ analyticsRouter.get('/dashboard', async (req, res) => {
         ),
         client.query(
           sourceMode === 'connection'
-            ? `SELECT COALESCE(w.name, l.source, 'Webhook') AS label, COUNT(*)::int AS count
+            ? `SELECT COALESCE(w.name, l.source, 'Webhook') AS label, COUNT(*) AS count
                FROM leads l
                LEFT JOIN tenant_webhooks w ON w.tenant_id = l.tenant_id AND w.id = l.connection_id
                WHERE ${where}
-               GROUP BY label
+               GROUP BY COALESCE(w.name, l.source, 'Webhook')
                ORDER BY count DESC
                LIMIT 10`
-            : `SELECT COALESCE(l.source, 'Webhook') AS label, COUNT(*)::int AS count
+            : `SELECT COALESCE(l.source, 'Webhook') AS label, COUNT(*) AS count
                FROM leads l
                WHERE ${where}
-               GROUP BY label
+               GROUP BY COALESCE(l.source, 'Webhook')
                ORDER BY count DESC
                LIMIT 10`,
           params
         ),
         client.query(
-          `SELECT s.id, s.stage_name, s.color_hex, s.capi_event_mapping, COUNT(l.id)::int AS count
+          `SELECT s.id, s.stage_name, s.color_hex, s.capi_event_mapping, COUNT(l.id) AS count
            FROM tenant_pipeline_stages s
            LEFT JOIN leads l ON l.tenant_id = s.tenant_id AND l.stage_id = s.id AND l.is_deleted = false
            WHERE s.tenant_id = $1
@@ -463,17 +587,17 @@ analyticsRouter.get('/dashboard', async (req, res) => {
         ),
         client.query<{ held_cnt: number; blacklisted_cnt: number }>(
           `SELECT
-             COUNT(*) FILTER (WHERE status = 'held')::int AS held_cnt,
-             COUNT(*) FILTER (WHERE status = 'blacklisted')::int AS blacklisted_cnt
+             COALESCE(SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END), 0) AS held_cnt,
+             COALESCE(SUM(CASE WHEN status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted_cnt
            FROM held_leads
            WHERE tenant_id = $1`,
           [ctx.tenantId]
         ),
         client.query<{ total_tickets: number; pending_tickets: number; approved_tickets: number }>(
           `SELECT
-             COUNT(*)::int AS total_tickets,
-             COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_tickets,
-             COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_tickets
+             COUNT(*) AS total_tickets,
+             COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_tickets,
+             COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_tickets
            FROM data_reports
            WHERE tenant_id = $1`,
           [ctx.tenantId]
@@ -490,11 +614,11 @@ analyticsRouter.get('/dashboard', async (req, res) => {
           params
         ),
         client.query<{ sent_ok: number }>(
-          `SELECT COUNT(*)::int AS sent_ok FROM capi_logs WHERE tenant_id = $1 AND response_status = 200`,
+          `SELECT COUNT(*) AS sent_ok FROM capi_logs WHERE tenant_id = $1 AND response_status = 200`,
           [ctx.tenantId]
         ),
         client.query(
-          `SELECT l.round_id, COALESCE(r.name, 'Chưa gắn vòng') AS round_name, COUNT(*)::int AS count
+          `SELECT l.round_id, COALESCE(r.name, 'Chưa gắn vòng') AS round_name, COUNT(*) AS count
            FROM leads l
            LEFT JOIN distribution_rounds r ON r.tenant_id = l.tenant_id AND r.id = l.round_id
            WHERE ${where}
@@ -503,7 +627,7 @@ analyticsRouter.get('/dashboard', async (req, res) => {
           params
         ),
         client.query(
-          `SELECT COALESCE(NULLIF(l.quality_status, ''), 'Pending') AS quality_status, COUNT(*)::int AS count
+          `SELECT COALESCE(NULLIF(l.quality_status, ''), 'Pending') AS quality_status, COUNT(*) AS count
            FROM leads l
            WHERE ${where}
            GROUP BY COALESCE(NULLIF(l.quality_status, ''), 'Pending')
@@ -512,10 +636,10 @@ analyticsRouter.get('/dashboard', async (req, res) => {
         ),
         client.query(
           `SELECT dr.reporter_id AS id, COALESCE(u.full_name, 'Đại lý') AS name,
-                  COUNT(dr.id)::int AS total_tickets,
-                  COUNT(dr.id) FILTER (WHERE dr.status = 'approved')::int AS approved_tickets,
-                  COUNT(dr.id) FILTER (WHERE dr.status = 'pending')::int AS pending_tickets,
-                  COUNT(dr.id) FILTER (WHERE dr.status = 'rejected')::int AS rejected_tickets
+                  COUNT(dr.id) AS total_tickets,
+                  COALESCE(SUM(CASE WHEN dr.status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_tickets,
+                  COALESCE(SUM(CASE WHEN dr.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_tickets,
+                  COALESCE(SUM(CASE WHEN dr.status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected_tickets
            FROM data_reports dr
            LEFT JOIN users u ON u.tenant_id = dr.tenant_id AND u.id = dr.reporter_id
            WHERE dr.tenant_id = $1
@@ -523,60 +647,72 @@ analyticsRouter.get('/dashboard', async (req, res) => {
            ORDER BY total_tickets DESC`,
           [ctx.tenantId]
         ),
+        client.query<{ created_at: Date | string; status: string; is_duplicate_reminder: boolean }>(
+          `SELECT l.created_at, l.status, l.is_duplicate_reminder FROM leads l WHERE ${where}`,
+          params
+        ),
       ]);
 
-      // Time-series or 7x24 Heatmap aggregation
+      // Cross-dialect in-hours + time-series / 7x24 Heatmap aggregation in VN timezone
       let chartSeries: Array<Record<string, unknown>> = [];
       let heatmapMatrix: Array<{ wday: number; hour: number; count: number }> = [];
+      let inHoursCount = 0;
+
+      const hourBuckets = new Map<number, { total: number; assigned: number; dup: number }>();
+      const heatmapBuckets = new Map<string, { wday: number; hour: number; count: number }>();
+      const dayBuckets = new Map<string, { total: number; assigned: number; dup: number }>();
+
+      for (const row of leadEventsRes.rows) {
+        const zp = getZonedDateParts(row.created_at, 'Asia/Ho_Chi_Minh');
+        if (!zp) continue;
+        const mins = zp.hour * 60 + zp.minute;
+        if (zp.isoDow <= 6 && mins >= startMins && mins <= endMins) {
+          inHoursCount++;
+        }
+        const isAssigned = row.status === 'assigned';
+        const isDup = row.is_duplicate_reminder === true;
+
+        if (chartMode === 'hour') {
+          const cur = hourBuckets.get(zp.hour) || { total: 0, assigned: 0, dup: 0 };
+          cur.total++;
+          if (isAssigned) cur.assigned++;
+          if (isDup) cur.dup++;
+          hourBuckets.set(zp.hour, cur);
+        } else if (chartMode === 'heatmap') {
+          const key = `${zp.isoDow}:${zp.hour}`;
+          const cur = heatmapBuckets.get(key) || { wday: zp.isoDow, hour: zp.hour, count: 0 };
+          cur.count++;
+          heatmapBuckets.set(key, cur);
+        } else {
+          const cur = dayBuckets.get(zp.ymd) || { total: 0, assigned: 0, dup: 0 };
+          cur.total++;
+          if (isAssigned) cur.assigned++;
+          if (isDup) cur.dup++;
+          dayBuckets.set(zp.ymd, cur);
+        }
+      }
 
       if (chartMode === 'hour') {
-        const hRes = await client.query<{ hr: number; total: number; assigned: number; dup: number }>(
-          `SELECT EXTRACT(HOUR FROM l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS hr,
-                  COUNT(*)::int AS total,
-                  COUNT(*) FILTER (WHERE l.status = 'assigned')::int AS assigned,
-                  COUNT(*) FILTER (WHERE l.is_duplicate_reminder = true)::int AS dup
-           FROM leads l
-           WHERE ${where}
-           GROUP BY hr
-           ORDER BY hr ASC`,
-          params
-        );
-        chartSeries = hRes.rows.map((r) => ({
-          label: `${String(r.hr).padStart(2, '0')}:00`,
-          total: r.total,
-          assigned: r.assigned,
-          duplicate: r.dup,
-        }));
+        chartSeries = [...hourBuckets.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([hr, v]) => ({
+            label: `${String(hr).padStart(2, '0')}:00`,
+            total: v.total,
+            assigned: v.assigned,
+            duplicate: v.dup,
+          }));
       } else if (chartMode === 'heatmap') {
-        const hmRes = await client.query<{ wday: number; hr: number; cnt: number }>(
-          `SELECT EXTRACT(ISODOW FROM l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS wday,
-                  EXTRACT(HOUR FROM l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS hr,
-                  COUNT(*)::int AS cnt
-           FROM leads l
-           WHERE ${where}
-           GROUP BY wday, hr`,
-          params
-        );
-        heatmapMatrix = hmRes.rows.map((r) => ({ wday: r.wday, hour: r.hr, count: r.cnt }));
+        heatmapMatrix = [...heatmapBuckets.values()];
       } else {
-        const dRes = await client.query<{ day_str: string; total: number; assigned: number; dup: number }>(
-          `SELECT to_char(l.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD') AS day_str,
-                  COUNT(*)::int AS total,
-                  COUNT(*) FILTER (WHERE l.status = 'assigned')::int AS assigned,
-                  COUNT(*) FILTER (WHERE l.is_duplicate_reminder = true)::int AS dup
-           FROM leads l
-           WHERE ${where}
-           GROUP BY day_str
-           ORDER BY day_str ASC
-           LIMIT 60`,
-          params
-        );
-        chartSeries = dRes.rows.map((r) => ({
-          label: r.day_str,
-          total: r.total,
-          assigned: r.assigned,
-          duplicate: r.dup,
-        }));
+        chartSeries = [...dayBuckets.entries()]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .slice(0, 60)
+          .map(([dayStr, v]) => ({
+            label: dayStr,
+            total: v.total,
+            assigned: v.assigned,
+            duplicate: v.dup,
+          }));
       }
 
       const k = kpiRes.rows[0] || {};
@@ -588,7 +724,7 @@ analyticsRouter.get('/dashboard', async (req, res) => {
       const slaRate = total > 0 ? Math.round(((total - Number(k.sla_breached_leads || 0)) / total) * 100) : 100;
       const assignedTotal = Number(k.assigned_leads || 0);
       const compensatedTotal = Number(k.compensated_leads || 0);
-      const inHours = Number(k.in_hours_leads || 0);
+      const inHours = inHoursCount;
       const outHours = Math.max(0, total - inHours);
 
       return {
@@ -687,8 +823,8 @@ analyticsRouter.get('/fair-share', async (req, res) => {
                   rc.receive_ratio, rc.data_per_turn, rc.leads_received_in_round, rc.compensation_count,
                   rc.skip_count, rc.current_turn_remaining,
                   p.status, p.is_available, p.vacation_mode, p.skipped_credit,
-                  COUNT(l.id) FILTER (WHERE l.id IS NOT NULL AND (${leadDateCond}))::int AS assigned_count,
-                  COUNT(l.id) FILTER (WHERE l.is_duplicate_reminder = true AND (${leadDateCond}))::int AS duplicate_count
+                  COALESCE(SUM(CASE WHEN l.id IS NOT NULL AND (${leadDateCond}) THEN 1 ELSE 0 END), 0) AS assigned_count,
+                  COALESCE(SUM(CASE WHEN l.is_duplicate_reminder = true AND (${leadDateCond}) THEN 1 ELSE 0 END), 0) AS duplicate_count
            FROM round_consultants rc
            INNER JOIN distribution_rounds dr ON dr.tenant_id = rc.tenant_id AND dr.id = rc.round_id
            INNER JOIN users u ON u.tenant_id = rc.tenant_id AND u.id = rc.user_id
@@ -721,8 +857,8 @@ analyticsRouter.get('/fair-share', async (req, res) => {
       // Count approved tickets per consultant
       const ticketRes = await client.query<{ reporter_id: string; approved_cnt: number; total_cnt: number }>(
         `SELECT reporter_id,
-                COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_cnt,
-                COUNT(*)::int AS total_cnt
+                COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_cnt,
+                COUNT(*) AS total_cnt
          FROM data_reports
          WHERE tenant_id = $1
          GROUP BY reporter_id`,
@@ -805,7 +941,13 @@ analyticsRouter.get('/fair-share', async (req, res) => {
   }
 });
 
-analyticsRouter.post('/fair-share/compensate', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+analyticsRouter.post(
+  '/fair-share/compensate',
+  requireAnyPermission([
+    ['fair_share', 'edit'],
+    ['rounds', 'edit'],
+  ]),
+  async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { round_id, consultant_user_id, amount = 1, reason = 'Bù lượt chủ động từ Admin' } = req.body || {};
@@ -867,13 +1009,13 @@ analyticsRouter.get('/ads-performance', async (_req, res) => {
         ),
         client.query(
           `SELECT COALESCE(l.ad_id, 'unattributed') AS ad_id,
-                  COUNT(*)::int AS total_leads,
-                  COUNT(*) FILTER (WHERE l.status = 'assigned')::int AS assigned_leads,
-                  COUNT(*) FILTER (WHERE LOWER(l.quality_status) IN ('qualified', 'good', 'hot'))::int AS qualified_cnt,
-                  COUNT(*) FILTER (WHERE LOWER(l.quality_status) IN ('booked', 'scheduled'))::int AS booked_cnt,
-                  COUNT(*) FILTER (WHERE LOWER(l.quality_status) IN ('booking', 'deposited'))::int AS deposit_cnt,
-                  COUNT(*) FILTER (WHERE LOWER(l.quality_status) IN ('closed', 'won'))::int AS closed_cnt,
-                  COUNT(*) FILTER (WHERE LOWER(l.quality_status) IN ('disqualified', 'notlead', 'junk'))::int AS notlead_cnt
+                  COUNT(*) AS total_leads,
+                  COALESCE(SUM(CASE WHEN l.status = 'assigned' THEN 1 ELSE 0 END), 0) AS assigned_leads,
+                  COALESCE(SUM(CASE WHEN LOWER(l.quality_status) IN ('qualified', 'good', 'hot') THEN 1 ELSE 0 END), 0) AS qualified_cnt,
+                  COALESCE(SUM(CASE WHEN LOWER(l.quality_status) IN ('booked', 'scheduled') THEN 1 ELSE 0 END), 0) AS booked_cnt,
+                  COALESCE(SUM(CASE WHEN LOWER(l.quality_status) IN ('booking', 'deposited') THEN 1 ELSE 0 END), 0) AS deposit_cnt,
+                  COALESCE(SUM(CASE WHEN LOWER(l.quality_status) IN ('closed', 'won') THEN 1 ELSE 0 END), 0) AS closed_cnt,
+                  COALESCE(SUM(CASE WHEN LOWER(l.quality_status) IN ('disqualified', 'notlead', 'junk') THEN 1 ELSE 0 END), 0) AS notlead_cnt
            FROM leads l
            WHERE l.tenant_id = $1 AND l.is_deleted = false
            GROUP BY COALESCE(l.ad_id, 'unattributed')`,
@@ -999,5 +1141,13 @@ const workspacePackageSwitchHandler = async (req: any, res: any) => {
   }
 };
 
-workspaceRouter.post(['/package', '/switch-package'], requireRoles('tenant_admin'), workspacePackageSwitchHandler);
-workspaceRouter.patch(['/package', '/switch-package'], requireRoles('tenant_admin'), workspacePackageSwitchHandler);
+workspaceRouter.post(
+  ['/package', '/switch-package'],
+  requirePermission('billing', 'manage_config'),
+  workspacePackageSwitchHandler
+);
+workspaceRouter.patch(
+  ['/package', '/switch-package'],
+  requirePermission('billing', 'manage_config'),
+  workspacePackageSwitchHandler
+);

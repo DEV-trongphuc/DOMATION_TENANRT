@@ -395,6 +395,203 @@ hrmRouter.post('/public-booking/:slug/book', publicBookSlotHandler);
 hrmRouter.post('/public-booking/:slug', publicBookSlotHandler);
 
 // ============================================================================
+// PUBLIC UNAUTHENTICATED SCHEDULE PORTAL (`/public-schedule/:slug`)
+// Placed STRICTLY BEFORE `hrmRouter.use(requireTenantAuth)`!
+// ============================================================================
+hrmRouter.get('/public-schedule/:slug', async (req, res) => {
+  try {
+    const rawSlug = String(req.params.slug || '').trim();
+    if (!rawSlug) {
+      sendApiError(res, 404, 'SCHEDULE_NOT_FOUND', 'Mã liên kết lịch không hợp lệ.');
+      return;
+    }
+
+    const resolved = await withSystemPrivilege(async (client) => {
+      // 1. Try matching a booking link slug/public_token
+      const blRes = await client.query<{ tenant_id: string; id: string }>(
+        `SELECT bl.tenant_id, bl.id
+         FROM tenant_booking_links bl
+         INNER JOIN tenants t ON t.id = bl.tenant_id
+         WHERE (LOWER(bl.slug) = LOWER($1) OR bl.public_token = $1)
+           AND bl.is_active = true
+           AND t.status NOT IN ('suspended', 'cancelled')
+         LIMIT 1`,
+        [rawSlug]
+      );
+      if (blRes.rows[0]) {
+        return {
+          mode: 'booking_link' as const,
+          tenantId: String(blRes.rows[0].tenant_id),
+          targetId: String(blRes.rows[0].id),
+        };
+      }
+
+      // 2. Try matching tenant slug directly
+      const tRes = await client.query<{ id: string }>(
+        `SELECT id FROM tenants
+         WHERE LOWER(slug) = LOWER($1)
+           AND status NOT IN ('suspended', 'cancelled')
+         LIMIT 1`,
+        [rawSlug]
+      );
+      if (tRes.rows[0]) {
+        return {
+          mode: 'tenant_schedule' as const,
+          tenantId: String(tRes.rows[0].id),
+          targetId: String(tRes.rows[0].id),
+        };
+      }
+
+      return null;
+    });
+
+    if (!resolved) {
+      sendApiError(res, 404, 'SCHEDULE_NOT_FOUND', 'Không tìm thấy lịch công khai tương ứng với liên kết này.');
+      return;
+    }
+
+    const payload = await withTenantTransaction(resolved.tenantId, async (client) => {
+      const [tenantRes, branchesRes, linksRes, apptsRes, shiftsRes] = await Promise.all([
+        client.query(
+          `SELECT name, slug, industry, industry_key, package_code, plan_tier,
+                  subscription_plan_code, crm_erp_upgrade_status, enabled_modules, entitlements, settings
+           FROM tenants WHERE id = $1 LIMIT 1`,
+          [resolved.tenantId]
+        ),
+        client.query(
+          'SELECT id, name, address, phone FROM tenant_branches WHERE tenant_id = $1 AND is_active = true ORDER BY is_headquarters DESC LIMIT 5',
+          [resolved.tenantId]
+        ),
+        resolved.mode === 'booking_link'
+          ? client.query(
+              `SELECT bl.*, u.full_name AS host_user_name, e.full_name AS host_emp_name
+               FROM tenant_booking_links bl
+               LEFT JOIN users u ON u.tenant_id = bl.tenant_id AND u.id = bl.host_user_id
+               LEFT JOIN tenant_hr_employees e ON e.tenant_id = bl.tenant_id AND e.id = bl.host_employee_id
+               WHERE bl.tenant_id = $1 AND bl.id = $2`,
+              [resolved.tenantId, resolved.targetId]
+            )
+          : client.query(
+              `SELECT bl.*, u.full_name AS host_user_name, e.full_name AS host_emp_name
+               FROM tenant_booking_links bl
+               LEFT JOIN users u ON u.tenant_id = bl.tenant_id AND u.id = bl.host_user_id
+               LEFT JOIN tenant_hr_employees e ON e.tenant_id = bl.tenant_id AND e.id = bl.host_employee_id
+               WHERE bl.tenant_id = $1 AND bl.is_active = true
+               ORDER BY bl.created_at DESC LIMIT 20`,
+              [resolved.tenantId]
+            ),
+        client.query(
+          `SELECT a.id, a.booking_link_id, a.booking_date, a.start_time, a.end_time, a.topic, a.status,
+                  bl.title AS session_title, bl.location_type, bl.location_value
+           FROM tenant_booking_appointments a
+           INNER JOIN tenant_booking_links bl ON bl.tenant_id = a.tenant_id AND bl.id = a.booking_link_id
+           WHERE a.tenant_id = $1 AND a.status = 'confirmed'
+           ORDER BY a.booking_date ASC, a.start_time ASC
+           LIMIT 100`,
+          [resolved.tenantId]
+        ),
+        client.query(
+          'SELECT id, code, name, start_time, end_time, working_days FROM tenant_hr_shifts WHERE tenant_id = $1 AND is_active = true ORDER BY is_default DESC LIMIT 10',
+          [resolved.tenantId]
+        ),
+      ]);
+
+      const tRow = tenantRes.rows[0] || {};
+      const entSnap = resolveTenantEntitlementSnapshot(tRow);
+      const settings = parseJsonSafe<Record<string, unknown>>(tRow.settings, {});
+      const hq = branchesRes.rows[0] || {};
+
+      const events: Array<Record<string, unknown>> = [];
+      for (const ap of apptsRes.rows) {
+        if (resolved.mode === 'booking_link' && String(ap.booking_link_id) !== resolved.targetId) continue;
+        const dStr =
+          ap.booking_date instanceof Date
+            ? ap.booking_date.toISOString().slice(0, 10)
+            : String(ap.booking_date).slice(0, 10);
+        events.push({
+          id: ap.id,
+          type: 'appointment',
+          date: dStr,
+          title: ap.session_title || 'Lịch hẹn xác nhận',
+          subtitle: ap.topic || 'Phiên làm việc 1-1',
+          start_time: ap.start_time,
+          end_time: ap.end_time,
+          time: `${ap.start_time} - ${ap.end_time}`,
+          location: ap.location_value || ap.location_type || hq.address || 'Online',
+          status: ap.status,
+        });
+      }
+
+      // Also generate upcoming availability sessions from active booking links so public schedule calendar is rich immediately
+      for (const bl of linksRes.rows) {
+        const rules = parseJsonSafe<AvailabilityRule[]>(bl.availability_rules, DEFAULT_AVAILABILITY_RULES);
+        const days = buildAvailableSlotsForLink({
+          rules: rules.length > 0 ? rules : DEFAULT_AVAILABILITY_RULES,
+          durationMinutes: Number(bl.duration_minutes || 30),
+          bufferMinutes: Number(bl.buffer_minutes || 10),
+          bookedSet: new Set<string>(),
+          daysAhead: 14,
+        });
+        for (const day of days) {
+          if (day.slots.length > 0) {
+            const firstSlot = day.slots[0];
+            const lastSlot = day.slots[day.slots.length - 1];
+            events.push({
+              id: `${bl.id}-${day.date}`,
+              type: 'session',
+              date: day.date,
+              title: bl.title,
+              subtitle: `${bl.host_emp_name || bl.host_user_name || 'Chuyên gia'} • ${day.slots.length} khung giờ trống`,
+              start_time: firstSlot.start_time,
+              end_time: lastSlot.end_time,
+              time: `${firstSlot.start_time} - ${lastSlot.end_time}`,
+              location: bl.location_value || bl.location_type || hq.address || 'Online',
+              booking_slug: bl.slug,
+              available_slots_count: day.slots.length,
+            });
+          }
+        }
+      }
+
+      return {
+        mode: resolved.mode,
+        slug: rawSlug,
+        organization: {
+          name: String(tRow.name || 'DOMATION Workspace'),
+          logo_url: typeof settings.brand_logo_url === 'string' && settings.brand_logo_url ? settings.brand_logo_url : '/imgs/autodata/ICON.png',
+          address: String(hq.address || ''),
+          phone: String(hq.phone || ''),
+          industry_label: entSnap.terminology.industry_label,
+          education_addon: Boolean(
+            entSnap.enabled_modules.includes('education') ||
+              (entSnap as unknown as Record<string, unknown>).education_addon
+          ),
+        },
+        shifts: shiftsRes.rows.map((s) => ({
+          ...s,
+          working_days: parseJsonSafe<number[]>(s.working_days, [1, 2, 3, 4, 5]),
+        })),
+        booking_links: linksRes.rows.map((l) => ({
+          id: l.id,
+          slug: l.slug,
+          title: l.title,
+          subtitle: l.subtitle,
+          host_name: l.host_emp_name || l.host_user_name || tRow.name || 'Chuyên gia',
+          duration_minutes: Number(l.duration_minutes || 30),
+          location_type: l.location_type,
+          location_value: l.location_value,
+        })),
+        events,
+      };
+    });
+
+    res.json({ success: true, data: payload });
+  } catch (err: any) {
+    sendApiError(res, 500, 'PUBLIC_SCHEDULE_READ_FAILED', err?.message || 'Không thể tải lịch trình công khai.');
+  }
+});
+
+// ============================================================================
 // AUTHENTICATED HRM 360° ROUTES (Protected by Tenant Auth + HRM Entitlement)
 // ============================================================================
 hrmRouter.use(requireTenantAuth);
@@ -671,6 +868,204 @@ hrmRouter.get('/employees/:id', requirePermission('hrm', 'view'), async (req, re
     res.json({ success: true, data: detail });
   } catch (err: any) {
     sendApiError(res, 500, 'GET_EMPLOYEE_FAILED', err?.message || 'Không thể tải chi tiết hồ sơ nhân sự.');
+  }
+});
+
+// Interactive Hierarchical Org Chart Tree (`/org-chart`)
+hrmRouter.get('/org-chart', requirePermission('hrm', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const tree = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [tenantRes, branchesRes, deptsRes, empsRes] = await Promise.all([
+        client.query('SELECT id, name, slug FROM tenants WHERE id = $1 LIMIT 1', [ctx.tenantId]),
+        client.query(
+          `SELECT b.*, u.full_name AS manager_name, u.email AS manager_email
+           FROM tenant_branches b
+           LEFT JOIN users u ON u.tenant_id = b.tenant_id AND u.id = b.manager_user_id
+           WHERE b.tenant_id = $1 AND b.is_active = true
+           ORDER BY b.is_headquarters DESC, b.name ASC`,
+          [ctx.tenantId]
+        ),
+        client.query(
+          `SELECT d.*, u.full_name AS manager_name, u.email AS manager_email
+           FROM tenant_departments d
+           LEFT JOIN users u ON u.tenant_id = d.tenant_id AND u.id = d.manager_user_id
+           WHERE d.tenant_id = $1 AND d.is_active = true
+           ORDER BY d.sort_order ASC, d.name ASC`,
+          [ctx.tenantId]
+        ),
+        client.query(
+          `SELECT e.id, e.user_id, e.employee_code, e.full_name, e.work_email, e.phone,
+                  e.branch_id, e.department_id, e.team_id, e.position_id, e.manager_user_id,
+                  e.employment_type, e.employment_status,
+                  p.name AS position_name,
+                  (SELECT COUNT(*)::int FROM tenant_hr_contracts c WHERE c.tenant_id = e.tenant_id AND c.employee_id = e.id AND c.status = 'active') AS active_contracts_count
+           FROM tenant_hr_employees e
+           LEFT JOIN tenant_positions p ON p.tenant_id = e.tenant_id AND p.id = e.position_id
+           WHERE e.tenant_id = $1
+           ORDER BY e.full_name ASC`,
+          [ctx.tenantId]
+        ),
+      ]);
+
+      const empsByDept = new Map<string, any[]>();
+      const unassignedEmps: any[] = [];
+      for (const emp of empsRes.rows) {
+        if (emp.department_id) {
+          const k = String(emp.department_id);
+          const list = empsByDept.get(k) || [];
+          list.push(emp);
+          empsByDept.set(k, list);
+        } else {
+          unassignedEmps.push(emp);
+        }
+      }
+
+      const deptNodes = new Map<string, any>();
+      for (const d of deptsRes.rows) {
+        deptNodes.set(String(d.id), {
+          ...d,
+          employees: empsByDept.get(String(d.id)) || [],
+          children: [],
+        });
+      }
+
+      const rootDeptsByBranch = new Map<string, any[]>();
+      const globalRootDepts: any[] = [];
+
+      for (const d of deptsRes.rows) {
+        const node = deptNodes.get(String(d.id));
+        if (d.parent_department_id && deptNodes.has(String(d.parent_department_id))) {
+          deptNodes.get(String(d.parent_department_id)).children.push(node);
+        } else if (d.branch_id) {
+          const bKey = String(d.branch_id);
+          const arr = rootDeptsByBranch.get(bKey) || [];
+          arr.push(node);
+          rootDeptsByBranch.set(bKey, arr);
+        } else {
+          globalRootDepts.push(node);
+        }
+      }
+
+      const branches = branchesRes.rows.map((b) => ({
+        ...b,
+        departments: rootDeptsByBranch.get(String(b.id)) || [],
+      }));
+
+      return {
+        company: tenantRes.rows[0] || { id: ctx.tenantId, name: 'Doanh nghiệp' },
+        total_employees: empsRes.rows.length,
+        branches,
+        unassigned_departments: globalRootDepts,
+        unassigned_employees: unassignedEmps,
+      };
+    });
+
+    res.json({ success: true, data: tree });
+  } catch (err: any) {
+    sendApiError(res, 500, 'ORG_CHART_FAILED', err?.message || 'Không thể tải sơ đồ tổ chức.');
+  }
+});
+
+// Full 360° Account & HR Dossier for `AccountDetailDrawer` (`/employees/:id/dossier`)
+hrmRouter.get('/employees/:id/dossier', requirePermission('hrm', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const id = String(req.params.id);
+
+    const dossier = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const rbac = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
+      const showSalary =
+        Boolean(rbac.userOrg?.is_tenant_owner) ||
+        Boolean(rbac.effectivePermissions.payroll?.actions.view) ||
+        Boolean(rbac.effectivePermissions.hrm?.actions.view_financials);
+
+      const empRes = await client.query(
+        `SELECT e.*, b.name AS branch_name, b.tax_code AS branch_tax_code,
+                d.name AS department_name, t.name AS team_name, p.name AS position_name,
+                mu.full_name AS manager_name
+         FROM tenant_hr_employees e
+         LEFT JOIN tenant_branches b ON b.tenant_id = e.tenant_id AND b.id = e.branch_id
+         LEFT JOIN tenant_departments d ON d.tenant_id = e.tenant_id AND d.id = e.department_id
+         LEFT JOIN tenant_teams t ON t.tenant_id = e.tenant_id AND t.id = e.team_id
+         LEFT JOIN tenant_positions p ON p.tenant_id = e.tenant_id AND p.id = e.position_id
+         LEFT JOIN users mu ON mu.tenant_id = e.tenant_id AND mu.id = e.manager_user_id
+         WHERE e.tenant_id = $1 AND (e.id::text = $2 OR e.user_id::text = $2)
+         LIMIT 1`,
+        [ctx.tenantId, id]
+      );
+      if (!empRes.rows[0]) return null;
+      const emp = empRes.rows[0];
+
+      const [userRes, contractsRes, assetsRes, attRes, shiftsRes] = await Promise.all([
+        emp.user_id
+          ? client.query(
+              `SELECT id, full_name, email, phone, role, avatar_url, branch_id, department_id, team_id,
+                      is_tenant_owner, last_login_at, created_at
+               FROM users WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+              [ctx.tenantId, emp.user_id]
+            )
+          : Promise.resolve({ rows: [] as any[] }),
+        client.query(
+          'SELECT * FROM tenant_hr_contracts WHERE tenant_id = $1 AND employee_id = $2 ORDER BY start_date DESC',
+          [ctx.tenantId, emp.id]
+        ),
+        client.query(
+          'SELECT * FROM tenant_hr_handover_assets WHERE tenant_id = $1 AND employee_id = $2 ORDER BY handed_over_at DESC',
+          [ctx.tenantId, emp.id]
+        ),
+        emp.user_id
+          ? client.query(
+              `SELECT work_date, attendance_code, check_in_at, check_out_at, late_minutes, work_units, status
+               FROM tenant_hr_attendance_logs
+               WHERE tenant_id = $1 AND user_id = $2
+               ORDER BY work_date DESC LIMIT 20`,
+              [ctx.tenantId, emp.user_id]
+            )
+          : Promise.resolve({ rows: [] as any[] }),
+        client.query(
+          'SELECT * FROM tenant_hr_shifts WHERE tenant_id = $1 AND is_active = true ORDER BY is_default DESC',
+          [ctx.tenantId]
+        ),
+      ]);
+
+      return {
+        employee: {
+          ...emp,
+          base_salary_vnd: showSalary || emp.user_id === ctx.userId ? toNum(emp.base_salary_vnd, 0) : null,
+          insurance_salary_vnd: showSalary || emp.user_id === ctx.userId ? toNum(emp.insurance_salary_vnd, 0) : null,
+          allowances_json:
+            showSalary || emp.user_id === ctx.userId
+              ? parseJsonSafe<Record<string, number>>(emp.allowances_json, {})
+              : {},
+          salary_masked: !(showSalary || emp.user_id === ctx.userId),
+        },
+        user_account: userRes.rows[0] || null,
+        contracts: contractsRes.rows.map((c) => ({
+          ...c,
+          base_salary_vnd: showSalary || emp.user_id === ctx.userId ? toNum(c.base_salary_vnd, 0) : null,
+          insurance_salary_vnd: showSalary || emp.user_id === ctx.userId ? toNum(c.insurance_salary_vnd, 0) : null,
+          signed_by_employee: toBool(c.signed_by_employee, false),
+          signed_by_employer: toBool(c.signed_by_employer, false),
+        })),
+        assets: assetsRes.rows.map((a) => ({
+          ...a,
+          asset_value_vnd: toNum(a.asset_value_vnd, 0),
+          acknowledged_by_employee: toBool(a.acknowledged_by_employee, false),
+        })),
+        recent_attendance: attRes.rows,
+        available_shifts: shiftsRes.rows,
+      };
+    });
+
+    if (!dossier) {
+      sendApiError(res, 404, 'EMPLOYEE_DOSSIER_NOT_FOUND', 'Không tìm thấy hồ sơ nhân sự 360°.');
+      return;
+    }
+
+    res.json({ success: true, data: dossier });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_EMPLOYEE_DOSSIER_FAILED', err?.message || 'Không thể tải hồ sơ nhân sự 360°.');
   }
 });
 

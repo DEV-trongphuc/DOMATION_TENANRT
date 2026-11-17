@@ -56,6 +56,87 @@ function mapFormRow(row: Record<string, unknown>) {
   };
 }
 
+// OTPTriggersTab: OTP Rate-Limit & Verification Audit Inspector
+formsRouter.get('/otp/audit', requirePermission('mkt_forms', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const canUnmask = await canUserUnmaskMarketingPii(client, ctx.tenantId, ctx.userId);
+      const [rowsRes, statsRes] = await Promise.all([
+        client.query(
+          `SELECT id, channel, recipient, purpose, attempts, verified, expires_at, verified_at, created_at
+           FROM mkt_otp_verifications
+           WHERE tenant_id = $1
+           ORDER BY created_at DESC
+           LIMIT 150`,
+          [ctx.tenantId]
+        ),
+        client.query<{
+          total_sent: number;
+          verified_cnt: number;
+          email_cnt: number;
+          sms_cnt: number;
+          blocked_cnt: number;
+        }>(
+          `SELECT COUNT(*)::int AS total_sent,
+                  COALESCE(SUM(CASE WHEN verified = true THEN 1 ELSE 0 END), 0)::int AS verified_cnt,
+                  COALESCE(SUM(CASE WHEN channel = 'email' THEN 1 ELSE 0 END), 0)::int AS email_cnt,
+                  COALESCE(SUM(CASE WHEN channel = 'sms' THEN 1 ELSE 0 END), 0)::int AS sms_cnt,
+                  COALESCE(SUM(CASE WHEN attempts >= 5 THEN 1 ELSE 0 END), 0)::int AS blocked_cnt
+           FROM mkt_otp_verifications
+           WHERE tenant_id = $1`,
+          [ctx.tenantId]
+        ),
+      ]);
+
+      const nowMs = Date.now();
+      const logs = rowsRes.rows.map((r) => {
+        const rec = String(r.recipient || '');
+        const isEmail = rec.includes('@');
+        const masked = maskContactPiiIfDisallowed(
+          { phone: isEmail ? null : rec, email: isEmail ? rec : null },
+          canUnmask,
+          cfg
+        );
+        const expired = !r.verified && new Date(String(r.expires_at)).getTime() < nowMs;
+        const blocked = Number(r.attempts || 0) >= 5;
+        return {
+          ...r,
+          recipient: isEmail ? masked.email || rec : masked.phone || rec,
+          audit_status: r.verified ? 'verified' : blocked ? 'rate_limited' : expired ? 'expired' : 'pending',
+        };
+      });
+
+      const st = statsRes.rows[0];
+      const totalSent = Number(st?.total_sent || 0);
+      const verifiedCnt = Number(st?.verified_cnt || 0);
+
+      return {
+        policy: {
+          max_attempts: 5,
+          ttl_seconds: 300,
+          hash_algorithm: 'HMAC-SHA256',
+        },
+        summary: {
+          total_sent: totalSent,
+          verified_count: verifiedCnt,
+          verification_rate_pct: totalSent > 0 ? Number(((verifiedCnt / totalSent) * 100).toFixed(1)) : 0,
+          email_count: Number(st?.email_cnt || 0),
+          sms_count: Number(st?.sms_cnt || 0),
+          rate_limited_count: Number(st?.blocked_cnt || 0),
+        },
+        logs,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'OTP_AUDIT_FAILED', err?.message || 'Không thể tải nhật ký kiểm toán OTP.');
+  }
+});
+
 // List Forms + Audiences + Sale Rounds + Custom/Purchase Events + OTP stats
 formsRouter.get('/', requirePermission('mkt_forms', 'view'), async (_req, res) => {
   try {
@@ -387,15 +468,16 @@ formsRouter.post('/events', requirePermission('mkt_forms', 'create'), async (req
     const schemaJson = req.body?.schema_json && typeof req.body.schema_json === 'object' ? req.body.schema_json : {};
 
     const id = crypto.randomUUID();
+    const secret = `whsec_${crypto.randomBytes(16).toString('hex')}`;
     const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
       await client.query(
-        `INSERT INTO mkt_custom_events (id, tenant_id, event_key, event_name, event_category, description, schema_json, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+        `INSERT INTO mkt_custom_events (id, tenant_id, event_key, event_name, event_category, description, schema_json, webhook_secret, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
          ON CONFLICT (tenant_id, event_key) DO UPDATE SET
            event_name = EXCLUDED.event_name,
            description = EXCLUDED.description,
            updated_at = clock_timestamp()`,
-        [id, ctx.tenantId, rawKey, eventName, eventCategory, description, JSON.stringify(schemaJson), ctx.userId]
+        [id, ctx.tenantId, rawKey, eventName, eventCategory, description, JSON.stringify(schemaJson), secret, ctx.userId]
       );
       const r = await client.query(
         'SELECT * FROM mkt_custom_events WHERE tenant_id = $1 AND event_key = $2 LIMIT 1',
@@ -407,6 +489,116 @@ formsRouter.post('/events', requirePermission('mkt_forms', 'create'), async (req
     res.status(201).json({ success: true, data: saved });
   } catch (err: any) {
     sendApiError(res, 500, 'CREATE_CUSTOM_EVENT_FAILED', err?.message || 'Không thể tạo định nghĩa sự kiện.');
+  }
+});
+
+// CustomEventDetailModal & PurchaseEventDetailModal Inspector + Webhook Secret Rotation
+formsRouter.get('/events/:id', requirePermission('mkt_forms', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const evRes = await client.query('SELECT * FROM mkt_custom_events WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      const ev = evRes.rows[0];
+      if (!ev) return null;
+
+      let webhookSecret = ev.webhook_secret ? String(ev.webhook_secret) : '';
+      if (!webhookSecret) {
+        webhookSecret = `whsec_${crypto.randomBytes(16).toString('hex')}`;
+        await client.query(
+          'UPDATE mkt_custom_events SET webhook_secret = $3 WHERE tenant_id = $1 AND id = $2',
+          [ctx.tenantId, ev.id, webhookSecret]
+        );
+      }
+
+      const logsRes = await client.query(
+        `SELECT id, lead_id, event_type, title, content, metadata, created_at
+         FROM lead_timeline_events
+         WHERE tenant_id = $1 AND event_type IN ('custom_event', 'purchase_event')
+         ORDER BY created_at DESC
+         LIMIT 50`,
+        [ctx.tenantId]
+      );
+
+      const matchedLogs = logsRes.rows
+        .map((r) => ({ ...r, metadata: parseJsonCol<Record<string, unknown>>(r.metadata, {}) }))
+        .filter((r) => !r.metadata.event_key || r.metadata.event_key === ev.event_key);
+
+      return {
+        event: {
+          ...ev,
+          schema_json: parseJsonCol(ev.schema_json, {}),
+          webhook_secret: webhookSecret,
+          total_revenue_vnd: Number(ev.total_revenue_vnd || 0),
+          trigger_count: Number(ev.trigger_count || 0),
+        },
+        recent_triggers: matchedLogs.slice(0, 25),
+      };
+    });
+
+    if (!data) {
+      sendApiError(res, 404, 'EVENT_NOT_FOUND', 'Không tìm thấy định nghĩa sự kiện.');
+      return;
+    }
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_EVENT_DETAIL_FAILED', err?.message || 'Không thể tải chi tiết sự kiện.');
+  }
+});
+
+formsRouter.post('/events/:id/rotate-secret', requirePermission('mkt_forms', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const newSecret = `whsec_${crypto.randomBytes(18).toString('hex')}`;
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `UPDATE mkt_custom_events
+         SET webhook_secret = $3, updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, req.params.id, newSecret]
+      );
+      return r.rowCount ? newSecret : null;
+    });
+    if (!updated) {
+      sendApiError(res, 404, 'EVENT_NOT_FOUND', 'Không tìm thấy định nghĩa sự kiện.');
+      return;
+    }
+    res.json({ success: true, data: { webhook_secret: updated } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'ROTATE_WEBHOOK_SECRET_FAILED', err?.message || 'Không thể xoay khóa bí mật Webhook.');
+  }
+});
+
+// Multi-Theme Form Embed Widget Generator (`iframe` | `popup_modal` | `floating_bar` | `slide_in`)
+formsRouter.get('/:id/embed-config', requirePermission('mkt_forms', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const form = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query('SELECT * FROM mkt_forms WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      return r.rows[0] ? mapFormRow(r.rows[0]) : null;
+    });
+    if (!form) {
+      sendApiError(res, 404, 'FORM_NOT_FOUND', 'Không tìm thấy Biểu mẫu.');
+      return;
+    }
+
+    const token = form.public_token;
+    const primary = String((form.theme as Record<string, unknown>)?.primaryColor || '#1E40FF');
+    const snippets = {
+      iframe: `<iframe src="https://app.domation.net/embed/form/${token}" width="100%" height="520" style="border:0;border-radius:16px;overflow:hidden;" loading="lazy"></iframe>`,
+      popup_modal: `<script src="https://app.domation.net/sdk/form-widget.js" data-form-token="${token}" data-mode="popup_modal" data-primary="${primary}" defer></script>`,
+      floating_bar: `<script src="https://app.domation.net/sdk/form-widget.js" data-form-token="${token}" data-mode="floating_bar" data-primary="${primary}" defer></script>`,
+      slide_in: `<script src="https://app.domation.net/sdk/form-widget.js" data-form-token="${token}" data-mode="slide_in" data-primary="${primary}" defer></script>`,
+    };
+
+    res.json({ success: true, data: { form, snippets } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_FORM_EMBED_FAILED', err?.message || 'Không thể tạo mã nhúng Form.');
   }
 });
 

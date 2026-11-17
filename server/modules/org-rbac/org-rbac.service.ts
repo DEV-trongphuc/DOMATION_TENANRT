@@ -6,6 +6,7 @@ import {
   buildDefaultSystemRoleModulePermission,
   normalizeActionsMap,
   normalizeDataScope,
+  parseBoolMapSafe,
   resolveUserEffectivePermissions,
   type DataScope,
 } from '../../core/security/rbac.ts';
@@ -97,8 +98,11 @@ export async function ensureDefaultSystemRolesSeeded(
     if (!roleId) {
       roleId = crypto.randomUUID();
       await client.query(
-        `INSERT INTO tenant_roles (id, tenant_id, role_key, name, description, default_data_scope, is_system, is_active)
-         VALUES ($1, $2, $3, $4, $5, $6, true, true)
+        `INSERT INTO tenant_roles (
+           id, tenant_id, role_key, name, description, default_data_scope,
+           screen_access, quick_actions, default_route, is_system, is_active
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, '{}'::jsonb, '/', true, true)
          ON CONFLICT (tenant_id, role_key) DO NOTHING`,
         [roleId, tenantId, seed.key, seed.name, seed.desc, seed.scope]
       );
@@ -112,10 +116,10 @@ export async function ensureDefaultSystemRolesSeeded(
 
     if (roleId) {
       const cntRes = await client.query<{ cnt: number }>(
-        'SELECT COUNT(*)::int AS cnt FROM tenant_role_permissions WHERE tenant_id = $1 AND role_id = $2',
+        'SELECT COUNT(*) AS cnt FROM tenant_role_permissions WHERE tenant_id = $1 AND role_id = $2',
         [tenantId, roleId]
       );
-      if (Number(cntRes.rows[0]?.cnt || 0) === 0) {
+      if (Number(cntRes.rows[0]?.cnt || 0) < SAAS_MODULES_CATALOG.length) {
         for (const mod of SAAS_MODULES_CATALOG) {
           const defPerm = buildDefaultSystemRoleModulePermission(seed.key, mod.key, {
             allowManagerExportCsv: Boolean(legacyRp.allow_manager_export_csv),
@@ -125,8 +129,8 @@ export async function ensureDefaultSystemRolesSeeded(
             piiMaskAllSales: Boolean(sObj.pii_mask_all_sales),
           });
           await client.query(
-            `INSERT INTO tenant_role_permissions (id, tenant_id, role_id, module_key, data_scope, actions)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            `INSERT INTO tenant_role_permissions (id, tenant_id, role_id, module_key, data_scope, actions, screen_access, quick_actions)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb)
              ON CONFLICT (tenant_id, role_id, module_key) DO NOTHING`,
             [
               crypto.randomUUID(),
@@ -183,22 +187,60 @@ export async function upsertRolePermissionsBatch(
   client: DbClient,
   tenantId: string,
   roleId: string,
-  items: Array<{ module_key: string; data_scope?: string; scope?: string; actions?: unknown }>
+  items: Array<{
+    module_key: string;
+    data_scope?: string;
+    scope?: string;
+    actions?: unknown;
+    screen_access?: unknown;
+    quick_actions?: unknown;
+  }>
 ): Promise<any[]> {
+  const existingRes = await client.query<{
+    module_key: string;
+    screen_access?: unknown;
+    quick_actions?: unknown;
+  }>(
+    'SELECT module_key, screen_access, quick_actions FROM tenant_role_permissions WHERE tenant_id = $1 AND role_id = $2',
+    [tenantId, roleId]
+  );
+  const existingMap = new Map(existingRes.rows.map((r) => [r.module_key, r]));
+
   for (const item of items) {
     const mKey = normalizeCanonicalModuleKey(item?.module_key);
     if (!mKey) continue;
     const scope = normalizeDataScope(item.data_scope ?? item.scope, 'none');
     const actions = normalizeActionsMap(item.actions);
+    const prev = existingMap.get(mKey);
+    const screenAccess =
+      item.screen_access !== undefined
+        ? parseBoolMapSafe(item.screen_access)
+        : parseBoolMapSafe(prev?.screen_access);
+    const quickActions =
+      item.quick_actions !== undefined
+        ? parseBoolMapSafe(item.quick_actions)
+        : parseBoolMapSafe(prev?.quick_actions);
+
     await client.query(
-      `INSERT INTO tenant_role_permissions (id, tenant_id, role_id, module_key, data_scope, actions)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+      `INSERT INTO tenant_role_permissions (id, tenant_id, role_id, module_key, data_scope, actions, screen_access, quick_actions)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb)
        ON CONFLICT (tenant_id, role_id, module_key)
        DO UPDATE SET
          data_scope = EXCLUDED.data_scope,
          actions = EXCLUDED.actions,
+         screen_access = EXCLUDED.screen_access,
+         quick_actions = EXCLUDED.quick_actions,
          updated_at = clock_timestamp()`,
-      [crypto.randomUUID(), tenantId, roleId, mKey, scope, JSON.stringify(actions)]
+      [
+        crypto.randomUUID(),
+        tenantId,
+        roleId,
+        mKey,
+        scope,
+        JSON.stringify(actions),
+        JSON.stringify(screenAccess),
+        JSON.stringify(quickActions),
+      ]
     );
   }
 
@@ -465,6 +507,12 @@ export async function getOrgRbacBootstrapPayload(
     kpisRes,
     policiesRes,
     usersRes,
+    customFieldsRes,
+    leadScoringRes,
+    notificationRulesRes,
+    emailTemplatesRes,
+    entityTabsRes,
+    tagsRes,
     resolvedRbac,
   ] = await Promise.all([
     client.query(
@@ -513,6 +561,27 @@ export async function getOrgRbacBootstrapPayload(
        ORDER BY is_tenant_owner DESC, created_at ASC`,
       [tenantId]
     ),
+    client.query(
+      'SELECT * FROM tenant_custom_fields WHERE tenant_id = $1 ORDER BY entity_type ASC, sort_order ASC, created_at ASC',
+      [tenantId]
+    ),
+    client.query(
+      'SELECT * FROM tenant_lead_scoring_rules WHERE tenant_id = $1 ORDER BY priority ASC, created_at ASC',
+      [tenantId]
+    ),
+    client.query(
+      'SELECT * FROM tenant_notification_rules WHERE tenant_id = $1 ORDER BY event_key ASC, created_at ASC',
+      [tenantId]
+    ),
+    client.query(
+      'SELECT * FROM tenant_email_templates WHERE tenant_id = $1 ORDER BY is_system DESC, created_at DESC',
+      [tenantId]
+    ),
+    client.query(
+      'SELECT * FROM tenant_entity_tabs WHERE tenant_id = $1 ORDER BY entity_type ASC, sort_order ASC, created_at ASC',
+      [tenantId]
+    ),
+    client.query('SELECT * FROM tenant_tags WHERE tenant_id = $1 ORDER BY name ASC', [tenantId]),
     resolveUserEffectivePermissions(client, tenantId, userId),
   ]);
 
@@ -535,6 +604,12 @@ export async function getOrgRbacBootstrapPayload(
     custom_kpis: kpisRes.rows,
     policies: policiesRes.rows,
     policy_documents: policiesRes.rows,
+    custom_fields: customFieldsRes.rows,
+    lead_scoring_rules: leadScoringRes.rows,
+    notification_rules: notificationRulesRes.rows,
+    email_templates: emailTemplatesRes.rows,
+    entity_tabs: entityTabsRes.rows,
+    tags: tagsRes.rows,
     industry_key: entSnap.industry_key,
     terminology: entSnap.terminology,
     terminology_overrides: normSettings.terminology,
@@ -546,6 +621,10 @@ export async function getOrgRbacBootstrapPayload(
     ai_avatar_url: normSettings.ai_avatar_url,
     pipeline_tabs: normSettings.pipeline_tabs,
     effective_permissions: resolvedRbac.effectivePermissions,
+    screen_access: resolvedRbac.screen_access,
+    quick_actions: resolvedRbac.quick_actions,
+    default_route: resolvedRbac.default_route,
+    is_tenant_owner: Boolean(resolvedRbac.userOrg?.is_tenant_owner),
     industry_presets: INDUSTRY_TERMINOLOGY_PRESETS,
     modules_catalog: SAAS_MODULES_CATALOG,
     scopes_catalog: DATA_SCOPES_ORDERED,

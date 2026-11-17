@@ -9,8 +9,8 @@ import {
 import { verifyTenantAccessToken, verifyPlatformAccessToken } from '../crypto/jwt.ts';
 import { tenantRedis } from '../cache/tenant-redis.ts';
 import { getTenantMetaCached } from '../settings/tenant-cache.ts';
-import { withTenantTransaction } from '../database/transaction.ts';
-import type { DbClient } from '../database/db-adapter.ts';
+import { withTenantTransaction, withSystemPrivilege } from '../database/transaction.ts';
+import { getDatabasePool, type DbClient } from '../database/db-adapter.ts';
 import {
   SAAS_MODULES_CATALOG,
   getAliasesForModuleKey,
@@ -160,13 +160,32 @@ export function buildDefaultSystemRoleModulePermission(
   }
 
   if (r === 'manager') {
-    const adminOnlyModules = new Set(['billing', 'org_rbac', 'integrations_crm', 'integrations_marketing']);
+    const adminOnlyModules = new Set([
+      'settings',
+      'billing',
+      'org_rbac',
+      'integrations_crm',
+      'integrations_marketing',
+    ]);
     if (adminOnlyModules.has(moduleKey)) {
       return {
         data_scope: moduleKey === 'org_rbac' ? 'department' : 'none',
         actions: {
           ...buildEmptyActions(false),
           view: moduleKey === 'org_rbac',
+        },
+      };
+    }
+    if (moduleKey === 'users') {
+      return {
+        data_scope: 'department',
+        actions: {
+          ...buildEmptyActions(false),
+          view: true,
+          create: true,
+          edit: true,
+          assign: true,
+          unmask_phone: true,
         },
       };
     }
@@ -202,6 +221,7 @@ export function buildDefaultSystemRoleModulePermission(
     'workchat',
     'enterprise_feed',
     'attendance',
+    'approvals',
     'dom_sales_copilot',
   ]);
 
@@ -231,10 +251,302 @@ export function buildDefaultSystemRoleModulePermission(
   };
 }
 
+export type ScreenAccessMap = Record<string, boolean>;
+export type QuickActionsMap = Record<string, boolean>;
+
 export interface ResolvedUserRbacResult {
   userOrg: UserOrgAuthSnapshot | null;
   enabledModules: string[];
   effectivePermissions: EffectivePermissionsMatrix;
+  screen_access: ScreenAccessMap;
+  quick_actions: QuickActionsMap;
+  default_route: string;
+}
+
+const rbacSchemaInitializedPools = new WeakSet<object>();
+const rbacSchemaPendingPools = new WeakMap<object, Promise<void>>();
+
+async function addMariaDbRbacColumnIfMissing(
+  client: DbClient,
+  table: string,
+  column: string,
+  definition: string
+): Promise<void> {
+  const res = await client.query<{ cnt: number }>(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = $1 AND column_name = $2`,
+    [table, column]
+  );
+  if (Number(res.rows[0]?.cnt || 0) === 0) {
+    await client.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+export async function ensureRbacScreenColumns(): Promise<void> {
+  let pool: ReturnType<typeof getDatabasePool>;
+  try {
+    pool = getDatabasePool();
+  } catch {
+    return;
+  }
+  if (rbacSchemaInitializedPools.has(pool)) {
+    return;
+  }
+  let running = rbacSchemaPendingPools.get(pool);
+  if (!running) {
+    running = (async () => {
+      await withSystemPrivilege(async (client) => {
+        if (client.dialect === 'mariadb' || pool.dialect === 'mariadb') {
+          await addMariaDbRbacColumnIfMissing(client, 'tenant_roles', 'screen_access', 'JSON NULL');
+          await addMariaDbRbacColumnIfMissing(client, 'tenant_roles', 'quick_actions', 'JSON NULL');
+          await addMariaDbRbacColumnIfMissing(
+            client,
+            'tenant_roles',
+            'default_route',
+            "VARCHAR(120) NOT NULL DEFAULT '/'"
+          );
+          await addMariaDbRbacColumnIfMissing(client, 'tenant_role_permissions', 'screen_access', 'JSON NULL');
+          await addMariaDbRbacColumnIfMissing(client, 'tenant_role_permissions', 'quick_actions', 'JSON NULL');
+          await client.query(`UPDATE tenant_roles SET screen_access = '{}' WHERE screen_access IS NULL`);
+          await client.query(`UPDATE tenant_roles SET quick_actions = '{}' WHERE quick_actions IS NULL`);
+          await client.query(`UPDATE tenant_role_permissions SET screen_access = '{}' WHERE screen_access IS NULL`);
+          await client.query(`UPDATE tenant_role_permissions SET quick_actions = '{}' WHERE quick_actions IS NULL`);
+        } else {
+          const pgAlters = [
+            `ALTER TABLE tenant_roles ADD COLUMN IF NOT EXISTS screen_access JSONB NOT NULL DEFAULT '{}'::jsonb`,
+            `ALTER TABLE tenant_roles ADD COLUMN IF NOT EXISTS quick_actions JSONB NOT NULL DEFAULT '{}'::jsonb`,
+            `ALTER TABLE tenant_roles ADD COLUMN IF NOT EXISTS default_route VARCHAR(120) NOT NULL DEFAULT '/'`,
+            `ALTER TABLE tenant_role_permissions ADD COLUMN IF NOT EXISTS screen_access JSONB NOT NULL DEFAULT '{}'::jsonb`,
+            `ALTER TABLE tenant_role_permissions ADD COLUMN IF NOT EXISTS quick_actions JSONB NOT NULL DEFAULT '{}'::jsonb`,
+          ];
+          for (const stmt of pgAlters) {
+            await client.query(stmt);
+          }
+        }
+      });
+      rbacSchemaInitializedPools.add(pool);
+    })().finally(() => {
+      rbacSchemaPendingPools.delete(pool);
+    });
+    rbacSchemaPendingPools.set(pool, running);
+  }
+  await running;
+}
+
+export function parseBoolMapSafe(val: unknown): Record<string, boolean> {
+  let raw = val;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return {};
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const out: Record<string, boolean> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(k || '').trim();
+    if (!key) continue;
+    out[key] = Boolean(v);
+  }
+  return out;
+}
+
+export const MODULE_TO_DEFAULT_SCREENS: Record<string, readonly string[]> = {
+  dashboard_crm: ['/', '/dashboard'],
+  leads: ['/leads', '/contacts', '/databank'],
+  rounds: ['/rounds', '/fair-share'],
+  routing_rules: ['/routing-rules'],
+  pipelines: ['/pipelines'],
+  gatekeeper: ['/gatekeeper'],
+  tickets_data: ['/tickets-data'],
+  ads_capi: ['/ads-capi'],
+  sale_portal: ['/sale-portal'],
+  appointments: ['/appointments'],
+  integrations_crm: ['/integrations', '/connect'],
+  dom_sales_copilot: ['/dom-sales-copilot'],
+  dashboard_marketing: ['/marketing'],
+  audiences: ['/audiences'],
+  mkt_templates: ['/marketing/templates'],
+  mkt_forms: ['/marketing/forms'],
+  mkt_surveys: ['/marketing/surveys'],
+  mkt_campaigns: ['/marketing/campaigns'],
+  mkt_flows: ['/marketing/flows'],
+  mkt_vouchers: ['/marketing/vouchers'],
+  mkt_web_tracking: ['/marketing/web-tracking'],
+  mkt_social_bot: ['/marketing/social-bot'],
+  mkt_ai_bot: ['/marketing/ai-bot'],
+  integrations_marketing: ['/marketing/connect'],
+  dashboard_growth: ['/growth'],
+  revenue_attribution: ['/growth/attribution'],
+  hrm: ['/erp/hrm', '/hrm'],
+  attendance: ['/erp/attendance', '/attendance'],
+  payroll: ['/erp/payroll', '/payroll'],
+  approvals: ['/erp/approvals', '/approvals'],
+  workspace_personal: ['/workspace', '/activities'],
+  projects: ['/erp/projects', '/projects'],
+  workchat: ['/erp/workchat', '/workchat'],
+  enterprise_feed: ['/feed', '/erp/feed'],
+  helpdesk: ['/support-tickets', '/helpdesk'],
+  crm_b2b: ['/deals', '/companies'],
+  deals: ['/deals', '/crm/deals'],
+  companies: ['/companies', '/crm/companies'],
+  finance: ['/erp/finance', '/finance', '/deposits', '/expenses', '/cash-flow', '/invoices'],
+  quotes_orders: ['/quotes', '/sales-orders', '/purchase-orders'],
+  inventory_assets: ['/products', '/suppliers', '/inventory'],
+  cloud_files_ocr: ['/erp/cloud-files', '/cloud-files'],
+  reports_bi: ['/reports'],
+  dom_agent: ['/dom-agent'],
+  education: ['/erp/education', '/education'],
+  settings: ['/settings'],
+  org_rbac: ['/settings/rbac', '/org-rbac'],
+  users: ['/accounts', '/users'],
+  billing: ['/billing'],
+};
+
+function computeScreenAccessQuickActionsAndRoute(options: {
+  matrix: EffectivePermissionsMatrix;
+  enabledSet: Set<string>;
+  isOwner: boolean;
+  roleScreenAccess?: Record<string, boolean>;
+  roleQuickActions?: Record<string, boolean>;
+  roleDefaultRoute?: string | null;
+  moduleScreenOverrides?: Record<string, boolean>;
+  moduleQuickOverrides?: Record<string, boolean>;
+}): { screen_access: ScreenAccessMap; quick_actions: QuickActionsMap; default_route: string } {
+  const screenAccess: ScreenAccessMap = {};
+  const { matrix, enabledSet, isOwner } = options;
+
+  for (const mod of SAAS_MODULES_CATALOG) {
+    const mKey = mod.key;
+    const perm = matrix[mKey];
+    const entitled = enabledSet.has(mKey) || Boolean(mod.always_enabled);
+    const allowed = entitled && Boolean(perm && perm.scope !== 'none' && perm.actions?.view);
+    screenAccess[mKey] = allowed;
+    for (const alias of getAliasesForModuleKey(mKey)) {
+      screenAccess[alias] = allowed;
+    }
+    const routes = MODULE_TO_DEFAULT_SCREENS[mKey] || [];
+    for (const route of routes) {
+      if (screenAccess[route] === undefined) {
+        screenAccess[route] = allowed;
+      } else {
+        screenAccess[route] = screenAccess[route] || allowed;
+      }
+    }
+  }
+
+  // Explicitly lock `/deals` & `/companies` individually if `deals` or `companies` perms exist cleanly
+  if (matrix.deals) {
+    const dealsAllowed = enabledSet.has('deals') && matrix.deals.scope !== 'none' && Boolean(matrix.deals.actions?.view);
+    screenAccess.deals = dealsAllowed;
+    screenAccess['/deals'] = dealsAllowed;
+    screenAccess['/crm/deals'] = dealsAllowed;
+  }
+  if (matrix.companies) {
+    const companiesAllowed =
+      enabledSet.has('companies') && matrix.companies.scope !== 'none' && Boolean(matrix.companies.actions?.view);
+    screenAccess.companies = companiesAllowed;
+    screenAccess['/companies'] = companiesAllowed;
+    screenAccess['/crm/companies'] = companiesAllowed;
+  }
+
+  const quickActions: QuickActionsMap = {
+    create_lead: Boolean(matrix.leads?.scope !== 'none' && matrix.leads?.actions?.create),
+    export_leads: Boolean(matrix.leads?.scope !== 'none' && matrix.leads?.actions?.export),
+    claim_databank: Boolean(matrix.leads?.scope !== 'none' && matrix.leads?.actions?.view),
+    create_deal: Boolean(
+      (matrix.deals?.scope !== 'none' && matrix.deals?.actions?.create) ||
+        (matrix.crm_b2b?.scope !== 'none' && matrix.crm_b2b?.actions?.create)
+    ),
+    create_task: Boolean(
+      (matrix.projects?.scope !== 'none' && matrix.projects?.actions?.create) ||
+        (matrix.workspace_personal?.scope !== 'none' && matrix.workspace_personal?.actions?.create)
+    ),
+    create_quote: Boolean(
+      (matrix.quotes_orders?.scope !== 'none' && matrix.quotes_orders?.actions?.create) ||
+        (matrix.finance?.scope !== 'none' && matrix.finance?.actions?.create)
+    ),
+    create_expense: Boolean(matrix.finance?.scope !== 'none' && matrix.finance?.actions?.create),
+    checkin_attendance: Boolean(matrix.attendance?.scope !== 'none' && matrix.attendance?.actions?.view),
+    submit_approval: Boolean(matrix.approvals?.scope !== 'none' && matrix.approvals?.actions?.create),
+    open_dom_agent: Boolean(
+      (matrix.dom_agent?.scope !== 'none' && matrix.dom_agent?.actions?.view) ||
+        (matrix.dom_sales_copilot?.scope !== 'none' && matrix.dom_sales_copilot?.actions?.view)
+    ),
+    manage_settings: Boolean(matrix.settings?.scope !== 'none' && matrix.settings?.actions?.manage_config),
+    manage_users: Boolean(
+      matrix.users?.scope !== 'none' && (matrix.users?.actions?.create || matrix.users?.actions?.edit)
+    ),
+  };
+
+  // Apply explicit module-level and role-level screen/quick overrides (unless Owner safeguard overrides recovery)
+  const applyScreenOverrides = (src?: Record<string, boolean>) => {
+    if (!src) return;
+    for (const [k, val] of Object.entries(src)) {
+      const canonical = normalizeCanonicalModuleKey(k);
+      if (canonical) {
+        const mod = SAAS_MODULES_CATALOG.find((m) => m.key === canonical);
+        const entitled = enabledSet.has(canonical) || Boolean(mod?.always_enabled);
+        screenAccess[k] = entitled ? Boolean(val) : false;
+      } else {
+        screenAccess[k] = Boolean(val);
+      }
+    }
+  };
+  applyScreenOverrides(options.moduleScreenOverrides);
+  applyScreenOverrides(options.roleScreenAccess);
+
+  const applyQuickOverrides = (src?: Record<string, boolean>) => {
+    if (!src) return;
+    for (const [k, val] of Object.entries(src)) {
+      quickActions[k] = Boolean(val);
+    }
+  };
+  applyQuickOverrides(options.moduleQuickOverrides);
+  applyQuickOverrides(options.roleQuickActions);
+
+  // OWNER SAFEGUARD: ONLY `users.is_tenant_owner === true` retains immutable access to Settings & Accounts recovery
+  if (isOwner) {
+    for (const recoveryKey of [
+      'settings',
+      'org_rbac',
+      'users',
+      'billing',
+      '/settings',
+      '/settings/rbac',
+      '/org-rbac',
+      '/accounts',
+      '/users',
+      '/billing',
+    ]) {
+      screenAccess[recoveryKey] = true;
+    }
+    quickActions.manage_settings = true;
+    quickActions.manage_users = true;
+  }
+
+  let defaultRoute = String(options.roleDefaultRoute || '').trim() || '/';
+  if (defaultRoute !== '/' && screenAccess[defaultRoute] === false && !isOwner) {
+    const firstAllowed = Object.entries(screenAccess).find(([k, v]) => k.startsWith('/') && v === true)?.[0];
+    defaultRoute = firstAllowed || '/';
+  } else if (defaultRoute === '/' && screenAccess['/'] === false && !isOwner) {
+    const firstAllowed = Object.entries(screenAccess).find(([k, v]) => k.startsWith('/') && v === true)?.[0];
+    if (firstAllowed) {
+      defaultRoute = firstAllowed;
+    }
+  }
+
+  return {
+    screen_access: screenAccess,
+    quick_actions: quickActions,
+    default_route: defaultRoute,
+  };
 }
 
 function mirrorModuleAliasesInMatrix(matrix: EffectivePermissionsMatrix): EffectivePermissionsMatrix {
@@ -270,7 +582,7 @@ export async function resolveUserEffectivePermissions(
 ): Promise<ResolvedUserRbacResult> {
   if (tenantId && userId) {
     const cached = tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(tenantId, userId);
-    if (cached) {
+    if (cached && cached.screen_access) {
       return cached;
     }
   }
@@ -319,7 +631,14 @@ export async function resolveUserEffectivePermissions(
   const tRow = tenantRes.rows[0];
   const uRow = userRes.rows[0];
   if (!tRow) {
-    return { userOrg: null, enabledModules: [], effectivePermissions: {} };
+    return {
+      userOrg: null,
+      enabledModules: [],
+      effectivePermissions: {},
+      screen_access: {},
+      quick_actions: {},
+      default_route: '/',
+    };
   }
 
   const entSnap = resolveTenantEntitlementSnapshot(tRow);
@@ -341,7 +660,14 @@ export async function resolveUserEffectivePermissions(
       };
     }
     mirrorModuleAliasesInMatrix(emptyMatrix);
-    return { userOrg: null, enabledModules: entSnap.enabled_modules, effectivePermissions: emptyMatrix };
+    return {
+      userOrg: null,
+      enabledModules: entSnap.enabled_modules,
+      effectivePermissions: emptyMatrix,
+      screen_access: {},
+      quick_actions: {},
+      default_route: '/',
+    };
   }
 
   const userOrg: UserOrgAuthSnapshot = {
@@ -380,10 +706,16 @@ export async function resolveUserEffectivePermissions(
       }
     }
     mirrorModuleAliasesInMatrix(ownerMatrix);
+    const ownerScreenMeta = computeScreenAccessQuickActionsAndRoute({
+      matrix: ownerMatrix,
+      enabledSet,
+      isOwner: true,
+    });
     const ownerResult: ResolvedUserRbacResult = {
       userOrg,
       enabledModules: entSnap.enabled_modules,
       effectivePermissions: ownerMatrix,
+      ...ownerScreenMeta,
     };
     tenantRedis.setCachedEffectivePermissions(tenantId, userId, ownerResult, 30);
     return ownerResult;
@@ -392,15 +724,33 @@ export async function resolveUserEffectivePermissions(
   // Resolve effective role_id if user only has string `role` matching `tenant_roles.role_key`
   let resolvedRoleId = userOrg.role_id;
   let resolvedRoleIsSystem = !userOrg.role_id;
+  let roleScreenAccess: Record<string, boolean> = {};
+  let roleQuickActions: Record<string, boolean> = {};
+  let roleDefaultRoute = '/';
   if (resolvedRoleId) {
-    const rSys = await client.query<{ is_system: boolean; role_key: string }>(
-      'SELECT is_system, role_key FROM tenant_roles WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+    const rSys = await client.query<{
+      is_system: boolean;
+      role_key: string;
+      screen_access?: unknown;
+      quick_actions?: unknown;
+      default_route?: string | null;
+    }>(
+      'SELECT is_system, role_key, screen_access, quick_actions, default_route FROM tenant_roles WHERE tenant_id = $1 AND id = $2 LIMIT 1',
       [tenantId, resolvedRoleId]
     );
     resolvedRoleIsSystem = Boolean(rSys.rows[0]?.is_system);
+    roleScreenAccess = parseBoolMapSafe(rSys.rows[0]?.screen_access);
+    roleQuickActions = parseBoolMapSafe(rSys.rows[0]?.quick_actions);
+    roleDefaultRoute = String(rSys.rows[0]?.default_route || '/').trim() || '/';
   } else if (userOrg.role) {
-    const roleLookup = await client.query<{ id: string; is_system: boolean }>(
-      `SELECT id, is_system FROM tenant_roles
+    const roleLookup = await client.query<{
+      id: string;
+      is_system: boolean;
+      screen_access?: unknown;
+      quick_actions?: unknown;
+      default_route?: string | null;
+    }>(
+      `SELECT id, is_system, screen_access, quick_actions, default_route FROM tenant_roles
        WHERE tenant_id = $1 AND LOWER(role_key) = LOWER($2) AND is_active = true
        LIMIT 1`,
       [tenantId, userOrg.role]
@@ -408,18 +758,35 @@ export async function resolveUserEffectivePermissions(
     resolvedRoleId = roleLookup.rows[0]?.id || null;
     if (roleLookup.rows[0]) {
       resolvedRoleIsSystem = Boolean(roleLookup.rows[0].is_system);
+      roleScreenAccess = parseBoolMapSafe(roleLookup.rows[0].screen_access);
+      roleQuickActions = parseBoolMapSafe(roleLookup.rows[0].quick_actions);
+      roleDefaultRoute = String(roleLookup.rows[0].default_route || '/').trim() || '/';
     }
   }
 
   const [rolePermsRes, deptPermsRes, overridesRes] = await Promise.all([
     resolvedRoleId
-      ? client.query<{ module_key: string; data_scope: string; actions: unknown }>(
-          `SELECT module_key, data_scope, actions
+      ? client.query<{
+          module_key: string;
+          data_scope: string;
+          actions: unknown;
+          screen_access?: unknown;
+          quick_actions?: unknown;
+        }>(
+          `SELECT module_key, data_scope, actions, screen_access, quick_actions
            FROM tenant_role_permissions
            WHERE tenant_id = $1 AND role_id = $2`,
           [tenantId, resolvedRoleId]
         )
-      : Promise.resolve({ rows: [] as Array<{ module_key: string; data_scope: string; actions: unknown }> }),
+      : Promise.resolve({
+          rows: [] as Array<{
+            module_key: string;
+            data_scope: string;
+            actions: unknown;
+            screen_access?: unknown;
+            quick_actions?: unknown;
+          }>,
+        }),
     userOrg.department_id
       ? client.query<{ module_key: string; data_scope: string; actions: unknown }>(
           `SELECT module_key, data_scope, actions
@@ -443,12 +810,22 @@ export async function resolveUserEffectivePermissions(
   ]);
 
   const rolePermMap = new Map<string, { scope: DataScope; actions: ActionPermissionMap }>();
+  const moduleScreenOverrides: Record<string, boolean> = {};
+  const moduleQuickOverrides: Record<string, boolean> = {};
   for (const rp of rolePermsRes.rows) {
     const normKey = normalizeCanonicalModuleKey(rp.module_key) || rp.module_key;
     rolePermMap.set(normKey, {
       scope: normalizeDataScope(rp.data_scope, 'none'),
       actions: normalizeActionsMap(rp.actions),
     });
+    const mScreens = parseBoolMapSafe(rp.screen_access);
+    for (const [sk, sv] of Object.entries(mScreens)) {
+      moduleScreenOverrides[sk] = sv;
+    }
+    const mQuicks = parseBoolMapSafe(rp.quick_actions);
+    for (const [qk, qv] of Object.entries(mQuicks)) {
+      moduleQuickOverrides[qk] = qv;
+    }
   }
 
   const deptPermMap = new Map<string, { scope: DataScope; actions: ActionPermissionMap }>();
@@ -532,6 +909,10 @@ export async function resolveUserEffectivePermissions(
         effectiveScope = explicitDeptPerm.scope;
         effectiveActions = { ...explicitDeptPerm.actions };
       }
+    } else if ((mKey === 'deals' || mKey === 'companies') && rolePermMap.has('crm_b2b')) {
+      const legacyCrmB2b = rolePermMap.get('crm_b2b')!;
+      effectiveScope = legacyCrmB2b.scope;
+      effectiveActions = { ...legacyCrmB2b.actions };
     } else if (!resolvedRoleId || resolvedRoleIsSystem) {
       // Fallback ONLY when no DB row exists yet for this module on a system role
       const fallback = buildDefaultSystemRoleModulePermission(userOrg.role, mKey, {
@@ -602,10 +983,21 @@ export async function resolveUserEffectivePermissions(
   }
 
   mirrorModuleAliasesInMatrix(matrix);
+  const screenMeta = computeScreenAccessQuickActionsAndRoute({
+    matrix,
+    enabledSet,
+    isOwner: false,
+    roleScreenAccess,
+    roleQuickActions,
+    roleDefaultRoute,
+    moduleScreenOverrides,
+    moduleQuickOverrides,
+  });
   const resolvedResult: ResolvedUserRbacResult = {
     userOrg,
     enabledModules: entSnap.enabled_modules,
     effectivePermissions: matrix,
+    ...screenMeta,
   };
   tenantRedis.setCachedEffectivePermissions(tenantId, userId, resolvedResult, 30);
   return resolvedResult;
@@ -904,12 +1296,15 @@ export function requireEntitlement(moduleKey: SaasModuleKey | string) {
     try {
       const ctx = getTenantContext();
       const canonicalKey = normalizeCanonicalModuleKey(moduleKey) || String(moduleKey);
-      const resolved =
+      let resolved =
         (req as any).rbacResolved ||
-        tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(ctx.tenantId, ctx.userId) ||
-        (await withTenantTransaction(ctx.tenantId, (client) =>
+        tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(ctx.tenantId, ctx.userId);
+      if (!resolved) {
+        await ensureRbacScreenColumns();
+        resolved = await withTenantTransaction(ctx.tenantId, (client) =>
           resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId)
-        ));
+        );
+      }
       (req as any).rbacResolved = resolved;
       if (!resolved.enabledModules.includes(canonicalKey) && !resolved.enabledModules.includes(String(moduleKey))) {
         sendApiError(
@@ -927,37 +1322,71 @@ export function requireEntitlement(moduleKey: SaasModuleKey | string) {
   };
 }
 
+export async function getResolvedUserRbac(
+  req: Request,
+  client?: DbClient
+): Promise<ResolvedUserRbacResult> {
+  const ctx = getTenantContext();
+  const fromReq = (req as any).rbacResolved as ResolvedUserRbacResult | undefined;
+  if (fromReq && fromReq.screen_access) {
+    return fromReq;
+  }
+  const fromCache = tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(ctx.tenantId, ctx.userId);
+  if (fromCache && fromCache.screen_access) {
+    (req as any).rbacResolved = fromCache;
+    return fromCache;
+  }
+  if (!client) {
+    await ensureRbacScreenColumns();
+  }
+  const resolved = client
+    ? await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId)
+    : await withTenantTransaction(ctx.tenantId, (tx) =>
+        resolveUserEffectivePermissions(tx, ctx.tenantId, ctx.userId)
+      );
+  (req as any).rbacResolved = resolved;
+  return resolved;
+}
+
+export function checkEffectivePermission(
+  resolved: ResolvedUserRbacResult,
+  moduleKey: SaasModuleKey | string,
+  action: GranularAction
+): { entitled: boolean; allowed: boolean; scope: DataScope } {
+  const canonicalKey = normalizeCanonicalModuleKey(moduleKey) || String(moduleKey);
+  const modDesc = SAAS_MODULES_CATALOG.find((m) => m.key === canonicalKey);
+  const entitled =
+    Boolean(modDesc?.always_enabled) ||
+    resolved.enabledModules.includes(canonicalKey) ||
+    resolved.enabledModules.includes(String(moduleKey));
+  if (!entitled) {
+    return { entitled: false, allowed: false, scope: 'none' };
+  }
+  const perm = resolved.effectivePermissions[canonicalKey] || resolved.effectivePermissions[String(moduleKey)];
+  if (!perm || perm.scope === 'none' || !perm.actions?.[action]) {
+    return { entitled: true, allowed: false, scope: perm?.scope || 'none' };
+  }
+  return { entitled: true, allowed: true, scope: perm.scope };
+}
+
 /**
  * Zero-Short-Circuit Granular Permission Middleware (`moduleKey` × `action`)
  */
 export function requirePermission(moduleKey: SaasModuleKey | string, action: GranularAction) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const ctx = getTenantContext();
-      const canonicalKey = normalizeCanonicalModuleKey(moduleKey) || String(moduleKey);
-      const resolved =
-        (req as any).rbacResolved ||
-        tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(ctx.tenantId, ctx.userId) ||
-        (await withTenantTransaction(ctx.tenantId, (client) =>
-          resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId)
-        ));
-      (req as any).rbacResolved = resolved;
-
-      if (!resolved.enabledModules.includes(canonicalKey) && !resolved.enabledModules.includes(String(moduleKey))) {
-        const modDesc = SAAS_MODULES_CATALOG.find((m) => m.key === canonicalKey);
-        if (!modDesc?.always_enabled) {
-          sendApiError(
-            res,
-            403,
-            'MODULE_NOT_ENTITLED',
-            `Phân hệ '${moduleKey}' chưa được mở khóa trong gói cước hiện tại.`
-          );
-          return;
-        }
+      const resolved = await getResolvedUserRbac(req);
+      const check = checkEffectivePermission(resolved, moduleKey, action);
+      if (!check.entitled) {
+        sendApiError(
+          res,
+          403,
+          'MODULE_NOT_ENTITLED',
+          `Phân hệ '${moduleKey}' chưa được mở khóa trong gói cước hiện tại.`
+        );
+        return;
       }
-
-      const perm = resolved.effectivePermissions[canonicalKey] || resolved.effectivePermissions[String(moduleKey)];
-      if (!perm || perm.scope === 'none' || !perm.actions[action]) {
+      if (!check.allowed) {
         sendApiError(
           res,
           403,
@@ -968,6 +1397,43 @@ export function requirePermission(moduleKey: SaasModuleKey | string, action: Gra
       }
 
       next();
+    } catch (err: any) {
+      sendApiError(res, 500, 'RBAC_CHECK_FAILED', err?.message || 'Không thể kiểm tra phân quyền chi tiết.');
+    }
+  };
+}
+
+/**
+ * Requires AT LEAST ONE `(moduleKey, action)` pair to be both entitled and granted.
+ */
+export function requireAnyPermission(checks: Array<[SaasModuleKey | string, GranularAction]>) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const resolved = await getResolvedUserRbac(req);
+      let anyEntitled = false;
+      for (const [moduleKey, action] of checks) {
+        const resCheck = checkEffectivePermission(resolved, moduleKey, action);
+        if (resCheck.entitled) anyEntitled = true;
+        if (resCheck.entitled && resCheck.allowed) {
+          next();
+          return;
+        }
+      }
+      if (!anyEntitled) {
+        sendApiError(
+          res,
+          403,
+          'MODULE_NOT_ENTITLED',
+          `Phân hệ yêu cầu chưa được mở khóa trong gói cước hiện tại.`
+        );
+        return;
+      }
+      sendApiError(
+        res,
+        403,
+        'FORBIDDEN_RBAC_PERMISSION',
+        `Tài khoản không có quyền thực hiện thao tác này theo ma trận phân quyền.`
+      );
     } catch (err: any) {
       sendApiError(res, 500, 'RBAC_CHECK_FAILED', err?.message || 'Không thể kiểm tra phân quyền chi tiết.');
     }

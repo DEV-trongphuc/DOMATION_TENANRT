@@ -57,15 +57,15 @@ function isoDaysAhead(days: number): string {
 }
 
 const GROUP_LABELS: Record<DomToolGroupKey, string> = {
-  crm_autodata: 'Group 1 — CRM & Auto Data (14 Tools)',
-  marketing_audiences: 'Group 2 — Audiences & Marketing Automation (16 Tools)',
+  crm_autodata: 'Group 1 — CRM & Auto Data (16 Tools)',
+  marketing_audiences: 'Group 2 — Audiences & Marketing Automation (17 Tools)',
   org_rbac_rag: 'Group 3 — Tổ chức, Phân quyền RBAC & Tri thức RAG (10 Tools)',
-  hrm_payroll: 'Group 4 — Nhân sự HRM, Chấm công & Bảng lương (12 Tools)',
-  erp_ops_finance: 'Group 5 — Dự án, WorkChat, Tài chính, Kho & Cloud OCR (20 Tools)',
+  hrm_payroll: 'Group 4 — Nhân sự HRM, Chấm công & Bảng lương (15 Tools)',
+  erp_ops_finance: 'Group 5 — Dự án, WorkChat, Tài chính, Kho & Cloud OCR (22 Tools)',
 };
 
 // ============================================================================
-// 72 RBAC-ENFORCED MULTI-TENANT FUNCTION TOOLS REGISTRY
+// 80 RBAC-ENFORCED MULTI-TENANT FUNCTION TOOLS REGISTRY
 // ============================================================================
 export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
   // --------------------------------------------------------------------------
@@ -950,9 +950,110 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
       };
     },
   },
+  {
+    name: 'crm_contact_360_profile',
+    title: 'Tra cứu Hồ sơ Khách hàng 360° Đa tầng (Timeline, Deals & Doanh thu)',
+    description:
+      'Lấy bức tranh 360° của một khách hàng gồm giai đoạn phễu, điểm nóng, doanh thu tích lũy và lịch sử tương tác gần nhất (tự động che PII nếu thiếu quyền unmask_phone).',
+    group: 'crm_autodata',
+    groupLabel: GROUP_LABELS.crm_autodata,
+    moduleKey: 'leads',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'crm_sales'],
+    parameters: {
+      lead_id: { type: 'STRING', description: 'UUID của khách hàng cần tra cứu' },
+      keyword: { type: 'STRING', description: 'Tên hoặc SĐT/Email để tìm hồ sơ 360°' },
+    },
+    execute: async (ctx, args) => {
+      const sc = await buildExtendedToolScopeWhere(
+        ctx.client,
+        ctx.tenantId,
+        ctx.resolvedRbac.userOrg,
+        ctx.effectiveScope,
+        { tenantColumn: 'l.tenant_id', ownerColumn: 'l.assigned_to', startParamIndex: 1 }
+      );
+      const clauses = [`(${sc.clause})`, 'l.is_deleted = false'];
+      const vals = [...sc.values];
+      let idx = sc.nextIndex;
+
+      if (args.lead_id && String(args.lead_id).trim()) {
+        clauses.push(`l.id::text = $${idx++}`);
+        vals.push(String(args.lead_id).trim());
+      } else if (args.keyword && String(args.keyword).trim()) {
+        const kw = `%${String(args.keyword).trim().toLowerCase()}%`;
+        clauses.push(`(LOWER(l.name) LIKE $${idx} OR LOWER(COALESCE(l.phone, '')) LIKE $${idx} OR LOWER(COALESCE(l.email, '')) LIKE $${idx})`);
+        vals.push(kw);
+        idx++;
+      }
+
+      const leadRes = await ctx.client.query<Record<string, unknown>>(
+        `SELECT l.id, l.name, l.phone, l.email, l.status, l.lead_score, l.total_revenue_vnd, l.lifecycle_stage,
+                s.stage_name, u.full_name AS assigned_name
+         FROM leads l
+         LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+         LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
+         WHERE ${clauses.join(' AND ')}
+         ORDER BY l.updated_at DESC
+         LIMIT 1`,
+        vals
+      );
+      const lead = leadRes.rows[0];
+      if (!lead) {
+        return { found: false, contact: null, timeline: [] };
+      }
+
+      const timelineRows =
+        (await runOptionalSavepointQuery<Record<string, unknown>>(
+          ctx.client,
+          `SELECT event_type, title, created_at FROM lead_timeline_events
+           WHERE tenant_id = $1 AND lead_id = $2
+           ORDER BY created_at DESC LIMIT 8`,
+          [ctx.tenantId, lead.id]
+        )) || [];
+
+      return {
+        found: true,
+        pii_masked: !ctx.canUnmaskPhone,
+        contact: sanitizeContactRow(lead as any, ctx.canUnmaskPhone, ctx.piiOptions),
+        timeline: timelineRows,
+      };
+    },
+  },
+  {
+    name: 'crm_public_databank_summary',
+    title: 'Thống kê Kho Dữ liệu Chung (Public Databank) & Cơ hội Thu hồi',
+    description:
+      'Kiểm tra số lượng hồ sơ khách hàng đang mở trong Kho dữ liệu chung (Databank) và các lead chưa được nhận chăm sóc.',
+    group: 'crm_autodata',
+    groupLabel: GROUP_LABELS.crm_autodata,
+    moduleKey: 'leads',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'crm_sales'],
+    parameters: {},
+    execute: async (ctx) => {
+      const poolCols = await getTableColumnsSafe(ctx.client, 'crm_public_leads_pool');
+      let poolCount = 0;
+      if (poolCols.size > 0) {
+        const pRows = await runOptionalSavepointQuery<{ cnt: number }>(
+          ctx.client,
+          `SELECT COUNT(*)::int AS cnt FROM crm_public_leads_pool WHERE tenant_id = $1`,
+          [ctx.tenantId]
+        );
+        poolCount = Number(pRows?.[0]?.cnt || 0);
+      }
+      const unaccRes = await ctx.client.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt FROM leads WHERE tenant_id = $1 AND is_deleted = false AND assigned_to IS NULL`,
+        [ctx.tenantId]
+      );
+      return {
+        databank_pool_count: poolCount,
+        unassigned_leads_count: Number(unaccRes.rows[0]?.cnt || 0),
+      };
+    },
+  },
 
   // --------------------------------------------------------------------------
-  // GROUP 2 — AUDIENCES & MARKETING AUTOMATION (16 TOOLS)
+  // GROUP 2 — AUDIENCES & MARKETING AUTOMATION (17 TOOLS)
   // --------------------------------------------------------------------------
   {
     name: 'mkt_list_audiences',
@@ -1484,6 +1585,51 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
         won_deals: Number(revRes.rows[0]?.won_leads || 0),
         attributed_revenue_vnd: ctx.canViewFinancials ? revenue : undefined,
         roas_multiple: ctx.canViewFinancials ? roas : undefined,
+      };
+    },
+  },
+  {
+    name: 'mkt_omnichannel_journey_analytics',
+    title: 'Phân tích Hành trình Đa kênh Omnichannel (Email, ZNS, Web, Khảo sát & Voucher)',
+    description:
+      'Tổng hợp bức tranh tương tác đa điểm chạm của tập khách hàng qua Chiến dịch, Kịch bản Flow, Khảo sát, Mã ưu đãi và Phiên Web.',
+    group: 'marketing_audiences',
+    groupLabel: GROUP_LABELS.marketing_audiences,
+    moduleKey: 'audiences',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'marketing_growth', 'executive_bi'],
+    parameters: {},
+    execute: async (ctx) => {
+      const [audRes, hotLeadsRes] = await Promise.all([
+        ctx.client.query<{ cnt: number }>(
+          'SELECT COUNT(*)::int AS cnt FROM mkt_audiences WHERE tenant_id = $1 AND is_archived = false',
+          [ctx.tenantId]
+        ),
+        ctx.client.query<{ total_cnt: number; hot_cnt: number }>(
+          `SELECT COUNT(*)::int AS total_cnt,
+                  COALESCE(SUM(CASE WHEN lead_score >= 50 THEN 1 ELSE 0 END), 0) AS hot_cnt
+           FROM leads WHERE tenant_id = $1 AND is_deleted = false`,
+          [ctx.tenantId]
+        ),
+      ]);
+
+      const campRows = await runOptionalSavepointQuery<{ cnt: number }>(
+        ctx.client,
+        'SELECT COUNT(*)::int AS cnt FROM mkt_campaigns WHERE tenant_id = $1',
+        [ctx.tenantId]
+      );
+      const flowRows = await runOptionalSavepointQuery<{ cnt: number }>(
+        ctx.client,
+        `SELECT COUNT(*)::int AS cnt FROM mkt_automation_flows WHERE tenant_id = $1 AND status = 'active'`,
+        [ctx.tenantId]
+      );
+
+      return {
+        active_audiences: Number(audRes.rows[0]?.cnt || 0),
+        total_contacts: Number(hotLeadsRes.rows[0]?.total_cnt || 0),
+        hot_contacts_gte_50: Number(hotLeadsRes.rows[0]?.hot_cnt || 0),
+        campaigns_count: Number(campRows?.[0]?.cnt || 0),
+        active_flows_count: Number(flowRows?.[0]?.cnt || 0),
       };
     },
   },
@@ -2316,9 +2462,113 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
       return { booking_count: 0, bookings: [] };
     },
   },
+  {
+    name: 'hrm_my_payslip_lookup',
+    title: 'Tra cứu Phiếu lương Cá nhân & Trạng thái Xác nhận Chữ ký số',
+    description:
+      'Xem chi tiết thu nhập Gross, khấu trừ BHXH/Thuế TNCN, lương thực lĩnh Net và trạng thái ký xác nhận phiếu lương của người dùng.',
+    group: 'hrm_payroll',
+    groupLabel: GROUP_LABELS.hrm_payroll,
+    moduleKey: 'payroll',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'hr_approvals'],
+    parameters: {
+      period_key: { type: 'STRING', description: 'Kỳ lương YYYY-MM (tùy chọn)' },
+    },
+    execute: async (ctx, args) => {
+      const cols = await getTableColumnsSafe(ctx.client, 'tenant_payroll_slips');
+      if (cols.size === 0) return { payslip_count: 0, payslips: [] };
+      const periodFilter = args.period_key ? String(args.period_key).trim() : '';
+      const rows =
+        (await runOptionalSavepointQuery<Record<string, unknown>>(
+          ctx.client,
+          `SELECT s.id, p.period_key, s.gross_pay_vnd, s.pit_tax_vnd, s.net_pay_vnd, s.payment_status
+           FROM tenant_payroll_slips s
+           INNER JOIN tenant_payroll_periods p ON p.tenant_id = s.tenant_id AND p.id = s.period_id
+           WHERE s.tenant_id = $1 AND s.user_id = $2
+           ORDER BY p.year DESC, p.month DESC LIMIT 6`,
+          [ctx.tenantId, ctx.userId]
+        )) || [];
+      const filtered = periodFilter ? rows.filter((r) => String(r.period_key) === periodFilter) : rows;
+      return { payslip_count: filtered.length, payslips: filtered };
+    },
+  },
+  {
+    name: 'hrm_cooperation_slips_summary',
+    title: 'Thống kê Phiếu Hợp tác Phân bổ Hoa hồng Đa Thành viên',
+    description:
+      'Tra cứu danh sách các phiếu hợp tác kinh doanh chia sẻ tỷ lệ hoa hồng, trạng thái chữ ký các bên và phê duyệt quản lý.',
+    group: 'hrm_payroll',
+    groupLabel: GROUP_LABELS.hrm_payroll,
+    moduleKey: 'payroll',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'hr_approvals', 'crm_sales'],
+    parameters: {
+      status: { type: 'STRING', description: 'Trạng thái phiếu (pending_signatures, pending_manager_approval, approved, disputed)' },
+    },
+    execute: async (ctx, args) => {
+      const cols = await getTableColumnsSafe(ctx.client, 'tenant_cooperation_slips');
+      if (cols.size === 0) return { count: 0, slips: [] };
+      const status = args.status ? String(args.status).trim() : '';
+      const rows = status
+        ? await runOptionalSavepointQuery<Record<string, unknown>>(
+            ctx.client,
+            `SELECT id, slip_code, title, status, estimated_value_vnd, expected_commission_vnd, created_at
+             FROM tenant_cooperation_slips WHERE tenant_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT 15`,
+            [ctx.tenantId, status]
+          )
+        : await runOptionalSavepointQuery<Record<string, unknown>>(
+            ctx.client,
+            `SELECT id, slip_code, title, status, estimated_value_vnd, expected_commission_vnd, created_at
+             FROM tenant_cooperation_slips WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 15`,
+            [ctx.tenantId]
+          );
+      return { count: rows?.length || 0, slips: rows || [] };
+    },
+  },
+  {
+    name: 'hrm_accounting_az_journal_summary',
+    title: 'Tổng hợp Bút toán Kế toán Lương & Thuế A-Z (TT200 / TT133)',
+    description:
+      'Đối soát tổng quỹ lương Gross, trích nộp BHXH/BHYT/BHTN (TK 338), Thuế TNCN khấu trừ (TK 3335) và lương phải trả (TK 334).',
+    group: 'hrm_payroll',
+    groupLabel: GROUP_LABELS.hrm_payroll,
+    moduleKey: 'payroll',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'hr_approvals', 'finance_ops', 'executive_bi'],
+    parameters: {
+      period_key: { type: 'STRING', description: 'Kỳ kế toán YYYY-MM (mặc định kỳ gần nhất)' },
+    },
+    execute: async (ctx, args) => {
+      const cols = await getTableColumnsSafe(ctx.client, 'tenant_payroll_periods');
+      if (cols.size === 0) return { period: null, summary: {} };
+      const pk = args.period_key ? String(args.period_key).trim() : '';
+      const rows = pk
+        ? await runOptionalSavepointQuery<Record<string, unknown>>(
+            ctx.client,
+            `SELECT period_key, employee_count, total_gross_vnd, total_emp_insurance_vnd, total_er_insurance_vnd, total_pit_tax_vnd, total_net_vnd, status
+             FROM tenant_payroll_periods WHERE tenant_id = $1 AND period_key = $2 LIMIT 1`,
+            [ctx.tenantId, pk]
+          )
+        : await runOptionalSavepointQuery<Record<string, unknown>>(
+            ctx.client,
+            `SELECT period_key, employee_count, total_gross_vnd, total_emp_insurance_vnd, total_er_insurance_vnd, total_pit_tax_vnd, total_net_vnd, status
+             FROM tenant_payroll_periods WHERE tenant_id = $1 ORDER BY year DESC, month DESC LIMIT 1`,
+            [ctx.tenantId]
+          );
+      return {
+        period: rows?.[0] || null,
+        accounts_mapping: {
+          salary_payable_account: '3341',
+          social_insurance_account: '3383/3384/3386',
+          pit_payable_account: '3335',
+        },
+      };
+    },
+  },
 
   // --------------------------------------------------------------------------
-  // GROUP 5 — PROJECTS, WORKCHAT, FINANCE, INVENTORY & CLOUD OCR (20 TOOLS)
+  // GROUP 5 — PROJECTS, WORKCHAT, FINANCE, INVENTORY & CLOUD OCR (22 TOOLS)
   // --------------------------------------------------------------------------
   {
     name: 'ops_my_open_tasks',
@@ -2389,23 +2639,39 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
       if (!title) {
         return { created: false, message: 'Vui lòng nhập tiêu đề công việc.' };
       }
+      const priority = ['low', 'medium', 'high', 'urgent'].includes(String(args.priority || ''))
+        ? String(args.priority)
+        : 'medium';
+      const tenantTaskCols = await getTableColumnsSafe(ctx.client, 'tenant_tasks');
+      if (tenantTaskCols.size > 0 && tenantTaskCols.has('title')) {
+        const taskId = crypto.randomUUID();
+        const inserted = await runOptionalSavepointQuery(
+          ctx.client,
+          `INSERT INTO tenant_tasks (id, tenant_id, title, description, status_key, priority, assignee_user_id, reporter_user_id)
+           VALUES ($1, $2, $3, $4, 'todo', $5, $6, $6)`,
+          [taskId, ctx.tenantId, title, args.description ? String(args.description) : null, priority, ctx.userId]
+        );
+        if (inserted !== null) {
+          return { created: true, task_id: taskId, title, priority, status: 'todo' };
+        }
+      }
       const cols = await getTableColumnsSafe(ctx.client, 'erp_tasks');
       if (cols.size > 0 && cols.has('title')) {
         const taskId = crypto.randomUUID();
         const inserted = await runOptionalSavepointQuery(
           ctx.client,
           `INSERT INTO erp_tasks (id, tenant_id, title, status, priority) VALUES ($1, $2, $3, 'todo', $4)`,
-          [taskId, ctx.tenantId, title, String(args.priority || 'medium')]
+          [taskId, ctx.tenantId, title, priority]
         );
         if (inserted !== null) {
-          return { created: true, task_id: taskId, title, priority: args.priority || 'medium' };
+          return { created: true, task_id: taskId, title, priority };
         }
       }
       return {
         created: true,
         staged_draft: true,
         title,
-        priority: args.priority || 'medium',
+        priority,
         assigned_to: ctx.userId,
       };
     },
@@ -2882,6 +3148,86 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
         if (rows) return { class_count: rows.length, classes: rows };
       }
       return { class_count: 0, classes: [] };
+    },
+  },
+  {
+    name: 'ops_trace_approval_blocker',
+    title: 'Truy vết Điểm nghẽn SLA Phê duyệt & Người Duyệt Hiện tại',
+    description:
+      'Kiểm tra các tờ trình phê duyệt đang chờ ở bước nào, ai đang giữ quyền duyệt và có bị quá hạn SLA hay không.',
+    group: 'erp_ops_finance',
+    groupLabel: GROUP_LABELS.erp_ops_finance,
+    moduleKey: 'approvals',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'hr_approvals', 'finance_ops', 'executive_bi'],
+    parameters: {},
+    execute: async (ctx) => {
+      const cols = await getTableColumnsSafe(ctx.client, 'tenant_approval_requests');
+      if (cols.size === 0) return { pending_count: 0, blockers: [] };
+      const rows =
+        (await runOptionalSavepointQuery<Record<string, unknown>>(
+          ctx.client,
+          `SELECT r.id, r.request_code, r.title, r.category, r.amount_vnd, r.current_step_order, r.total_steps,
+                  sl.step_name, sl.due_at, u.full_name AS current_approver_name
+           FROM tenant_approval_requests r
+           LEFT JOIN tenant_approval_step_logs sl
+             ON sl.tenant_id = r.tenant_id AND sl.request_id = r.id AND sl.step_order = r.current_step_order AND sl.status = 'pending'
+           LEFT JOIN users u ON u.tenant_id = sl.tenant_id AND u.id = sl.assigned_user_id
+           WHERE r.tenant_id = $1 AND r.status = 'pending'
+           ORDER BY sl.due_at ASC NULLS LAST, r.created_at ASC
+           LIMIT 15`,
+          [ctx.tenantId]
+        )) || [];
+      return {
+        pending_count: rows.length,
+        blockers: rows.map((r) => ({
+          ...r,
+          is_sla_overdue: r.due_at ? new Date(String(r.due_at)).getTime() < Date.now() : false,
+        })),
+      };
+    },
+  },
+  {
+    name: 'ops_draft_action_proposal',
+    title: 'Khởi tạo Đề xuất Hành động Xác nhận Trước Khi Ghi (ActionProposalCard)',
+    description:
+      'Chuẩn bị thẻ đề xuất có xác nhận của người dùng (Confirm-Before-Write) cho Nghỉ phép, Đề nghị Chi phí, Tạm ứng, Giao việc hoặc Tạo Lead.',
+    group: 'erp_ops_finance',
+    groupLabel: GROUP_LABELS.erp_ops_finance,
+    moduleKey: 'leads',
+    requiredAction: 'view',
+    specialistKeys: ['orchestrator', 'crm_sales', 'hr_approvals', 'finance_ops', 'marketing_growth'],
+    parameters: {
+      action_type: { type: 'STRING', description: 'Loại hành động: leave | expense | cash_advance | task | lead' },
+      title: { type: 'STRING', description: 'Tiêu đề đề xuất' },
+      amount_vnd: { type: 'NUMBER', description: 'Số tiền VNĐ (nếu là chi phí/tạm ứng)' },
+      reason: { type: 'STRING', description: 'Lý do hoặc mô tả chi tiết' },
+    },
+    execute: async (_ctx, args) => {
+      const actionType = ['leave', 'expense', 'cash_advance', 'task', 'lead'].includes(String(args.action_type))
+        ? String(args.action_type)
+        : 'task';
+      const title = String(args.title || 'Đề xuất hành động từ DOM Agent').trim();
+      const amountVnd = Number(args.amount_vnd || 0);
+      const reason = String(args.reason || 'Được chuẩn bị bởi DOM Agent — chờ người dùng xác nhận trước khi ghi DB.').trim();
+      const todayIso = new Date().toISOString().slice(0, 10);
+
+      return {
+        requires_user_confirmation: true,
+        proposal: {
+          action_type: actionType,
+          title,
+          summary: `${title}${amountVnd > 0 ? ` • ${amountVnd.toLocaleString('vi-VN')}₫` : ''}`,
+          params: {
+            title,
+            amount_vnd: amountVnd,
+            reason,
+            start_date: todayIso,
+            end_date: todayIso,
+            priority: 'high',
+          },
+        },
+      };
     },
   },
 ];

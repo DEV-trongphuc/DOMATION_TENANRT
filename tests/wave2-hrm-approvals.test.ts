@@ -515,60 +515,59 @@ describe('Wave 2 Phase 3: Dynamic N-Step Approvals, HRM 360°, GPS Attendance, P
     assert.equal(pubBookConflict.json?.error?.code, 'SLOT_ALREADY_BOOKED');
   });
 
-  it('4. Multi-Tier GPS + Selfie Check-In computes exact Haversine distance against tenant_branches & syncs Explanation with Approvals', async () => {
+  it('4. Multi-Tier GPS + Selfie Check-In computes exact Haversine distance against tenant_branches (anti-spoofing server clock) & syncs Explanation with Approvals', async () => {
     // HQ Branch is at (10.7745, 106.7035) with radius 150m.
-    // Check-in 1: Inside geofence (~35m away: 10.7747, 106.7037) on 2026-11-02 08:25 (+07:00)
+    // Check-in 1: Inside geofence (~35m away: 10.7747, 106.7037); server ignores spoofed client timestamps
     const inFence = await apiRequest(harness.baseUrl, '/api/v1/attendance/check-in', {
       method: 'POST',
       token: requesterStaff.token,
       tenantSlug: tenantA.slug,
       body: {
-        work_date: '2026-11-02',
-        timestamp: '2026-11-02T01:25:00.000Z', // 08:25 ICT (on time for 08:30 shift)
+        work_date: '2020-01-01', // ignored by server anti-spoofing
+        timestamp: '2020-01-01T01:25:00.000Z', // ignored by server anti-spoofing
         latitude: 10.7747,
         longitude: 106.7037,
+        accuracy_meters: 15,
         selfie_data_url: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
         device_info: 'Chrome 131 Desktop WebRTC',
       },
     });
     assert.equal(inFence.status, 201);
+    assert.notEqual(String(inFence.json.data.work_date).slice(0, 10), '2020-01-01', 'Server must ignore spoofed client work_date');
     assert.equal(inFence.json.data.within_geofence, true);
     assert.ok(inFence.json.data.distance_meters < 150, `Expected <150m, got ${inFence.json.data.distance_meters}`);
-    assert.equal(inFence.json.data.late_minutes, 0);
 
-    // Check-out on 2026-11-02 18:30 (+07:00) -> 9h net worked (1h OT)
+    // Check-out inside geofence (work_units computed server-side, never from client keep_full_unit)
     const outFence = await apiRequest(harness.baseUrl, '/api/v1/attendance/check-out', {
       method: 'POST',
       token: requesterStaff.token,
       tenantSlug: tenantA.slug,
       body: {
-        work_date: '2026-11-02',
-        timestamp: '2026-11-02T11:30:00.000Z', // 18:30 ICT
         latitude: 10.7746,
         longitude: 106.7036,
+        accuracy_meters: 15,
+        keep_full_unit: true, // ignored by server anti-spoofing
       },
     });
     assert.equal(outFence.status, 200);
-    assert.equal(outFence.json.data.work_units, 1);
-    assert.ok(outFence.json.data.overtime_hours >= 0.9);
+    assert.ok(typeof outFence.json.data.work_units === 'number');
 
-    // Check-in 2: Outside geofence (~2.5km away: 10.7950, 106.7150) on 2026-11-03
+    // Check-in 2 (under default flexible geofence mode): Outside geofence (~2.5km away: 10.7950, 106.7150) logs distance without blocking
     const outOfGeo = await apiRequest(harness.baseUrl, '/api/v1/attendance/check-in', {
       method: 'POST',
       token: requesterStaff.token,
       tenantSlug: tenantA.slug,
       body: {
-        work_date: '2026-11-03',
-        timestamp: '2026-11-03T02:10:00.000Z', // 09:10 ICT (40 mins late > 15m grace)
         latitude: 10.7950,
         longitude: 106.7150,
+        accuracy_meters: 20,
       },
     });
     assert.equal(outOfGeo.status, 201);
     assert.equal(outOfGeo.json.data.within_geofence, false);
     assert.ok(outOfGeo.json.data.distance_meters > 1500);
     assert.equal(outOfGeo.json.data.status, 'out_of_geofence');
-    assert.equal(outOfGeo.json.data.late_minutes, 40);
+    const serverWorkDate = String(outOfGeo.json.data.work_date).slice(0, 10);
 
     // Submit Attendance Explanation -> automatically creates linked Approval Request
     const expRes = await apiRequest(harness.baseUrl, '/api/v1/attendance/explanations', {
@@ -576,7 +575,7 @@ describe('Wave 2 Phase 3: Dynamic N-Step Approvals, HRM 360°, GPS Attendance, P
       token: requesterStaff.token,
       tenantSlug: tenantA.slug,
       body: {
-        work_date: '2026-11-03',
+        work_date: serverWorkDate,
         explanation_type: 'business_trip',
         requested_work_units: 1,
         reason: 'Đi họp trực tiếp tại văn phòng khách hàng Quận Bình Thạnh',

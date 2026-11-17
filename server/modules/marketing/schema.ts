@@ -26,6 +26,14 @@ export const MARKETING_TABLES = [
   'mkt_ai_bot_configs',
   'mkt_social_conversations',
   'mkt_social_messages',
+  'mkt_campaign_reminders',
+  'mkt_web_heatmaps',
+  'mkt_zalo_oa_configs',
+  'mkt_zalo_templates',
+  'mkt_automation_scenarios',
+  'mkt_template_acl',
+  'mkt_media_assets',
+  'mkt_ai_training_docs',
 ] as const;
 
 const initializedPools = new WeakSet<object>();
@@ -508,6 +516,219 @@ const POSTGRES_MARKETING_DDL = `
   );
   CREATE INDEX IF NOT EXISTS idx_mkt_socmsg_lookup ON mkt_social_messages(tenant_id, conversation_id, created_at ASC);
 
+  CREATE TABLE IF NOT EXISTS mkt_campaign_reminders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    campaign_id UUID NOT NULL,
+    step_order INTEGER NOT NULL DEFAULT 1,
+    trigger_condition VARCHAR(40) NOT NULL DEFAULT 'no_open',
+    wait_hours INTEGER NOT NULL DEFAULT 24,
+    subject VARCHAR(255) NOT NULL DEFAULT '',
+    template_id UUID,
+    channel VARCHAR(20) NOT NULL DEFAULT 'email',
+    dispatched_count INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_campaign_reminders_tenant_id UNIQUE (tenant_id, id),
+    CONSTRAINT fk_mkt_camp_rem_campaign FOREIGN KEY (tenant_id, campaign_id) REFERENCES mkt_campaigns(tenant_id, id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_mkt_camp_rem_lookup ON mkt_campaign_reminders(tenant_id, campaign_id, step_order ASC);
+
+  CREATE TABLE IF NOT EXISTS mkt_web_heatmaps (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    property_id UUID NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    page_url_pattern VARCHAR(500) NOT NULL DEFAULT '/',
+    device_filter VARCHAR(30) NOT NULL DEFAULT 'all',
+    snapshot_html TEXT,
+    viewport_width INTEGER NOT NULL DEFAULT 1440,
+    viewport_height INTEGER NOT NULL DEFAULT 900,
+    click_count INTEGER NOT NULL DEFAULT 0,
+    scroll_avg_pct INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_web_heatmaps_tenant_id UNIQUE (tenant_id, id),
+    CONSTRAINT fk_mkt_webhm_prop FOREIGN KEY (tenant_id, property_id) REFERENCES mkt_web_properties(tenant_id, id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_mkt_webhm_lookup ON mkt_web_heatmaps(tenant_id, property_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS mkt_zalo_oa_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    oa_id VARCHAR(100) NOT NULL DEFAULT '',
+    oa_name VARCHAR(200) NOT NULL DEFAULT 'Zalo Official Account',
+    app_id VARCHAR(100) NOT NULL DEFAULT '',
+    status VARCHAR(30) NOT NULL DEFAULT 'connected',
+    daily_quota INTEGER NOT NULL DEFAULT 1000,
+    sent_today INTEGER NOT NULL DEFAULT 0,
+    quality_rating VARCHAR(30) NOT NULL DEFAULT 'high',
+    webhook_secret VARCHAR(120),
+    settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_zalo_oa_configs_tenant_id UNIQUE (tenant_id, id),
+    CONSTRAINT uk_mkt_zalo_oa_per_tenant UNIQUE (tenant_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS mkt_zalo_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    oa_id VARCHAR(100),
+    template_code VARCHAR(100) NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    template_type VARCHAR(40) NOT NULL DEFAULT 'zns_transaction',
+    status VARCHAR(30) NOT NULL DEFAULT 'approved',
+    price_vnd INTEGER NOT NULL DEFAULT 250,
+    content_body TEXT NOT NULL DEFAULT '',
+    params_schema_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    buttons_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    preview_url TEXT,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    delivered_count INTEGER NOT NULL DEFAULT 0,
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_zalo_templates_tenant_id UNIQUE (tenant_id, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mkt_zalo_tpl_tenant ON mkt_zalo_templates(tenant_id, status, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS mkt_automation_scenarios (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name VARCHAR(200) NOT NULL,
+    channel VARCHAR(30) NOT NULL DEFAULT 'messenger',
+    trigger_type VARCHAR(50) NOT NULL DEFAULT 'keyword',
+    keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    nodes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    edges_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    matched_count INTEGER NOT NULL DEFAULT 0,
+    converted_count INTEGER NOT NULL DEFAULT 0,
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_automation_scenarios_tenant_id UNIQUE (tenant_id, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mkt_auto_scen_tenant ON mkt_automation_scenarios(tenant_id, channel, is_active);
+
+  CREATE TABLE IF NOT EXISTS mkt_template_acl (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    template_id UUID NOT NULL,
+    scope_type VARCHAR(30) NOT NULL DEFAULT 'role',
+    scope_target_id VARCHAR(120) NOT NULL,
+    scope_label VARCHAR(150),
+    permission_level VARCHAR(20) NOT NULL DEFAULT 'view',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_template_acl_tenant_id UNIQUE (tenant_id, id),
+    CONSTRAINT uk_mkt_template_acl_target UNIQUE (tenant_id, template_id, scope_type, scope_target_id),
+    CONSTRAINT fk_mkt_tpl_acl_template FOREIGN KEY (tenant_id, template_id) REFERENCES mkt_email_templates(tenant_id, id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS mkt_media_assets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    folder_name VARCHAR(100) NOT NULL DEFAULT 'Chung',
+    file_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(80) NOT NULL DEFAULT 'image/png',
+    url TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    width_px INTEGER,
+    height_px INTEGER,
+    alt_text VARCHAR(255),
+    tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_media_assets_tenant_id UNIQUE (tenant_id, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mkt_media_assets_tenant ON mkt_media_assets(tenant_id, folder_name, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS mkt_ai_training_docs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    doc_type VARCHAR(40) NOT NULL DEFAULT 'faq',
+    source_url TEXT,
+    content_text TEXT NOT NULL DEFAULT '',
+    chunk_count INTEGER NOT NULL DEFAULT 1,
+    token_count INTEGER NOT NULL DEFAULT 0,
+    status VARCHAR(30) NOT NULL DEFAULT 'indexed',
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT uk_mkt_ai_training_docs_tenant_id UNIQUE (tenant_id, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mkt_ai_docs_tenant ON mkt_ai_training_docs(tenant_id, status, updated_at DESC);
+
+  ALTER TABLE mkt_email_templates ADD COLUMN IF NOT EXISTS saved_blocks_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_email_templates ADD COLUMN IF NOT EXISTS thumbnail_url TEXT;
+  ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS fallback_vars_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+  ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS throttle_per_minute INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS ab_winner_criteria VARCHAR(40) NOT NULL DEFAULT 'open_rate';
+  ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS ab_test_hours INTEGER NOT NULL DEFAULT 4;
+  ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS pre_send_score INTEGER NOT NULL DEFAULT 100;
+  ALTER TABLE mkt_flows ADD COLUMN IF NOT EXISTS settings_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+  ALTER TABLE mkt_custom_events ADD COLUMN IF NOT EXISTS webhook_secret VARCHAR(120);
+  ALTER TABLE mkt_surveys ADD COLUMN IF NOT EXISTS redirect_rules_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_surveys ADD COLUMN IF NOT EXISTS thank_you_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+  ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS geo_country VARCHAR(60) NOT NULL DEFAULT 'VN';
+  ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS geo_city VARCHAR(100);
+  ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS browser VARCHAR(60);
+  ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS os VARCHAR(60);
+  ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS duration_seconds INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS step_order INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS trigger_condition VARCHAR(40) NOT NULL DEFAULT 'no_open';
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS wait_hours INTEGER NOT NULL DEFAULT 24;
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS subject VARCHAR(255) NOT NULL DEFAULT '';
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS template_id UUID;
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS channel VARCHAR(20) NOT NULL DEFAULT 'email';
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS dispatched_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS page_url_pattern VARCHAR(500) NOT NULL DEFAULT '/';
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS device_filter VARCHAR(30) NOT NULL DEFAULT 'all';
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS snapshot_html TEXT;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS viewport_width INTEGER NOT NULL DEFAULT 1440;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS viewport_height INTEGER NOT NULL DEFAULT 900;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS click_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS scroll_avg_pct INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+  ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS oa_id VARCHAR(100) NOT NULL DEFAULT '';
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS oa_name VARCHAR(200) NOT NULL DEFAULT 'Zalo Official Account';
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS app_id VARCHAR(100) NOT NULL DEFAULT '';
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'connected';
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS daily_quota INTEGER NOT NULL DEFAULT 1000;
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS sent_today INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS quality_rating VARCHAR(30) NOT NULL DEFAULT 'high';
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS webhook_secret VARCHAR(120);
+  ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS settings_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS oa_id VARCHAR(100);
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS template_code VARCHAR(100) NOT NULL DEFAULT '';
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS template_type VARCHAR(40) NOT NULL DEFAULT 'zns_transaction';
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'approved';
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS price_vnd INTEGER NOT NULL DEFAULT 250;
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS content_body TEXT NOT NULL DEFAULT '';
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS params_schema_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS buttons_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS preview_url TEXT;
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS sent_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS delivered_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS channel VARCHAR(30) NOT NULL DEFAULT 'messenger';
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS trigger_type VARCHAR(50) NOT NULL DEFAULT 'keyword';
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS nodes_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS edges_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS settings_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS matched_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS converted_count INTEGER NOT NULL DEFAULT 0;
+
   DO $$
   DECLARE
     tbl TEXT;
@@ -537,7 +758,15 @@ const POSTGRES_MARKETING_DDL = `
       'mkt_web_events',
       'mkt_ai_bot_configs',
       'mkt_social_conversations',
-      'mkt_social_messages'
+      'mkt_social_messages',
+      'mkt_campaign_reminders',
+      'mkt_web_heatmaps',
+      'mkt_zalo_oa_configs',
+      'mkt_zalo_templates',
+      'mkt_automation_scenarios',
+      'mkt_template_acl',
+      'mkt_media_assets',
+      'mkt_ai_training_docs'
     ]
     LOOP
       EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', tbl);
@@ -982,12 +1211,223 @@ const MARIADB_MARKETING_STATEMENTS: string[] = [
     UNIQUE KEY uk_mkt_social_messages_tenant_id (tenant_id, id),
     INDEX idx_mkt_socmsg_lookup (tenant_id, conversation_id, created_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_campaign_reminders (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    campaign_id VARCHAR(36) NOT NULL,
+    step_order INT NOT NULL DEFAULT 1,
+    trigger_condition VARCHAR(40) NOT NULL DEFAULT 'no_open',
+    wait_hours INT NOT NULL DEFAULT 24,
+    subject VARCHAR(255) NOT NULL DEFAULT '',
+    template_id VARCHAR(36) NULL,
+    channel VARCHAR(20) NOT NULL DEFAULT 'email',
+    dispatched_count INT NOT NULL DEFAULT 0,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_campaign_reminders_tenant_id (tenant_id, id),
+    INDEX idx_mkt_camp_rem_lookup (tenant_id, campaign_id, step_order)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_web_heatmaps (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    property_id VARCHAR(36) NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    page_url_pattern VARCHAR(500) NOT NULL DEFAULT '/',
+    device_filter VARCHAR(30) NOT NULL DEFAULT 'all',
+    snapshot_html MEDIUMTEXT NULL,
+    viewport_width INT NOT NULL DEFAULT 1440,
+    viewport_height INT NOT NULL DEFAULT 900,
+    click_count INT NOT NULL DEFAULT 0,
+    scroll_avg_pct INT NOT NULL DEFAULT 0,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    metadata_json JSON NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_web_heatmaps_tenant_id (tenant_id, id),
+    INDEX idx_mkt_webhm_lookup (tenant_id, property_id, created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_zalo_oa_configs (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    oa_id VARCHAR(100) NOT NULL DEFAULT '',
+    oa_name VARCHAR(200) NOT NULL DEFAULT 'Zalo Official Account',
+    app_id VARCHAR(100) NOT NULL DEFAULT '',
+    status VARCHAR(30) NOT NULL DEFAULT 'connected',
+    daily_quota INT NOT NULL DEFAULT 1000,
+    sent_today INT NOT NULL DEFAULT 0,
+    quality_rating VARCHAR(30) NOT NULL DEFAULT 'high',
+    webhook_secret VARCHAR(120) NULL,
+    settings_json JSON NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_zalo_oa_configs_tenant_id (tenant_id, id),
+    UNIQUE KEY uk_mkt_zalo_oa_per_tenant (tenant_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_zalo_templates (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    oa_id VARCHAR(100) NULL,
+    template_code VARCHAR(100) NOT NULL DEFAULT '',
+    name VARCHAR(200) NOT NULL,
+    template_type VARCHAR(40) NOT NULL DEFAULT 'zns_transaction',
+    status VARCHAR(30) NOT NULL DEFAULT 'approved',
+    price_vnd INT NOT NULL DEFAULT 250,
+    content_body TEXT NULL,
+    params_schema_json JSON NULL,
+    buttons_json JSON NULL,
+    preview_url TEXT NULL,
+    sent_count INT NOT NULL DEFAULT 0,
+    delivered_count INT NOT NULL DEFAULT 0,
+    created_by VARCHAR(36) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_zalo_templates_tenant_id (tenant_id, id),
+    INDEX idx_mkt_zalo_tpl_tenant (tenant_id, status, created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_automation_scenarios (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    channel VARCHAR(30) NOT NULL DEFAULT 'messenger',
+    trigger_type VARCHAR(50) NOT NULL DEFAULT 'keyword',
+    keywords_json JSON NULL,
+    nodes_json JSON NULL,
+    edges_json JSON NULL,
+    settings_json JSON NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    matched_count INT NOT NULL DEFAULT 0,
+    converted_count INT NOT NULL DEFAULT 0,
+    created_by VARCHAR(36) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_automation_scenarios_tenant_id (tenant_id, id),
+    INDEX idx_mkt_auto_scen_tenant (tenant_id, channel, is_active)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_template_acl (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    template_id VARCHAR(36) NOT NULL,
+    scope_type VARCHAR(30) NOT NULL DEFAULT 'role',
+    scope_target_id VARCHAR(120) NOT NULL,
+    scope_label VARCHAR(150) NULL,
+    permission_level VARCHAR(20) NOT NULL DEFAULT 'view',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_template_acl_tenant_id (tenant_id, id),
+    UNIQUE KEY uk_mkt_template_acl_target (tenant_id, template_id, scope_type, scope_target_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_media_assets (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    folder_name VARCHAR(100) NOT NULL DEFAULT 'Chung',
+    file_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(80) NOT NULL DEFAULT 'image/png',
+    url MEDIUMTEXT NOT NULL,
+    size_bytes INT NOT NULL DEFAULT 0,
+    width_px INT NULL,
+    height_px INT NULL,
+    alt_text VARCHAR(255) NULL,
+    tags_json JSON NULL,
+    created_by VARCHAR(36) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_media_assets_tenant_id (tenant_id, id),
+    INDEX idx_mkt_media_assets_tenant (tenant_id, folder_name, created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mkt_ai_training_docs (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    doc_type VARCHAR(40) NOT NULL DEFAULT 'faq',
+    source_url TEXT NULL,
+    content_text MEDIUMTEXT NULL,
+    chunk_count INT NOT NULL DEFAULT 1,
+    token_count INT NOT NULL DEFAULT 0,
+    status VARCHAR(30) NOT NULL DEFAULT 'indexed',
+    metadata_json JSON NULL,
+    created_by VARCHAR(36) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_mkt_ai_training_docs_tenant_id (tenant_id, id),
+    INDEX idx_mkt_ai_docs_tenant (tenant_id, status, updated_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+];
+
+const MARIADB_MARKETING_ALTERS: string[] = [
+  "ALTER TABLE mkt_email_templates ADD COLUMN IF NOT EXISTS saved_blocks_json JSON NULL",
+  "ALTER TABLE mkt_email_templates ADD COLUMN IF NOT EXISTS thumbnail_url TEXT NULL",
+  "ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS fallback_vars_json JSON NULL",
+  "ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS throttle_per_minute INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS ab_winner_criteria VARCHAR(40) NOT NULL DEFAULT 'open_rate'",
+  "ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS ab_test_hours INT NOT NULL DEFAULT 4",
+  "ALTER TABLE mkt_campaigns ADD COLUMN IF NOT EXISTS pre_send_score INT NOT NULL DEFAULT 100",
+  "ALTER TABLE mkt_flows ADD COLUMN IF NOT EXISTS settings_json JSON NULL",
+  "ALTER TABLE mkt_custom_events ADD COLUMN IF NOT EXISTS webhook_secret VARCHAR(120) NULL",
+  "ALTER TABLE mkt_surveys ADD COLUMN IF NOT EXISTS redirect_rules_json JSON NULL",
+  "ALTER TABLE mkt_surveys ADD COLUMN IF NOT EXISTS thank_you_json JSON NULL",
+  "ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS geo_country VARCHAR(60) NOT NULL DEFAULT 'VN'",
+  "ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS geo_city VARCHAR(100) NULL",
+  "ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS browser VARCHAR(60) NULL",
+  "ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS os VARCHAR(60) NULL",
+  "ALTER TABLE mkt_web_sessions ADD COLUMN IF NOT EXISTS duration_seconds INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS step_order INT NOT NULL DEFAULT 1",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS trigger_condition VARCHAR(40) NOT NULL DEFAULT 'no_open'",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS wait_hours INT NOT NULL DEFAULT 24",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS subject VARCHAR(255) NOT NULL DEFAULT ''",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS template_id VARCHAR(36) NULL",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS channel VARCHAR(20) NOT NULL DEFAULT 'email'",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS dispatched_count INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_campaign_reminders ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS page_url_pattern VARCHAR(500) NOT NULL DEFAULT '/'",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS device_filter VARCHAR(30) NOT NULL DEFAULT 'all'",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS snapshot_html MEDIUMTEXT NULL",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS viewport_width INT NOT NULL DEFAULT 1440",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS viewport_height INT NOT NULL DEFAULT 900",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS click_count INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS scroll_avg_pct INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1",
+  "ALTER TABLE mkt_web_heatmaps ADD COLUMN IF NOT EXISTS metadata_json JSON NULL",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS oa_id VARCHAR(100) NOT NULL DEFAULT ''",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS oa_name VARCHAR(200) NOT NULL DEFAULT 'Zalo Official Account'",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS app_id VARCHAR(100) NOT NULL DEFAULT ''",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'connected'",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS daily_quota INT NOT NULL DEFAULT 1000",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS sent_today INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS quality_rating VARCHAR(30) NOT NULL DEFAULT 'high'",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS webhook_secret VARCHAR(120) NULL",
+  "ALTER TABLE mkt_zalo_oa_configs ADD COLUMN IF NOT EXISTS settings_json JSON NULL",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS oa_id VARCHAR(100) NULL",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS template_code VARCHAR(100) NOT NULL DEFAULT ''",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS template_type VARCHAR(40) NOT NULL DEFAULT 'zns_transaction'",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'approved'",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS price_vnd INT NOT NULL DEFAULT 250",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS content_body TEXT NULL",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS params_schema_json JSON NULL",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS buttons_json JSON NULL",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS preview_url TEXT NULL",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS sent_count INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_zalo_templates ADD COLUMN IF NOT EXISTS delivered_count INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS channel VARCHAR(30) NOT NULL DEFAULT 'messenger'",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS trigger_type VARCHAR(50) NOT NULL DEFAULT 'keyword'",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS keywords_json JSON NULL",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS nodes_json JSON NULL",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS edges_json JSON NULL",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS settings_json JSON NULL",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS matched_count INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS converted_count INT NOT NULL DEFAULT 0",
 ];
 
 async function runSchemaInitOnClient(client: DbClient, isMariaDb: boolean): Promise<void> {
   if (isMariaDb) {
     for (const stmt of MARIADB_MARKETING_STATEMENTS) {
       await client.query(stmt);
+    }
+    for (const alter of MARIADB_MARKETING_ALTERS) {
+      try {
+        await client.query(alter);
+      } catch {
+        // Column may already exist on non-IF-NOT-EXISTS engines
+      }
     }
     return;
   }

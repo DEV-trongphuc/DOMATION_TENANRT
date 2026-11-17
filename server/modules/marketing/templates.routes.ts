@@ -33,8 +33,10 @@ function mapTemplateRow(row: Record<string, unknown>) {
     preheader: String(row.preheader || ''),
     category: String(row.category || 'general'),
     blocks: parseJsonCol<EmailBlockDto[]>(row.blocks_json, []),
+    saved_blocks: parseJsonCol<EmailBlockDto[]>(row.saved_blocks_json, []),
     body_style: parseJsonCol<EmailBodyStyleDto>(row.body_style, {}),
     compiled_html: String(row.compiled_html || ''),
+    thumbnail_url: row.thumbnail_url ? String(row.thumbnail_url) : null,
     spam_score: Number(row.spam_score || 0),
     merge_tags: parseJsonCol<string[]>(row.merge_tags, []),
     visibility: String(row.visibility || 'company'),
@@ -193,6 +195,287 @@ templatesRouter.post('/compile', requirePermission('mkt_templates', 'view'), asy
     });
   } catch (err: any) {
     sendApiError(res, 500, 'COMPILE_EMAIL_FAILED', err?.message || 'Không thể biên dịch HTML Email.');
+  }
+});
+
+// EmailValidationPanel: Link & Deliverability Checker + SPF/DKIM Vault Status
+templatesRouter.post('/validate', requirePermission('mkt_templates', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const blocks: EmailBlockDto[] = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
+    const bodyStyle: EmailBodyStyleDto =
+      req.body?.body_style && typeof req.body.body_style === 'object' ? req.body.body_style : {};
+    const subject = String(req.body?.subject || '');
+    const compiledHtml =
+      typeof req.body?.compiled_html === 'string' && req.body.compiled_html.trim()
+        ? req.body.compiled_html
+        : compileEmailBlocksToHtml(blocks, bodyStyle, subject || 'DOMATION Email');
+
+    const spam = analyzeEmailSpamScore(subject, blocks, compiledHtml);
+    const vaultInfo = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const vault = await readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']);
+      return {
+        configured: vault.configured,
+        provider: vault.integrationType,
+        spf_verified: Boolean(vault.config.spf_verified ?? vault.configured),
+        dkim_verified: Boolean(vault.config.dkim_verified ?? vault.configured),
+      };
+    });
+
+    const links: Array<{ blockId: string; label: string; url: string; valid: boolean; reason?: string }> = [];
+    const missingAltImages: string[] = [];
+
+    for (const b of blocks) {
+      if (b.type === 'button' || b.type === 'hero_banner' || b.type === 'product_card' || b.type === 'pricing_card' || b.type === 'video_thumbnail') {
+        const rawUrl = String(b.url || '').trim();
+        if (!rawUrl || rawUrl === '#') {
+          links.push({
+            blockId: b.id,
+            label: String(b.buttonLabel || b.title || b.type),
+            url: rawUrl || '(trống)',
+            valid: false,
+            reason: 'Chưa cấu hình URL đích thực tế',
+          });
+        } else {
+          const ok = /^https?:\/\//i.test(rawUrl) || rawUrl.startsWith('{{');
+          links.push({
+            blockId: b.id,
+            label: String(b.buttonLabel || b.title || b.type),
+            url: rawUrl,
+            valid: ok,
+            reason: ok ? undefined : 'URL cần bắt đầu bằng https:// hoặc biến động {{...}}',
+          });
+        }
+      }
+      if (b.type === 'image' && !String(b.title || '').trim()) {
+        missingAltImages.push(b.id);
+      }
+    }
+
+    const deliverabilityScore = Math.max(0, 100 - spam.score);
+    res.json({
+      success: true,
+      data: {
+        deliverability_score: deliverabilityScore,
+        spam_risk_score: spam.score,
+        deliverability_grade: spam.deliverabilityGrade,
+        has_unsubscribe_tag: compiledHtml.includes('{{unsubscribe_url}}'),
+        vault_status: vaultInfo,
+        links,
+        missing_alt_block_ids: missingAltImages,
+        issues: spam.issues,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'VALIDATE_EMAIL_FAILED', err?.message || 'Không thể kiểm tra chất lượng Email.');
+  }
+});
+
+// ImageLibraryModal: Tenant Media Asset Library CRUD
+templatesRouter.get('/media', requirePermission('mkt_templates', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const folder = req.query.folder ? String(req.query.folder).trim() : '';
+    const q = req.query.q ? String(req.query.q).trim().toLowerCase() : '';
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      let sql = 'SELECT * FROM mkt_media_assets WHERE tenant_id = $1';
+      const params: unknown[] = [ctx.tenantId];
+      if (folder && folder !== 'all') {
+        params.push(folder);
+        sql += ` AND folder_name = $${params.length}`;
+      }
+      if (q) {
+        params.push(`%${q}%`);
+        sql += ` AND LOWER(file_name) LIKE $${params.length}`;
+      }
+      sql += ' ORDER BY created_at DESC LIMIT 200';
+      const [itemsRes, foldersRes] = await Promise.all([
+        client.query(sql, params),
+        client.query<{ folder_name: string; cnt: number }>(
+          `SELECT folder_name, COUNT(*)::int AS cnt
+           FROM mkt_media_assets
+           WHERE tenant_id = $1
+           GROUP BY folder_name
+           ORDER BY folder_name ASC`,
+          [ctx.tenantId]
+        ),
+      ]);
+      return {
+        items: itemsRes.rows.map((r) => ({
+          ...r,
+          tags: parseJsonCol<string[]>(r.tags_json, []),
+        })),
+        folders: foldersRes.rows,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_MEDIA_FAILED', err?.message || 'Không thể tải thư viện hình ảnh.');
+  }
+});
+
+templatesRouter.post('/media', requirePermission('mkt_templates', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const url = String(req.body?.url || '').trim();
+    const fileName = String(req.body?.file_name || 'email-asset.png').trim();
+    if (!url) {
+      sendApiError(res, 422, 'MEDIA_URL_REQUIRED', 'Vui lòng cung cấp URL hoặc dữ liệu hình ảnh.');
+      return;
+    }
+    const folderName = String(req.body?.folder_name || 'Chung').trim() || 'Chung';
+    const mimeType = String(req.body?.mime_type || 'image/png').trim();
+    const sizeBytes = Math.max(0, Math.round(Number(req.body?.size_bytes || 0)));
+    const widthPx = req.body?.width_px ? Math.round(Number(req.body.width_px)) : null;
+    const heightPx = req.body?.height_px ? Math.round(Number(req.body.height_px)) : null;
+    const altText = req.body?.alt_text ? String(req.body.alt_text).trim() : fileName;
+    const tags = Array.isArray(req.body?.tags) ? req.body.tags.map(String) : [];
+
+    const id = crypto.randomUUID();
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO mkt_media_assets (
+           id, tenant_id, folder_name, file_name, mime_type, url,
+           size_bytes, width_px, height_px, alt_text, tags_json, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)`,
+        [
+          id,
+          ctx.tenantId,
+          folderName,
+          fileName,
+          mimeType,
+          url,
+          sizeBytes,
+          widthPx,
+          heightPx,
+          altText,
+          JSON.stringify(tags),
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_media_assets WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPLOAD_MEDIA_FAILED', err?.message || 'Không thể thêm hình ảnh vào thư viện.');
+  }
+});
+
+templatesRouter.delete('/media/:assetId', requirePermission('mkt_templates', 'delete'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM mkt_media_assets WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.assetId,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_MEDIA_FAILED', err?.message || 'Không thể xóa hình ảnh.');
+  }
+});
+
+// QuickSendEmailModal: Direct Personalized Dispatch to Specific Recipients / Leads
+templatesRouter.post('/quick-send', requirePermission('mkt_templates', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const rawRecipients: string[] = Array.isArray(req.body?.recipients)
+      ? req.body.recipients.map((r: unknown) => String(r || '').trim().toLowerCase()).filter((r: string) => r.includes('@'))
+      : String(req.body?.to_email || '')
+          .split(/[,;\s]+/)
+          .map((s) => s.trim().toLowerCase())
+          .filter((s) => s.includes('@'));
+
+    if (rawRecipients.length === 0) {
+      sendApiError(res, 422, 'RECIPIENTS_REQUIRED', 'Vui lòng nhập ít nhất 1 địa chỉ Email người nhận hợp lệ.');
+      return;
+    }
+
+    const fallbackVars: Record<string, string> =
+      req.body?.fallback_vars && typeof req.body.fallback_vars === 'object' ? req.body.fallback_vars : {};
+
+    const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [tenantRes, vault] = await Promise.all([
+        client.query<{ name: string }>('SELECT name FROM tenants WHERE id = $1 LIMIT 1', [ctx.tenantId]),
+        readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']),
+      ]);
+      const tenantName = tenantRes.rows[0]?.name || 'DOMATION';
+
+      let subject = String(req.body?.subject || '').trim();
+      let html = String(req.body?.compiled_html || '').trim();
+      if (req.body?.template_id) {
+        const tRes = await client.query(
+          'SELECT subject, compiled_html, blocks_json, body_style FROM mkt_email_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, String(req.body.template_id)]
+        );
+        const tpl = tRes.rows[0];
+        if (tpl) {
+          if (!subject) subject = String(tpl.subject || '');
+          if (!html) html = String(tpl.compiled_html || '');
+        }
+      }
+      if (!html && Array.isArray(req.body?.blocks)) {
+        html = compileEmailBlocksToHtml(req.body.blocks, req.body?.body_style || {}, subject || 'DOMATION Email');
+      }
+
+      const dispatched: Array<{ email: string; lead_id: string | null; subject: string }> = [];
+      for (const email of rawRecipients.slice(0, 50)) {
+        const lRes = await client.query(
+          'SELECT id, name, phone, email, product_interest, custom_fields FROM leads WHERE tenant_id = $1 AND LOWER(email) = $2 AND is_deleted = false LIMIT 1',
+          [ctx.tenantId, email]
+        );
+        const lead = lRes.rows[0];
+        const renderedSubject = renderMergeTags(
+          subject || 'Thông báo từ {{tenant.name}}',
+          {
+            lead: lead
+              ? { ...lead, custom_fields: parseJsonCol(lead.custom_fields, {}) }
+              : { email, name: fallbackVars['lead.name'] || 'Quý khách' },
+            tenant: { name: tenantName },
+            unsubscribe_url: '#unsubscribe',
+          },
+          fallbackVars
+        );
+
+        if (lead?.id) {
+          await client.query(
+            `INSERT INTO lead_timeline_events (
+               id, tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+             ) VALUES ($1, $2, $3, 'mkt_email_sent', 'communication', $4, 'tenant_admin', $5, $6, $7, $8::jsonb)`,
+            [
+              crypto.randomUUID(),
+              ctx.tenantId,
+              lead.id,
+              ctx.userId,
+              ctx.userName || 'Quick Send',
+              `Gửi nhanh Email: ${renderedSubject}`,
+              `Kênh gửi: ${vault.integrationType || 'vault_sandbox'}`,
+              JSON.stringify({ quick_send: true, email }),
+            ]
+          );
+        }
+        dispatched.push({ email, lead_id: lead?.id ? String(lead.id) : null, subject: renderedSubject });
+      }
+
+      return {
+        sent_count: dispatched.length,
+        provider: vault.integrationType || 'vault_sandbox_queue',
+        vault_configured: vault.configured,
+        dispatched,
+      };
+    });
+
+    res.json({ success: true, data: outcome });
+  } catch (err: any) {
+    sendApiError(res, 500, 'QUICK_SEND_FAILED', err?.message || 'Không thể gửi nhanh Email.');
   }
 });
 
@@ -584,5 +867,122 @@ templatesRouter.post('/:id/test-send', requirePermission('mkt_templates', 'view'
     res.json({ success: true, data: result });
   } catch (err: any) {
     sendApiError(res, 500, 'TEST_SEND_FAILED', err?.message || 'Không thể gửi thử mẫu Email.');
+  }
+});
+
+// TemplateAccessModal: Team / Department / Role / User ACL Sharing
+templatesRouter.get('/:id/acl', requirePermission('mkt_templates', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const tplRes = await client.query(
+        'SELECT id, name, visibility FROM mkt_email_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      if (!tplRes.rows[0]) return null;
+
+      const [aclRes, rolesRes, deptsRes, teamsRes, usersRes] = await Promise.all([
+        client.query(
+          'SELECT * FROM mkt_template_acl WHERE tenant_id = $1 AND template_id = $2 ORDER BY created_at ASC',
+          [ctx.tenantId, req.params.id]
+        ),
+        client.query('SELECT id, name, code FROM tenant_roles WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
+        client.query('SELECT id, name FROM tenant_departments WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
+        client.query('SELECT id, name FROM tenant_teams WHERE tenant_id = $1 ORDER BY name ASC', [ctx.tenantId]),
+        client.query('SELECT id, full_name, email FROM users WHERE tenant_id = $1 AND is_active = true ORDER BY full_name ASC LIMIT 100', [ctx.tenantId]),
+      ]);
+
+      return {
+        template: tplRes.rows[0],
+        acl_entries: aclRes.rows,
+        available_targets: {
+          roles: rolesRes.rows,
+          departments: deptsRes.rows,
+          teams: teamsRes.rows,
+          users: usersRes.rows,
+        },
+      };
+    });
+
+    if (!data) {
+      sendApiError(res, 404, 'TEMPLATE_NOT_FOUND', 'Không tìm thấy mẫu Email.');
+      return;
+    }
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_TEMPLATE_ACL_FAILED', err?.message || 'Không thể tải cấu hình phân quyền mẫu Email.');
+  }
+});
+
+templatesRouter.put('/:id/acl', requirePermission('mkt_templates', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const visibility = ['private', 'team', 'department', 'company'].includes(String(req.body?.visibility || ''))
+      ? String(req.body.visibility)
+      : 'company';
+    const entries: Array<{
+      scope_type?: string;
+      scope_target_id?: string;
+      scope_label?: string;
+      permission_level?: string;
+    }> = Array.isArray(req.body?.entries) ? req.body.entries : [];
+
+    const out = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const ex = await client.query(
+        'SELECT id FROM mkt_email_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      if (!ex.rows[0]) return null;
+
+      await client.query(
+        'UPDATE mkt_email_templates SET visibility = $3, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2',
+        [ctx.tenantId, req.params.id, visibility]
+      );
+      await client.query(
+        'DELETE FROM mkt_template_acl WHERE tenant_id = $1 AND template_id = $2',
+        [ctx.tenantId, req.params.id]
+      );
+
+      for (const item of entries) {
+        const scopeType = ['user', 'department', 'role', 'team'].includes(String(item.scope_type || ''))
+          ? String(item.scope_type)
+          : 'role';
+        const targetId = String(item.scope_target_id || '').trim();
+        if (!targetId) continue;
+        const permLevel = ['view', 'edit', 'manage'].includes(String(item.permission_level || ''))
+          ? String(item.permission_level)
+          : 'view';
+        await client.query(
+          `INSERT INTO mkt_template_acl (
+             id, tenant_id, template_id, scope_type, scope_target_id, scope_label, permission_level
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (tenant_id, template_id, scope_type, scope_target_id)
+           DO UPDATE SET permission_level = EXCLUDED.permission_level, scope_label = EXCLUDED.scope_label`,
+          [
+            crypto.randomUUID(),
+            ctx.tenantId,
+            req.params.id,
+            scopeType,
+            targetId,
+            item.scope_label ? String(item.scope_label) : null,
+            permLevel,
+          ]
+        );
+      }
+
+      const aclRes = await client.query(
+        'SELECT * FROM mkt_template_acl WHERE tenant_id = $1 AND template_id = $2 ORDER BY created_at ASC',
+        [ctx.tenantId, req.params.id]
+      );
+      return { visibility, acl_entries: aclRes.rows };
+    });
+
+    if (!out) {
+      sendApiError(res, 404, 'TEMPLATE_NOT_FOUND', 'Không tìm thấy mẫu Email.');
+      return;
+    }
+    res.json({ success: true, data: out });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_TEMPLATE_ACL_FAILED', err?.message || 'Không thể lưu phân quyền mẫu Email.');
   }
 });

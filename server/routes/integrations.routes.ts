@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
-import { Router, type Request, type Response } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
+import { getDatabasePool } from '../core/database/db-adapter.ts';
 import { withSystemPrivilege, withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
-import { requireTenantAuth, requireRoles, sendApiError } from '../core/security/rbac.ts';
+import { requireAnyPermission, requireTenantAuth, sendApiError } from '../core/security/rbac.ts';
+import { validateAndNormalizePhone } from '../services/phone.service.ts';
 import { encryptTenantSecret, decryptTenantSecret } from '../core/crypto/vault.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import { normalizeTenantSettings, type TenantSettings } from '../core/settings/tenant-settings.ts';
@@ -378,8 +380,27 @@ publicWebhooksRouter.post('/telegram/webhook', handleTelegramWebhook);
 // ============================================================================
 integrationsRouter.use(requireTenantAuth);
 
+const requireIntegrationsView = requireAnyPermission([
+  ['integrations_crm', 'view'],
+  ['integrations_marketing', 'view'],
+  ['settings', 'view'],
+]);
+const requireIntegrationsConfig = requireAnyPermission([
+  ['integrations_crm', 'manage_config'],
+  ['integrations_marketing', 'manage_config'],
+  ['settings', 'manage_config'],
+]);
+const requireCapiView = requireAnyPermission([
+  ['ads_capi', 'view'],
+  ['integrations_crm', 'view'],
+]);
+const requireCapiManage = requireAnyPermission([
+  ['ads_capi', 'manage_config'],
+  ['integrations_crm', 'manage_config'],
+]);
+
 // Overview of Webhooks, Vault Integrations, DLQ & Recent CAPI Logs
-integrationsRouter.get('/overview', requireRoles('tenant_admin'), async (_req, res) => {
+integrationsRouter.get('/overview', requireIntegrationsView, async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -475,7 +496,7 @@ integrationsRouter.get('/overview', requireRoles('tenant_admin'), async (_req, r
 });
 
 // Create Inbound or Outbound Webhook (Op 20)
-integrationsRouter.post('/webhooks', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/webhooks', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const {
@@ -527,7 +548,7 @@ integrationsRouter.post('/webhooks', requireRoles('tenant_admin'), async (req, r
   }
 });
 
-integrationsRouter.patch('/webhooks/:id', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.patch('/webhooks/:id', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { name, url, field_mappings, subscribed_events, is_active, rotate_secret } = req.body || {};
@@ -566,7 +587,7 @@ integrationsRouter.patch('/webhooks/:id', requireRoles('tenant_admin'), async (r
   }
 });
 
-integrationsRouter.delete('/webhooks/:id', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.delete('/webhooks/:id', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -583,7 +604,7 @@ integrationsRouter.delete('/webhooks/:id', requireRoles('tenant_admin'), async (
 });
 
 // 6.2 Replay or Delete Failed Webhook from Dead Letter Queue (DLQ)
-integrationsRouter.post('/webhooks/dlq/:id/replay', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/webhooks/dlq/:id/replay', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const outcome = await replayWebhookDlqItem(ctx.tenantId, req.params.id);
@@ -597,7 +618,7 @@ integrationsRouter.post('/webhooks/dlq/:id/replay', requireRoles('tenant_admin')
   }
 });
 
-integrationsRouter.delete('/webhooks/dlq/:id', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.delete('/webhooks/dlq/:id', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -739,16 +760,16 @@ async function handleSaveVaultIntegration(
 }
 
 // Save Encrypted Third-Party Credentials in AES-256-GCM Vault (`PUT /vault/:type` & `POST /vault`)
-integrationsRouter.put('/vault/:type', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.put('/vault/:type', requireIntegrationsConfig, async (req, res) => {
   await handleSaveVaultIntegration(req, res, req.params.type);
 });
 
-integrationsRouter.post('/vault', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/vault', requireIntegrationsConfig, async (req, res) => {
   await handleSaveVaultIntegration(req, res);
 });
 
 // 7.1 Dispatch Live / Sandbox Meta Conversions API Test Event
-integrationsRouter.post('/capi/test-event', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/capi/test-event', requireCapiManage, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const {
@@ -841,7 +862,7 @@ integrationsRouter.post('/zalo/command', async (req, res) => {
   }
 });
 
-integrationsRouter.post('/zalo/refresh-token', requireRoles('tenant_admin'), async (_req, res) => {
+integrationsRouter.post('/zalo/refresh-token', requireIntegrationsConfig, async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const out = await refreshExpiringZaloTokens(ctx.tenantId);
@@ -851,7 +872,7 @@ integrationsRouter.post('/zalo/refresh-token', requireRoles('tenant_admin'), asy
   }
 });
 
-integrationsRouter.post('/smtp/test', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/smtp/test', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const to = req.body?.to ? String(req.body.to).trim() : undefined;
@@ -879,7 +900,7 @@ integrationsRouter.post('/smtp/test', requireRoles('tenant_admin'), async (req, 
 });
 
 // Unified Google Apps Script & Email Configuration + Multi-Category Test Endpoints
-integrationsRouter.get('/email/config', requireRoles('tenant_admin'), async (_req, res) => {
+integrationsRouter.get('/email/config', requireIntegrationsView, async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const row = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -905,7 +926,7 @@ integrationsRouter.get('/email/config', requireRoles('tenant_admin'), async (_re
   }
 });
 
-integrationsRouter.post('/email/config', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/email/config', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const {
@@ -945,7 +966,7 @@ integrationsRouter.post('/email/config', requireRoles('tenant_admin'), async (re
   }
 });
 
-integrationsRouter.post('/email/test', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/email/test', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const body = req.body || {};
@@ -1024,7 +1045,7 @@ integrationsRouter.post('/email/test', requireRoles('tenant_admin'), async (req,
 });
 
 // Multi-Account Meta Ads REST CRUD + Discover + Sync
-integrationsRouter.post('/meta-ads/discover', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/meta-ads/discover', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const out = await withTenantTransaction(ctx.tenantId, (client) =>
@@ -1040,7 +1061,7 @@ integrationsRouter.post('/meta-ads/discover', requireRoles('tenant_admin'), asyn
   }
 });
 
-integrationsRouter.get('/meta-ads/accounts', async (_req, res) => {
+integrationsRouter.get('/meta-ads/accounts', requireIntegrationsView, async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const summary = await withTenantTransaction(ctx.tenantId, (client) => getMetaAdsConfigSummary(client, ctx.tenantId));
@@ -1050,7 +1071,7 @@ integrationsRouter.get('/meta-ads/accounts', async (_req, res) => {
   }
 });
 
-integrationsRouter.post('/meta-ads/accounts', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/meta-ads/accounts', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const out = await withTenantTransaction(ctx.tenantId, (client) =>
@@ -1074,7 +1095,7 @@ integrationsRouter.post('/meta-ads/accounts', requireRoles('tenant_admin'), asyn
   }
 });
 
-integrationsRouter.put('/meta-ads/accounts/:id', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.put('/meta-ads/accounts/:id', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const out = await withTenantTransaction(ctx.tenantId, (client) =>
@@ -1097,7 +1118,7 @@ integrationsRouter.put('/meta-ads/accounts/:id', requireRoles('tenant_admin'), a
   }
 });
 
-integrationsRouter.patch('/meta-ads/accounts/:id/toggle', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.patch('/meta-ads/accounts/:id/toggle', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const out = await withTenantTransaction(ctx.tenantId, (client) =>
@@ -1113,7 +1134,7 @@ integrationsRouter.patch('/meta-ads/accounts/:id/toggle', requireRoles('tenant_a
   }
 });
 
-integrationsRouter.delete('/meta-ads/accounts/:id', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.delete('/meta-ads/accounts/:id', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const purge = req.query.purge_insights === 'true' || Boolean(req.body?.purge_insights);
@@ -1130,7 +1151,7 @@ integrationsRouter.delete('/meta-ads/accounts/:id', requireRoles('tenant_admin')
   }
 });
 
-integrationsRouter.post('/meta-ads/sync', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/meta-ads/sync', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const accountRef = String(req.body?.account_id || req.body?.ad_account_id || req.query.ad_account_id || '').trim();
@@ -1278,7 +1299,7 @@ integrationsRouter.post('/zalo/updates', async (req, res) => {
 });
 
 // Save Telegram Bot Vault Configuration (respects masked tokens)
-integrationsRouter.post('/telegram/config', requireRoles('tenant_admin'), async (req, res) => {
+integrationsRouter.post('/telegram/config', requireIntegrationsConfig, async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { bot_token = '', chat_id = '', silent_mode = true, enabled = false } = req.body || {};
@@ -1392,5 +1413,703 @@ integrationsRouter.post('/telegram/test', async (req, res) => {
     });
   } catch (err: any) {
     sendApiError(res, 500, 'TELEGRAM_TEST_FAILED', err?.message || 'Không thể kiểm thử Telegram Bot.');
+  }
+});
+
+// ============================================================================
+// Wave A Meta CAPI Full Parity Endpoints (`/api/v1/integrations/capi/*`)
+// ============================================================================
+const capiPoolsInit = new WeakSet<object>();
+const capiPoolsPending = new WeakMap<object, Promise<void>>();
+
+async function ensureCapiWaveASchema(): Promise<void> {
+  const pool = getDatabasePool();
+  if (capiPoolsInit.has(pool)) return;
+  let running = capiPoolsPending.get(pool);
+  if (!running) {
+    running = (async () => {
+      await withSystemPrivilege(async (client) => {
+        if (client.dialect === 'mariadb' || pool.dialect === 'mariadb') {
+          await client.query(`
+            CREATE TABLE IF NOT EXISTS capi_blocked_phones (
+              id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+              tenant_id VARCHAR(36) NOT NULL,
+              phone_normalized VARCHAR(40) NOT NULL,
+              phone_hash VARCHAR(128) NOT NULL,
+              reason TEXT NULL,
+              source VARCHAR(60) NOT NULL DEFAULT 'manual',
+              matched_leads_count INT NOT NULL DEFAULT 0,
+              synced_to_meta TINYINT(1) NOT NULL DEFAULT 0,
+              last_synced_at DATETIME(6) NULL,
+              created_by VARCHAR(36) NULL,
+              created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+              updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+              CONSTRAINT uk_capi_blocked_tenant_id UNIQUE (tenant_id, id),
+              CONSTRAINT uk_capi_blocked_phone UNIQUE (tenant_id, phone_normalized),
+              INDEX idx_capi_blocked_sync (tenant_id, synced_to_meta, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+          `);
+        } else {
+          const pgStmts = [
+            `CREATE TABLE IF NOT EXISTS capi_blocked_phones (
+              id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+              tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+              phone_normalized VARCHAR(40) NOT NULL,
+              phone_hash VARCHAR(128) NOT NULL,
+              reason TEXT,
+              source VARCHAR(60) NOT NULL DEFAULT 'manual',
+              matched_leads_count INTEGER NOT NULL DEFAULT 0,
+              synced_to_meta BOOLEAN NOT NULL DEFAULT false,
+              last_synced_at TIMESTAMPTZ,
+              created_by UUID,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+              CONSTRAINT uk_capi_blocked_tenant_id UNIQUE (tenant_id, id),
+              CONSTRAINT uk_capi_blocked_phone UNIQUE (tenant_id, phone_normalized)
+            )`,
+            `CREATE INDEX IF NOT EXISTS idx_capi_blocked_sync
+              ON capi_blocked_phones (tenant_id, synced_to_meta, created_at DESC)`,
+            `ALTER TABLE capi_blocked_phones ENABLE ROW LEVEL SECURITY`,
+            `ALTER TABLE capi_blocked_phones FORCE ROW LEVEL SECURITY`,
+            `DROP POLICY IF EXISTS tenant_isolation_capi_blocked_phones ON capi_blocked_phones`,
+            `CREATE POLICY tenant_isolation_capi_blocked_phones ON capi_blocked_phones
+              USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+              WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)`,
+            `GRANT SELECT, INSERT, UPDATE, DELETE ON capi_blocked_phones TO autodata_app`,
+          ];
+          for (const stmt of pgStmts) {
+            await client.query(stmt);
+          }
+        }
+      });
+      capiPoolsInit.add(pool);
+    })().finally(() => {
+      capiPoolsPending.delete(pool);
+    });
+    capiPoolsPending.set(pool, running);
+  }
+  await running;
+}
+
+async function ensureCapiWaveAMiddleware(_req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    await ensureCapiWaveASchema();
+    next();
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_SCHEMA_FAILED', err?.message || 'Không thể khởi tạo dữ liệu Meta CAPI.');
+  }
+}
+
+integrationsRouter.use('/capi', ensureCapiWaveAMiddleware);
+
+function parseCapiBackfillParams(req: Request) {
+  const b = req.method === 'GET' ? req.query : req.body || {};
+  const days = Math.max(1, Math.min(30, Number(b.days || 7)));
+  const fromDate = b.from_date ? String(b.from_date).slice(0, 10) : new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+  const toDate = b.to_date ? String(b.to_date).slice(0, 10) : new Date().toISOString().slice(0, 10);
+  const stageId = b.stage_id ? String(b.stage_id).trim() : null;
+  const eventName = b.event_name ? String(b.event_name).trim() : null;
+  const limit = Math.max(1, Math.min(200, Number(b.limit || 50)));
+  return { days, fromDate, toDate, stageId, eventName, limit };
+}
+
+// 1. CAPI Historical Backfill Preview & Run
+async function handleCapiBackfillPreview(req: Request, res: Response) {
+  try {
+    const ctx = getTenantContext();
+    const { fromDate, toDate, stageId, eventName, limit } = parseCapiBackfillParams(req);
+    const sevenDaysAgoMs = Date.now() - 7 * 86_400_000;
+
+    const preview = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const params: unknown[] = [ctx.tenantId, `${fromDate}T00:00:00.000Z`, `${toDate}T23:59:59.999Z`];
+      let extra = '';
+      if (stageId) {
+        params.push(stageId);
+        extra += ` AND l.stage_id = $${params.length}`;
+      }
+
+      const leadsRes = await client.query<{
+        id: string;
+        name: string;
+        phone: string;
+        email: string | null;
+        created_at: string;
+        stage_id: string;
+        stage_name: string | null;
+        capi_event_mapping: string | null;
+      }>(
+        `SELECT l.id, l.name, l.phone, l.email, l.created_at, l.stage_id,
+                s.stage_name, s.capi_event_mapping
+         FROM leads l
+         LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+         WHERE l.tenant_id = $1
+           AND l.is_deleted = false
+           AND l.created_at >= $2::timestamptz
+           AND l.created_at <= $3::timestamptz
+           ${extra}
+         ORDER BY l.created_at DESC
+         LIMIT 500`,
+        params
+      );
+
+      const sentLogsRes = await client.query<{ lead_id: string; event_name: string }>(
+        'SELECT lead_id, event_name FROM capi_logs WHERE tenant_id = $1 AND response_status = 200',
+        [ctx.tenantId]
+      );
+      const sentSet = new Set(sentLogsRes.rows.map((r) => `${r.lead_id}:${r.event_name}`));
+
+      const byEventMap = new Map<string, number>();
+      const byStageMap = new Map<string, { stage_id: string; stage_name: string; count: number }>();
+      const eligibleLeads: any[] = [];
+      let within7dCount = 0;
+
+      for (const l of leadsRes.rows) {
+        const mappedEvent = eventName || l.capi_event_mapping || 'Lead';
+        if (sentSet.has(`${l.id}:${mappedEvent}`)) continue;
+        const createdMs = new Date(l.created_at).getTime();
+        const isWithin7d = createdMs >= sevenDaysAgoMs;
+        if (isWithin7d) within7dCount++;
+        byEventMap.set(mappedEvent, (byEventMap.get(mappedEvent) || 0) + 1);
+        const stKey = l.stage_id || 'unassigned';
+        const prevSt = byStageMap.get(stKey) || {
+          stage_id: stKey,
+          stage_name: l.stage_name || 'Mặc định',
+          count: 0,
+        };
+        prevSt.count++;
+        byStageMap.set(stKey, prevSt);
+        if (eligibleLeads.length < limit) {
+          eligibleLeads.push({
+            lead_id: l.id,
+            name: l.name,
+            stage_name: l.stage_name,
+            event_name: mappedEvent,
+            within_7d: isWithin7d,
+            created_at: l.created_at,
+          });
+        }
+      }
+
+      return {
+        from_date: fromDate,
+        to_date: toDate,
+        total_eligible: eligibleLeads.length,
+        within_7d_count: within7dCount,
+        by_event: Object.fromEntries(byEventMap.entries()),
+        by_stage: Array.from(byStageMap.values()),
+        sample_leads: eligibleLeads.slice(0, 25),
+      };
+    });
+
+    res.json({ success: true, data: preview });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_BACKFILL_PREVIEW_FAILED', err?.message || 'Không thể xem trước dữ liệu CAPI Backfill.');
+  }
+}
+
+integrationsRouter.get('/capi/backfill/preview', requireCapiView, handleCapiBackfillPreview);
+integrationsRouter.post('/capi/backfill/preview', requireCapiView, handleCapiBackfillPreview);
+
+integrationsRouter.post('/capi/backfill/run', requireCapiManage, async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const { fromDate, toDate, stageId, eventName, limit } = parseCapiBackfillParams(req);
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+
+    const candidates = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const params: unknown[] = [ctx.tenantId, `${fromDate}T00:00:00.000Z`, `${toDate}T23:59:59.999Z`];
+      let extra = '';
+      if (stageId) {
+        params.push(stageId);
+        extra += ` AND l.stage_id = $${params.length}`;
+      }
+      const [leadsRes, sentRes] = await Promise.all([
+        client.query<{
+          id: string;
+          name: string;
+          phone: string;
+          email: string | null;
+          utm_source: string | null;
+          fbclid: string | null;
+          fbc: string | null;
+          fbp: string | null;
+          meta_lead_id: string | null;
+          total_revenue_vnd: number | null;
+          custom_fields: Record<string, unknown> | null;
+          capi_event_mapping: string | null;
+        }>(
+          `SELECT l.id, l.name, l.phone, l.email, l.utm_source, l.fbclid, l.fbc, l.fbp,
+                  l.meta_lead_id, l.total_revenue_vnd, l.custom_fields, s.capi_event_mapping
+           FROM leads l
+           LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+           WHERE l.tenant_id = $1
+             AND l.is_deleted = false
+             AND l.created_at >= $2::timestamptz
+             AND l.created_at <= $3::timestamptz
+             ${extra}
+           ORDER BY l.created_at DESC
+           LIMIT $${params.length + 1}`,
+          [...params, limit]
+        ),
+        client.query<{ lead_id: string; event_name: string }>(
+          'SELECT lead_id, event_name FROM capi_logs WHERE tenant_id = $1 AND response_status = 200',
+          [ctx.tenantId]
+        ),
+      ]);
+      const sentSet = new Set(sentRes.rows.map((r) => `${r.lead_id}:${r.event_name}`));
+      return leadsRes.rows
+        .map((l) => ({ ...l, targetEvent: eventName || l.capi_event_mapping || 'Lead' }))
+        .filter((l) => !sentSet.has(`${l.id}:${l.targetEvent}`));
+    });
+
+    let succeeded = 0;
+    let failed = 0;
+    const results: Array<{ lead_id: string; event_name: string; status: number; event_id: string }> = [];
+
+    for (const lead of candidates) {
+      const out = await dispatchStageCapiEventDetached({
+        tenantId: ctx.tenantId,
+        tenantSlug: ctx.tenantSlug,
+        eventName: lead.targetEvent,
+        tenantSettings: cfg,
+        lead: {
+          leadId: lead.id,
+          name: lead.name,
+          phone: lead.phone,
+          email: lead.email,
+          fbclid: lead.fbclid,
+          fbc: lead.fbc,
+          fbp: lead.fbp,
+          metaLeadId: lead.meta_lead_id,
+          dealValue: Number(lead.total_revenue_vnd || 0),
+          customFields: lead.custom_fields || undefined,
+        },
+      });
+      const httpStatus = Number((out as any).status ?? 0);
+      if (httpStatus >= 200 && httpStatus < 300) {
+        succeeded++;
+      } else {
+        failed++;
+      }
+      results.push({
+        lead_id: lead.id,
+        event_name: out.event_name,
+        status: httpStatus,
+        event_id: out.event_id,
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        processed: candidates.length,
+        succeeded,
+        failed,
+        skipped: 0,
+        results,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_BACKFILL_RUN_FAILED', err?.message || 'Không thể chạy đồng bộ CAPI Backfill.');
+  }
+});
+
+// 2. CAPI Custom Audience Sync Preview & Sync
+async function handleCapiAudiencePreview(req: Request, res: Response) {
+  try {
+    const ctx = getTenantContext();
+    const b = req.method === 'GET' ? req.query : req.body || {};
+    const stageId = b.stage_id ? String(b.stage_id).trim() : null;
+    const lifecycleStage = b.lifecycle_stage ? String(b.lifecycle_stage).trim() : null;
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const params: unknown[] = [ctx.tenantId];
+      let where = 'tenant_id = $1 AND is_deleted = false';
+      if (stageId) {
+        params.push(stageId);
+        where += ` AND stage_id = $${params.length}`;
+      }
+      if (lifecycleStage) {
+        params.push(lifecycleStage);
+        where += ` AND lifecycle_stage = $${params.length}`;
+      }
+      const leadsRes = await client.query<{ id: string; name: string; phone: string; email: string | null }>(
+        `SELECT id, name, phone, email FROM leads WHERE ${where} ORDER BY created_at DESC LIMIT 2000`,
+        params
+      );
+
+      let validPhone = 0;
+      let validEmail = 0;
+      for (const l of leadsRes.rows) {
+        const { matchKeysPresent } = buildCapiUserData(
+          ctx.tenantId,
+          { leadId: l.id, name: l.name, phone: l.phone, email: l.email },
+          { countryCode: cfg.default_country_code, dialCode: cfg.default_dial_code }
+        );
+        if (matchKeysPresent.ph) validPhone++;
+        if (matchKeysPresent.em) validEmail++;
+      }
+
+      return {
+        total_contacts: leadsRes.rows.length,
+        valid_phone_count: validPhone,
+        valid_email_count: validEmail,
+        schema: ['PHONE', 'EMAIL', 'FN'],
+        estimated_match_rate_pct:
+          leadsRes.rows.length > 0 ? Math.min(95, Math.round(((validPhone + validEmail * 0.5) / leadsRes.rows.length) * 80)) : 0,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_AUDIENCE_PREVIEW_FAILED', err?.message || 'Không thể xem trước Custom Audience.');
+  }
+}
+
+integrationsRouter.get('/capi/audiences/preview', requireCapiView, handleCapiAudiencePreview);
+integrationsRouter.post('/capi/audiences/preview', requireCapiView, handleCapiAudiencePreview);
+
+integrationsRouter.post('/capi/audiences/sync', requireCapiManage, async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const audienceName = String(b.audience_name || b.name || `DOMATION Custom Audience ${new Date().toISOString().slice(0, 10)}`).trim();
+    const customAudienceId = b.custom_audience_id ? String(b.custom_audience_id).trim() : `ca_sim_${crypto.randomBytes(4).toString('hex')}`;
+    const stageId = b.stage_id ? String(b.stage_id).trim() : null;
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+
+    const out = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const params: unknown[] = [ctx.tenantId];
+      let where = 'tenant_id = $1 AND is_deleted = false';
+      if (stageId) {
+        params.push(stageId);
+        where += ` AND stage_id = $${params.length}`;
+      }
+      const leadsRes = await client.query<{ id: string; name: string; phone: string; email: string | null }>(
+        `SELECT id, name, phone, email FROM leads WHERE ${where} ORDER BY created_at DESC LIMIT 1000`,
+        params
+      );
+
+      const hashedRows: string[][] = [];
+      for (const l of leadsRes.rows) {
+        const { userData } = buildCapiUserData(
+          ctx.tenantId,
+          { leadId: l.id, name: l.name, phone: l.phone, email: l.email },
+          { countryCode: cfg.default_country_code, dialCode: cfg.default_dial_code }
+        );
+        const ph = Array.isArray(userData.ph) && userData.ph[0] ? String(userData.ph[0]) : '';
+        const em = Array.isArray(userData.em) && userData.em[0] ? String(userData.em[0]) : '';
+        const fn = Array.isArray(userData.fn) && userData.fn[0] ? String(userData.fn[0]) : '';
+        if (ph || em) {
+          hashedRows.push([ph, em, fn]);
+        }
+      }
+
+      await client.query(
+        `INSERT INTO admin_audit_logs (
+           tenant_id, actor_id, actor_name, action, entity_type, entity_id, details
+         ) VALUES ($1, $2, $3, 'capi_audience_sync', 'meta_custom_audience', $4, $5::jsonb)`,
+        [
+          ctx.tenantId,
+          ctx.userId,
+          ctx.userName || 'Admin',
+          customAudienceId,
+          JSON.stringify({
+            audience_name: audienceName,
+            synced_count: hashedRows.length,
+            silent: isOutboundSilentMode(),
+          }),
+        ]
+      );
+
+      return {
+        custom_audience_id: customAudienceId,
+        audience_name: audienceName,
+        synced_count: hashedRows.length,
+        schema: ['PHONE', 'EMAIL', 'FN'],
+        silent: isOutboundSilentMode(),
+        dry_run: isOutboundSilentMode(),
+      };
+    });
+
+    res.json({ success: true, data: out });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_AUDIENCE_SYNC_FAILED', err?.message || 'Không thể đồng bộ Meta Custom Audience.');
+  }
+});
+
+// 3. CAPI AdSet Quick Optimization (`/adsets/:id/optimize`)
+integrationsRouter.post('/capi/adsets/:id/optimize', requireCapiManage, async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const adsetId = String(req.params.id || '').trim();
+    const b = req.body || {};
+    const action = String(b.action || 'adjust_budget').trim().toLowerCase();
+    const dailyBudgetVnd =
+      b.daily_budget_vnd !== undefined ? Math.max(0, Math.round(Number(b.daily_budget_vnd) || 0)) : undefined;
+    const reason = String(b.reason || `CAPI ROAS Auto-Optimize (${action})`).trim();
+    const nextStatus = action === 'pause' ? 'PAUSED' : action === 'enable' ? 'ACTIVE' : undefined;
+
+    const result = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO admin_audit_logs (
+           tenant_id, actor_id, actor_name, action, entity_type, entity_id, details
+         ) VALUES ($1, $2, $3, 'capi_adset_optimize', 'meta_adset', $4, $5::jsonb)`,
+        [
+          ctx.tenantId,
+          ctx.userId,
+          ctx.userName || 'Admin',
+          adsetId,
+          JSON.stringify({ action, nextStatus, daily_budget_vnd: dailyBudgetVnd, reason }),
+        ]
+      );
+      return {
+        adset_id: adsetId,
+        action,
+        status: nextStatus || 'ACTIVE',
+        daily_budget_vnd: dailyBudgetVnd ?? null,
+        reason,
+        silent: isOutboundSilentMode(),
+        dry_run: isOutboundSilentMode(),
+      };
+    });
+
+    res.json({ success: true, data: result });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_ADSET_OPTIMIZE_FAILED', err?.message || 'Không thể tối ưu AdSet Meta.');
+  }
+});
+
+// 4. Phone Farm / Spam Phone Exclusion Guard (`/phone-farm/*`)
+integrationsRouter.get('/capi/phone-farm/stats', requireCapiView, async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [statsRes, itemsRes] = await Promise.all([
+        client.query<{
+          total_blocked: number;
+          synced_count: number;
+          pending_sync_count: number;
+          matched_leads_count: number;
+        }>(
+          `SELECT
+             COUNT(*) AS total_blocked,
+             COALESCE(SUM(CASE WHEN synced_to_meta = true THEN 1 ELSE 0 END), 0) AS synced_count,
+             COALESCE(SUM(CASE WHEN synced_to_meta = false THEN 1 ELSE 0 END), 0) AS pending_sync_count,
+             COALESCE(SUM(matched_leads_count), 0) AS matched_leads_count
+           FROM capi_blocked_phones
+           WHERE tenant_id = $1`,
+          [ctx.tenantId]
+        ),
+        client.query(
+          'SELECT * FROM capi_blocked_phones WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100',
+          [ctx.tenantId]
+        ),
+      ]);
+      const st = statsRes.rows[0] || {
+        total_blocked: 0,
+        synced_count: 0,
+        pending_sync_count: 0,
+        matched_leads_count: 0,
+      };
+      return {
+        total_blocked: Number(st.total_blocked || 0),
+        synced_count: Number(st.synced_count || 0),
+        pending_sync_count: Number(st.pending_sync_count || 0),
+        matched_leads_count: Number(st.matched_leads_count || 0),
+        items: itemsRes.rows,
+      };
+    });
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_PHONE_FARM_STATS_FAILED', err?.message || 'Không thể tải thống kê Phone Farm.');
+  }
+});
+
+integrationsRouter.post('/capi/phone-farm/import', requireCapiManage, async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+    const rawPhones: string[] = Array.isArray(b.phones)
+      ? b.phones.map((p: unknown) => String(p || '').trim())
+      : typeof b.phones_text === 'string'
+        ? b.phones_text.split(/[\n,;]+/).map((p: string) => p.trim())
+        : [];
+    const uniqueRaw = Array.from(new Set(rawPhones.filter(Boolean))).slice(0, 1000);
+    if (uniqueRaw.length === 0) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Cần cung cấp danh sách số điện thoại (phones) để chặn.');
+      return;
+    }
+
+    const reason = String(b.reason || 'Phone Farm / Virtual SIM Spam Exclusion').trim();
+    const source = String(b.source || 'manual').trim().slice(0, 60);
+
+    const out = await withTenantTransaction(ctx.tenantId, async (client) => {
+      let imported = 0;
+      let totalMatchedLeads = 0;
+
+      for (const rawPhone of uniqueRaw) {
+        const pCheck = validateAndNormalizePhone(rawPhone, {
+          default_dial_code: cfg.default_dial_code,
+          allow_international_phones: cfg.allow_international_phones,
+          allow_landline_phones: cfg.allow_landline_phones,
+          vn_mobile_prefixes: cfg.vn_mobile_prefixes,
+          custom_phone_regex: cfg.custom_phone_regex,
+          block_repeated_digits: cfg.block_repeated_digits,
+        });
+        const normPhone = (pCheck.valid ? pCheck.normalizedE164 : rawPhone.replace(/\D/g, '')).slice(0, 40);
+        if (!normPhone) continue;
+
+        const phoneHash = crypto.createHash('sha256').update(normPhone).digest('hex');
+        const matchRes = await client.query<{ cnt: number }>(
+          'SELECT COUNT(*) AS cnt FROM leads WHERE tenant_id = $1 AND phone = $2 AND is_deleted = false',
+          [ctx.tenantId, normPhone]
+        );
+        const matchedCnt = Number(matchRes.rows[0]?.cnt || 0);
+        totalMatchedLeads += matchedCnt;
+
+        await client.query(
+          `INSERT INTO capi_blocked_phones (
+             id, tenant_id, phone_normalized, phone_hash, reason, source,
+             matched_leads_count, synced_to_meta, created_by
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8)
+           ON CONFLICT (tenant_id, phone_normalized)
+           DO UPDATE SET
+             reason = EXCLUDED.reason,
+             matched_leads_count = EXCLUDED.matched_leads_count,
+             updated_at = clock_timestamp()`,
+          [crypto.randomUUID(), ctx.tenantId, normPhone, phoneHash, reason, source, matchedCnt, ctx.userId]
+        );
+        imported++;
+      }
+
+      const rowsRes = await client.query(
+        'SELECT * FROM capi_blocked_phones WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100',
+        [ctx.tenantId]
+      );
+      return {
+        imported,
+        matched_leads_count: totalMatchedLeads,
+        items: rowsRes.rows,
+      };
+    });
+
+    res.status(201).json({ success: true, data: out });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_PHONE_FARM_IMPORT_FAILED', err?.message || 'Không thể nhập danh sách số chặn Phone Farm.');
+  }
+});
+
+integrationsRouter.post('/capi/phone-farm/sync-meta', requireCapiManage, async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const exclusionAudienceId = req.body?.exclusion_audience_id
+      ? String(req.body.exclusion_audience_id).trim()
+      : `excl_sim_${crypto.randomBytes(4).toString('hex')}`;
+
+    const out = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const pendingRes = await client.query<{ id: string; phone_hash: string }>(
+        'SELECT id, phone_hash FROM capi_blocked_phones WHERE tenant_id = $1 AND synced_to_meta = false LIMIT 1000',
+        [ctx.tenantId]
+      );
+      if (pendingRes.rows.length > 0) {
+        const ids = pendingRes.rows.map((r) => r.id);
+        const phPlaceholders = ids.map((_, idx) => `$${idx + 2}`).join(', ');
+        await client.query(
+          `UPDATE capi_blocked_phones
+           SET synced_to_meta = true, last_synced_at = clock_timestamp(), updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id IN (${phPlaceholders})`,
+          [ctx.tenantId, ...ids]
+        );
+      }
+
+      return {
+        synced_count: pendingRes.rows.length,
+        exclusion_audience_id: exclusionAudienceId,
+        silent: isOutboundSilentMode(),
+        dry_run: isOutboundSilentMode(),
+      };
+    });
+
+    res.json({ success: true, data: out });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_PHONE_FARM_SYNC_FAILED', err?.message || 'Không thể đồng bộ danh sách loại trừ lên Meta.');
+  }
+});
+
+// 5. Retry Single Failed CAPI Delivery Log (`/retry/:logId`)
+integrationsRouter.post('/capi/retry/:logId', requireCapiManage, async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+
+    const logLead = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query<{
+        log_id: string;
+        lead_id: string;
+        event_name: string;
+        event_id: string;
+        name: string;
+        phone: string;
+        email: string | null;
+        fbclid: string | null;
+        fbc: string | null;
+        fbp: string | null;
+        meta_lead_id: string | null;
+        total_revenue_vnd: number | null;
+        custom_fields: Record<string, unknown> | null;
+      }>(
+        `SELECT cl.id AS log_id, cl.lead_id, cl.event_name, cl.event_id,
+                l.name, l.phone, l.email, l.fbclid, l.fbc, l.fbp, l.meta_lead_id,
+                l.total_revenue_vnd, l.custom_fields
+         FROM capi_logs cl
+         INNER JOIN leads l ON l.tenant_id = cl.tenant_id AND l.id = cl.lead_id
+         WHERE cl.tenant_id = $1 AND cl.id = $2
+         LIMIT 1`,
+        [ctx.tenantId, req.params.logId]
+      );
+      return r.rows[0] || null;
+    });
+
+    if (!logLead) {
+      sendApiError(res, 404, 'CAPI_LOG_NOT_FOUND', 'Không tìm thấy bản ghi Meta CAPI cần gửi lại.');
+      return;
+    }
+
+    const out = await dispatchStageCapiEventDetached({
+      tenantId: ctx.tenantId,
+      tenantSlug: ctx.tenantSlug,
+      eventName: logLead.event_name || 'Lead',
+      tenantSettings: cfg,
+      lead: {
+        leadId: logLead.lead_id,
+        name: logLead.name,
+        phone: logLead.phone,
+        email: logLead.email,
+        fbclid: logLead.fbclid,
+        fbc: logLead.fbc,
+        fbp: logLead.fbp,
+        metaLeadId: logLead.meta_lead_id,
+        dealValue: Number(logLead.total_revenue_vnd || 0),
+        customFields: logLead.custom_fields || undefined,
+      },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        retried: true,
+        original_log_id: logLead.log_id,
+        lead_id: logLead.lead_id,
+        event_name: out.event_name,
+        event_id: out.event_id,
+        meta_http_status: Number((out as any).status ?? 200),
+        fbtrace_id: out.fbtrace_id,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAPI_RETRY_FAILED', err?.message || 'Không thể gửi lại sự kiện Meta CAPI.');
   }
 });

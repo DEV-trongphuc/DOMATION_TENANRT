@@ -40,6 +40,24 @@ export const ERP_OPS_TABLES = [
   'tenant_edu_schedules',
   'tenant_edu_enrollments',
   'tenant_edu_attendance_grades',
+  // Stage 4B Full-Clone Commercial Finance, Supply Chain, Projects/Gantt, Cloud & Education Tables
+  'tenant_quote_items',
+  'tenant_sales_order_items',
+  'tenant_purchase_order_items',
+  'tenant_invoices',
+  'tenant_invoice_items',
+  'tenant_deposit_milestones',
+  'tenant_expenses',
+  'tenant_pos_sessions',
+  'tenant_pos_orders',
+  'tenant_inventory_sync_sheets',
+  'tenant_project_roster',
+  'tenant_task_dependencies',
+  'tenant_task_comments',
+  'tenant_task_attachments',
+  'tenant_task_whiteboard_snapshots',
+  'tenant_cloud_file_categories',
+  'tenant_edu_announcements',
 ] as const;
 
 const initializedPools = new WeakSet<object>();
@@ -1330,6 +1348,480 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
     );
 
     -- ========================================================================
+    -- GROUP 7: STAGE 4B FULL-CLONE TABLES & IDEMPOTENT COLUMN UPGRADES
+    -- ========================================================================
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS shipping_fee_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS tax_pct NUMERIC(5,2) NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS customer_name VARCHAR(200);
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);
+    ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(40);
+
+    ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS shipping_fee_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS voucher_code VARCHAR(80);
+    ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer';
+    ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS split_payments_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS subtotal_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS discount_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS tax_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS shipping_fee_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR(30) NOT NULL DEFAULT 'unpaid';
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS paid_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS three_way_match_status VARCHAR(30) NOT NULL DEFAULT 'pending';
+    ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS three_way_match_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS project_id UUID;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS unit_code VARCHAR(80);
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS contract_value_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS expected_commission_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS currency VARCHAR(10) NOT NULL DEFAULT 'VND';
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(12,4) NOT NULL DEFAULT 1;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS unc_attachment_url TEXT;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS commission_shares_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS watchers_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS history_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS confirmed_by UUID;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS refunded_amount_vnd BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS refund_reason TEXT;
+
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS prestige_tier VARCHAR(10) NOT NULL DEFAULT 'A';
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS cooperation_status VARCHAR(30) NOT NULL DEFAULT 'active';
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS website VARCHAR(255);
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS bank_name VARCHAR(120);
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS bank_account_no VARCHAR(80);
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS bank_account_holder VARCHAR(150);
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS categories_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+    ALTER TABLE tenant_cloud_files ADD COLUMN IF NOT EXISTS category_key VARCHAR(80) NOT NULL DEFAULT 'general';
+    ALTER TABLE tenant_cloud_files ADD COLUMN IF NOT EXISTS lead_id UUID;
+    ALTER TABLE tenant_cloud_files ADD COLUMN IF NOT EXISTS file_url TEXT;
+
+    ALTER TABLE tenant_edu_courses ADD COLUMN IF NOT EXISTS grading_scale VARCHAR(30) NOT NULL DEFAULT 'scale_10';
+    ALTER TABLE tenant_edu_courses ADD COLUMN IF NOT EXISTS subjects_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_edu_courses ADD COLUMN IF NOT EXISTS credits INTEGER NOT NULL DEFAULT 3;
+
+    ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS program_code VARCHAR(60);
+    ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_status VARCHAR(30) NOT NULL DEFAULT 'none';
+    ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_reason TEXT;
+    ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_until DATE;
+    ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_ocr_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS subject_key VARCHAR(80) NOT NULL DEFAULT 'GENERAL';
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS subject_name VARCHAR(200);
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS attendance_score NUMERIC(5,2);
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS assignment_score NUMERIC(5,2);
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS ects_score_6 NUMERIC(5,2);
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS letter_grade VARCHAR(40);
+    ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS pass_status VARCHAR(20) NOT NULL DEFAULT 'passed';
+
+    CREATE TABLE IF NOT EXISTS tenant_quote_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      quote_id UUID NOT NULL,
+      product_id UUID,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      description TEXT,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      qty NUMERIC(12,2) NOT NULL DEFAULT 1,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      tax_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      line_subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      line_discount_vnd BIGINT NOT NULL DEFAULT 0,
+      line_tax_vnd BIGINT NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_quote_items_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_qitem_quote FOREIGN KEY (tenant_id, quote_id) REFERENCES tenant_quotes(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_quote_items_quote ON tenant_quote_items(tenant_id, quote_id, sort_order ASC);
+
+    CREATE TABLE IF NOT EXISTS tenant_sales_order_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      sales_order_id UUID NOT NULL,
+      product_id UUID,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      description TEXT,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      qty NUMERIC(12,2) NOT NULL DEFAULT 1,
+      fulfilled_qty NUMERIC(12,2) NOT NULL DEFAULT 0,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      tax_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      line_subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      line_discount_vnd BIGINT NOT NULL DEFAULT 0,
+      line_tax_vnd BIGINT NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_so_items_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_soitem_so FOREIGN KEY (tenant_id, sales_order_id) REFERENCES tenant_sales_orders(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_so_items_so ON tenant_sales_order_items(tenant_id, sales_order_id, sort_order ASC);
+
+    CREATE TABLE IF NOT EXISTS tenant_purchase_order_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      purchase_order_id UUID NOT NULL,
+      product_id UUID,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      ordered_qty NUMERIC(12,2) NOT NULL DEFAULT 1,
+      received_qty NUMERIC(12,2) NOT NULL DEFAULT 0,
+      invoiced_qty NUMERIC(12,2) NOT NULL DEFAULT 0,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      tax_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      match_note TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_po_items_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_poitem_po FOREIGN KEY (tenant_id, purchase_order_id) REFERENCES tenant_purchase_orders(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_po_items_po ON tenant_purchase_order_items(tenant_id, purchase_order_id, sort_order ASC);
+
+    CREATE TABLE IF NOT EXISTS tenant_invoices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      invoice_code VARCHAR(60) NOT NULL,
+      invoice_type VARCHAR(20) NOT NULL DEFAULT 'sales',
+      sales_order_id UUID,
+      purchase_order_id UUID,
+      quote_id UUID,
+      deposit_id UUID,
+      company_id UUID,
+      lead_id UUID,
+      supplier_id UUID,
+      branch_id UUID,
+      customer_name VARCHAR(200) NOT NULL,
+      customer_tax_code VARCHAR(60),
+      customer_address TEXT,
+      customer_email VARCHAR(255),
+      status VARCHAR(30) NOT NULL DEFAULT 'issued',
+      issue_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      due_date DATE,
+      items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_vnd BIGINT NOT NULL DEFAULT 0,
+      tax_vnd BIGINT NOT NULL DEFAULT 0,
+      shipping_fee_vnd BIGINT NOT NULL DEFAULT 0,
+      total_vnd BIGINT NOT NULL DEFAULT 0,
+      paid_vnd BIGINT NOT NULL DEFAULT 0,
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      vat_invoice_no VARCHAR(80),
+      vat_serial VARCHAR(40),
+      notes TEXT,
+      created_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_invoices_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_invoices_code UNIQUE (tenant_id, invoice_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tenant_invoices_status ON tenant_invoices(tenant_id, status, issue_date DESC);
+
+    CREATE TABLE IF NOT EXISTS tenant_invoice_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      invoice_id UUID NOT NULL,
+      product_id UUID,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      description TEXT,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      qty NUMERIC(12,2) NOT NULL DEFAULT 1,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      tax_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_invoice_items_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_invitem_inv FOREIGN KEY (tenant_id, invoice_id) REFERENCES tenant_invoices(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_invoice_items_inv ON tenant_invoice_items(tenant_id, invoice_id, sort_order ASC);
+
+    CREATE TABLE IF NOT EXISTS tenant_deposit_milestones (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      deposit_id UUID NOT NULL,
+      tranche_no INTEGER NOT NULL DEFAULT 1,
+      name VARCHAR(200) NOT NULL,
+      amount_vnd BIGINT NOT NULL DEFAULT 0,
+      expected_pay_date DATE,
+      paid_at TIMESTAMPTZ,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending',
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      unc_url TEXT,
+      reference_no VARCHAR(100),
+      confirmed_by UUID,
+      confirmed_by_name VARCHAR(150),
+      note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_dep_milestones_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_depm_dep FOREIGN KEY (tenant_id, deposit_id) REFERENCES tenant_deposits(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_deposit_milestones_dep ON tenant_deposit_milestones(tenant_id, deposit_id, tranche_no ASC);
+
+    CREATE TABLE IF NOT EXISTS tenant_expenses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      expense_code VARCHAR(60) NOT NULL,
+      title VARCHAR(255) NOT NULL,
+      category VARCHAR(80) NOT NULL DEFAULT 'operating_expense',
+      branch_id UUID,
+      department_id UUID,
+      project_id UUID,
+      supplier_id UUID,
+      vendor_name VARCHAR(200),
+      vendor_tax_code VARCHAR(60),
+      requester_user_id UUID,
+      requester_name VARCHAR(150),
+      approver_user_id UUID,
+      approval_request_id UUID,
+      approval_status VARCHAR(40) NOT NULL DEFAULT 'pending_approval',
+      has_vat_invoice BOOLEAN NOT NULL DEFAULT false,
+      is_vat_inclusive BOOLEAN NOT NULL DEFAULT true,
+      vat_invoice_no VARCHAR(80),
+      currency VARCHAR(10) NOT NULL DEFAULT 'VND',
+      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      vat_amount_vnd BIGINT NOT NULL DEFAULT 0,
+      total_amount_vnd BIGINT NOT NULL DEFAULT 0,
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      bank_name VARCHAR(120),
+      bank_bin VARCHAR(30),
+      bank_account_no VARCHAR(80),
+      bank_account_holder VARCHAR(150),
+      expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      due_date DATE,
+      paid_at TIMESTAMPTZ,
+      refund_status VARCHAR(30) NOT NULL DEFAULT 'none',
+      refund_amount_vnd BIGINT NOT NULL DEFAULT 0,
+      refund_attachment_url TEXT,
+      refunded_at TIMESTAMPTZ,
+      line_items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      watchers_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_expenses_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_expenses_code UNIQUE (tenant_id, expense_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tenant_expenses_status ON tenant_expenses(tenant_id, approval_status, expense_date DESC);
+
+    CREATE TABLE IF NOT EXISTS tenant_pos_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      session_code VARCHAR(60) NOT NULL,
+      branch_id UUID,
+      warehouse_id UUID,
+      cashier_user_id UUID,
+      cashier_name VARCHAR(150),
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      opening_cash_vnd BIGINT NOT NULL DEFAULT 0,
+      cash_sales_vnd BIGINT NOT NULL DEFAULT 0,
+      bank_sales_vnd BIGINT NOT NULL DEFAULT 0,
+      card_sales_vnd BIGINT NOT NULL DEFAULT 0,
+      expected_closing_cash_vnd BIGINT NOT NULL DEFAULT 0,
+      actual_closing_cash_vnd BIGINT NOT NULL DEFAULT 0,
+      variance_vnd BIGINT NOT NULL DEFAULT 0,
+      orders_count INTEGER NOT NULL DEFAULT 0,
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      closed_at TIMESTAMPTZ,
+      closing_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_pos_sessions_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_pos_sessions_code UNIQUE (tenant_id, session_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pos_sessions_status ON tenant_pos_sessions(tenant_id, status, opened_at DESC);
+
+    CREATE TABLE IF NOT EXISTS tenant_pos_orders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      pos_order_code VARCHAR(60) NOT NULL,
+      session_id UUID,
+      sales_order_id UUID,
+      lead_id UUID,
+      branch_id UUID,
+      warehouse_id UUID,
+      cashier_user_id UUID,
+      customer_name VARCHAR(200) NOT NULL DEFAULT 'Khách lẻ POS',
+      customer_phone VARCHAR(40),
+      items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_vnd BIGINT NOT NULL DEFAULT 0,
+      voucher_code VARCHAR(80),
+      voucher_discount_vnd BIGINT NOT NULL DEFAULT 0,
+      shipping_fee_vnd BIGINT NOT NULL DEFAULT 0,
+      tax_vnd BIGINT NOT NULL DEFAULT 0,
+      total_vnd BIGINT NOT NULL DEFAULT 0,
+      cash_paid_vnd BIGINT NOT NULL DEFAULT 0,
+      bank_paid_vnd BIGINT NOT NULL DEFAULT 0,
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'cash',
+      cogs_vnd BIGINT NOT NULL DEFAULT 0,
+      status VARCHAR(30) NOT NULL DEFAULT 'completed',
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_pos_orders_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_pos_orders_code UNIQUE (tenant_id, pos_order_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pos_orders_session ON tenant_pos_orders(tenant_id, session_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS tenant_inventory_sync_sheets (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      sheet_name VARCHAR(150) NOT NULL DEFAULT 'Sheet1',
+      spreadsheet_id VARCHAR(255) NOT NULL,
+      webhook_token VARCHAR(120) NOT NULL,
+      warehouse_id UUID,
+      sync_interval_minutes INTEGER NOT NULL DEFAULT 15,
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      sync_status VARCHAR(30) NOT NULL DEFAULT 'idle',
+      last_sync_at TIMESTAMPTZ,
+      last_error TEXT,
+      mappings_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_inv_sync_sheets_tenant_id UNIQUE (tenant_id, id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_project_roster (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      project_id UUID NOT NULL,
+      user_id UUID NOT NULL,
+      user_name VARCHAR(150) NOT NULL,
+      role_in_project VARCHAR(30) NOT NULL DEFAULT 'member',
+      can_edit_tasks BOOLEAN NOT NULL DEFAULT true,
+      can_manage_roster BOOLEAN NOT NULL DEFAULT false,
+      can_edit_whiteboard BOOLEAN NOT NULL DEFAULT true,
+      allocation_pct INTEGER NOT NULL DEFAULT 100,
+      added_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_project_roster_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_project_roster_member UNIQUE (tenant_id, project_id, user_id),
+      CONSTRAINT fk_proster_proj FOREIGN KEY (tenant_id, project_id) REFERENCES tenant_projects(tenant_id, id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_task_dependencies (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      project_id UUID,
+      task_id UUID NOT NULL,
+      predecessor_task_id UUID NOT NULL,
+      dependency_type VARCHAR(10) NOT NULL DEFAULT 'FS',
+      lag_days INTEGER NOT NULL DEFAULT 0,
+      created_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_task_deps_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_task_dep_pair UNIQUE (tenant_id, task_id, predecessor_task_id),
+      CONSTRAINT fk_tdep_task FOREIGN KEY (tenant_id, task_id) REFERENCES tenant_tasks(tenant_id, id) ON DELETE CASCADE,
+      CONSTRAINT fk_tdep_pred FOREIGN KEY (tenant_id, predecessor_task_id) REFERENCES tenant_tasks(tenant_id, id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_task_comments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      task_id UUID NOT NULL,
+      author_user_id UUID,
+      author_name VARCHAR(150) NOT NULL,
+      content TEXT NOT NULL,
+      mentions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_tcomm_task FOREIGN KEY (tenant_id, task_id) REFERENCES tenant_tasks(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_comments_task ON tenant_task_comments(tenant_id, task_id, created_at ASC);
+
+    CREATE TABLE IF NOT EXISTS tenant_task_attachments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      task_id UUID NOT NULL,
+      file_name VARCHAR(255) NOT NULL,
+      file_url TEXT NOT NULL,
+      mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
+      size_bytes BIGINT NOT NULL DEFAULT 0,
+      uploaded_by UUID,
+      uploaded_by_name VARCHAR(150),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_task_attachments_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_tatt_task FOREIGN KEY (tenant_id, task_id) REFERENCES tenant_tasks(tenant_id, id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_task_whiteboard_snapshots (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      project_id UUID NOT NULL,
+      snapshot_name VARCHAR(200) NOT NULL,
+      version_no INTEGER NOT NULL DEFAULT 1,
+      snapshot_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      thumbnail_note TEXT,
+      created_by UUID,
+      created_by_name VARCHAR(150),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_wb_snapshots_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT fk_wbsnap_proj FOREIGN KEY (tenant_id, project_id) REFERENCES tenant_projects(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_wb_snapshots_proj ON tenant_task_whiteboard_snapshots(tenant_id, project_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS tenant_cloud_file_categories (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      category_key VARCHAR(80) NOT NULL,
+      label VARCHAR(150) NOT NULL,
+      icon_type VARCHAR(40) NOT NULL DEFAULT 'folder',
+      visibility VARCHAR(30) NOT NULL DEFAULT 'company',
+      allowed_department_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      allowed_role_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_cloud_cats_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_cloud_cat_key UNIQUE (tenant_id, category_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_edu_announcements (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      announcement_type VARCHAR(40) NOT NULL DEFAULT 'subject_announcement',
+      course_id UUID,
+      class_id UUID,
+      subject_key VARCHAR(80),
+      title VARCHAR(255) NOT NULL,
+      content_html TEXT NOT NULL,
+      channels_json JSONB NOT NULL DEFAULT '["email"]'::jsonb,
+      recipients_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      sent_count INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(30) NOT NULL DEFAULT 'sent',
+      created_by UUID,
+      created_by_name VARCHAR(150),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_tenant_edu_announcements_tenant_id UNIQUE (tenant_id, id)
+    );
+
+    -- ========================================================================
     -- ENABLE & FORCE ROW LEVEL SECURITY + TENANT POLICIES + autodata_app GRANTS
     -- ========================================================================
     DO $$
@@ -1348,7 +1840,13 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
         'tenant_inventory_batches', 'tenant_stock_movements', 'tenant_fixed_assets',
         'tenant_cloud_folders', 'tenant_cloud_files', 'tenant_ocr_extractions',
         'tenant_edu_courses', 'tenant_edu_classes', 'tenant_edu_schedules',
-        'tenant_edu_enrollments', 'tenant_edu_attendance_grades'
+        'tenant_edu_enrollments', 'tenant_edu_attendance_grades',
+        'tenant_quote_items', 'tenant_sales_order_items', 'tenant_purchase_order_items',
+        'tenant_invoices', 'tenant_invoice_items', 'tenant_deposit_milestones',
+        'tenant_expenses', 'tenant_pos_sessions', 'tenant_pos_orders',
+        'tenant_inventory_sync_sheets', 'tenant_project_roster', 'tenant_task_dependencies',
+        'tenant_task_comments', 'tenant_task_attachments', 'tenant_task_whiteboard_snapshots',
+        'tenant_cloud_file_categories', 'tenant_edu_announcements'
       ]
       LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', tbl);
@@ -1381,7 +1879,13 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
           'tenant_inventory_batches', 'tenant_stock_movements', 'tenant_fixed_assets',
           'tenant_cloud_folders', 'tenant_cloud_files', 'tenant_ocr_extractions',
           'tenant_edu_courses', 'tenant_edu_classes', 'tenant_edu_schedules',
-          'tenant_edu_enrollments', 'tenant_edu_attendance_grades'
+          'tenant_edu_enrollments', 'tenant_edu_attendance_grades',
+          'tenant_quote_items', 'tenant_sales_order_items', 'tenant_purchase_order_items',
+          'tenant_invoices', 'tenant_invoice_items', 'tenant_deposit_milestones',
+          'tenant_expenses', 'tenant_pos_sessions', 'tenant_pos_orders',
+          'tenant_inventory_sync_sheets', 'tenant_project_roster', 'tenant_task_dependencies',
+          'tenant_task_comments', 'tenant_task_attachments', 'tenant_task_whiteboard_snapshots',
+          'tenant_cloud_file_categories', 'tenant_edu_announcements'
         ]
         LOOP
           EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO autodata_app', tbl);
@@ -2030,9 +2534,443 @@ async function runErpOpsMariaDbSchema(client: DbClient): Promise<void> {
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_edu_attendance_grades_tenant_id UNIQUE (tenant_id, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_quote_items (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      quote_id VARCHAR(36) NOT NULL,
+      product_id VARCHAR(36) NULL,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      qty DECIMAL(12,2) NOT NULL DEFAULT 1,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      tax_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      line_subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      line_discount_vnd BIGINT NOT NULL DEFAULT 0,
+      line_tax_vnd BIGINT NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_quote_items_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_sales_order_items (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      sales_order_id VARCHAR(36) NOT NULL,
+      product_id VARCHAR(36) NULL,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      qty DECIMAL(12,2) NOT NULL DEFAULT 1,
+      fulfilled_qty DECIMAL(12,2) NOT NULL DEFAULT 0,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      tax_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      line_subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      line_discount_vnd BIGINT NOT NULL DEFAULT 0,
+      line_tax_vnd BIGINT NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_so_items_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_purchase_order_items (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      purchase_order_id VARCHAR(36) NOT NULL,
+      product_id VARCHAR(36) NULL,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      ordered_qty DECIMAL(12,2) NOT NULL DEFAULT 1,
+      received_qty DECIMAL(12,2) NOT NULL DEFAULT 0,
+      invoiced_qty DECIMAL(12,2) NOT NULL DEFAULT 0,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      tax_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      match_note TEXT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_po_items_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_invoices (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      invoice_code VARCHAR(60) NOT NULL,
+      invoice_type VARCHAR(20) NOT NULL DEFAULT 'sales',
+      sales_order_id VARCHAR(36) NULL,
+      purchase_order_id VARCHAR(36) NULL,
+      quote_id VARCHAR(36) NULL,
+      deposit_id VARCHAR(36) NULL,
+      company_id VARCHAR(36) NULL,
+      lead_id VARCHAR(36) NULL,
+      supplier_id VARCHAR(36) NULL,
+      branch_id VARCHAR(36) NULL,
+      customer_name VARCHAR(200) NOT NULL,
+      customer_tax_code VARCHAR(60) NULL,
+      customer_address TEXT NULL,
+      customer_email VARCHAR(255) NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'issued',
+      issue_date DATE NOT NULL,
+      due_date DATE NULL,
+      items_json JSON NULL,
+      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_vnd BIGINT NOT NULL DEFAULT 0,
+      tax_vnd BIGINT NOT NULL DEFAULT 0,
+      shipping_fee_vnd BIGINT NOT NULL DEFAULT 0,
+      total_vnd BIGINT NOT NULL DEFAULT 0,
+      paid_vnd BIGINT NOT NULL DEFAULT 0,
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      vat_invoice_no VARCHAR(80) NULL,
+      vat_serial VARCHAR(40) NULL,
+      notes TEXT NULL,
+      created_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_invoices_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_invoices_code UNIQUE (tenant_id, invoice_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_invoice_items (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      invoice_id VARCHAR(36) NOT NULL,
+      product_id VARCHAR(36) NULL,
+      sku VARCHAR(80) NOT NULL DEFAULT '',
+      name VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      unit VARCHAR(40) NOT NULL DEFAULT 'Cái',
+      qty DECIMAL(12,2) NOT NULL DEFAULT 1,
+      unit_price_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      tax_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      line_total_vnd BIGINT NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_invoice_items_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_deposit_milestones (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      deposit_id VARCHAR(36) NOT NULL,
+      tranche_no INT NOT NULL DEFAULT 1,
+      name VARCHAR(200) NOT NULL,
+      amount_vnd BIGINT NOT NULL DEFAULT 0,
+      expected_pay_date DATE NULL,
+      paid_at DATETIME(6) NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending',
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      unc_url TEXT NULL,
+      reference_no VARCHAR(100) NULL,
+      confirmed_by VARCHAR(36) NULL,
+      confirmed_by_name VARCHAR(150) NULL,
+      note TEXT NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_dep_milestones_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_expenses (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      expense_code VARCHAR(60) NOT NULL,
+      title VARCHAR(255) NOT NULL,
+      category VARCHAR(80) NOT NULL DEFAULT 'operating_expense',
+      branch_id VARCHAR(36) NULL,
+      department_id VARCHAR(36) NULL,
+      project_id VARCHAR(36) NULL,
+      supplier_id VARCHAR(36) NULL,
+      vendor_name VARCHAR(200) NULL,
+      vendor_tax_code VARCHAR(60) NULL,
+      requester_user_id VARCHAR(36) NULL,
+      requester_name VARCHAR(150) NULL,
+      approver_user_id VARCHAR(36) NULL,
+      approval_request_id VARCHAR(36) NULL,
+      approval_status VARCHAR(40) NOT NULL DEFAULT 'pending_approval',
+      has_vat_invoice TINYINT(1) NOT NULL DEFAULT 0,
+      is_vat_inclusive TINYINT(1) NOT NULL DEFAULT 1,
+      vat_invoice_no VARCHAR(80) NULL,
+      currency VARCHAR(10) NOT NULL DEFAULT 'VND',
+      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      vat_amount_vnd BIGINT NOT NULL DEFAULT 0,
+      total_amount_vnd BIGINT NOT NULL DEFAULT 0,
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      bank_name VARCHAR(120) NULL,
+      bank_bin VARCHAR(30) NULL,
+      bank_account_no VARCHAR(80) NULL,
+      bank_account_holder VARCHAR(150) NULL,
+      expense_date DATE NOT NULL,
+      due_date DATE NULL,
+      paid_at DATETIME(6) NULL,
+      refund_status VARCHAR(30) NOT NULL DEFAULT 'none',
+      refund_amount_vnd BIGINT NOT NULL DEFAULT 0,
+      refund_attachment_url TEXT NULL,
+      refunded_at DATETIME(6) NULL,
+      line_items_json JSON NULL,
+      attachments_json JSON NULL,
+      watchers_json JSON NULL,
+      history_json JSON NULL,
+      notes TEXT NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_expenses_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_expenses_code UNIQUE (tenant_id, expense_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_pos_sessions (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      session_code VARCHAR(60) NOT NULL,
+      branch_id VARCHAR(36) NULL,
+      warehouse_id VARCHAR(36) NULL,
+      cashier_user_id VARCHAR(36) NULL,
+      cashier_name VARCHAR(150) NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      opening_cash_vnd BIGINT NOT NULL DEFAULT 0,
+      cash_sales_vnd BIGINT NOT NULL DEFAULT 0,
+      bank_sales_vnd BIGINT NOT NULL DEFAULT 0,
+      card_sales_vnd BIGINT NOT NULL DEFAULT 0,
+      expected_closing_cash_vnd BIGINT NOT NULL DEFAULT 0,
+      actual_closing_cash_vnd BIGINT NOT NULL DEFAULT 0,
+      variance_vnd BIGINT NOT NULL DEFAULT 0,
+      orders_count INT NOT NULL DEFAULT 0,
+      opened_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      closed_at DATETIME(6) NULL,
+      closing_note TEXT NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_pos_sessions_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_pos_sessions_code UNIQUE (tenant_id, session_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_pos_orders (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      pos_order_code VARCHAR(60) NOT NULL,
+      session_id VARCHAR(36) NULL,
+      sales_order_id VARCHAR(36) NULL,
+      lead_id VARCHAR(36) NULL,
+      branch_id VARCHAR(36) NULL,
+      warehouse_id VARCHAR(36) NULL,
+      cashier_user_id VARCHAR(36) NULL,
+      customer_name VARCHAR(200) NOT NULL DEFAULT 'Khách lẻ POS',
+      customer_phone VARCHAR(40) NULL,
+      items_json JSON NULL,
+      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
+      discount_vnd BIGINT NOT NULL DEFAULT 0,
+      voucher_code VARCHAR(80) NULL,
+      voucher_discount_vnd BIGINT NOT NULL DEFAULT 0,
+      shipping_fee_vnd BIGINT NOT NULL DEFAULT 0,
+      tax_vnd BIGINT NOT NULL DEFAULT 0,
+      total_vnd BIGINT NOT NULL DEFAULT 0,
+      cash_paid_vnd BIGINT NOT NULL DEFAULT 0,
+      bank_paid_vnd BIGINT NOT NULL DEFAULT 0,
+      payment_method VARCHAR(40) NOT NULL DEFAULT 'cash',
+      cogs_vnd BIGINT NOT NULL DEFAULT 0,
+      status VARCHAR(30) NOT NULL DEFAULT 'completed',
+      notes TEXT NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_pos_orders_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_pos_orders_code UNIQUE (tenant_id, pos_order_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_inventory_sync_sheets (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      sheet_name VARCHAR(150) NOT NULL DEFAULT 'Sheet1',
+      spreadsheet_id VARCHAR(255) NOT NULL,
+      webhook_token VARCHAR(120) NOT NULL,
+      warehouse_id VARCHAR(36) NULL,
+      sync_interval_minutes INT NOT NULL DEFAULT 15,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      sync_status VARCHAR(30) NOT NULL DEFAULT 'idle',
+      last_sync_at DATETIME(6) NULL,
+      last_error TEXT NULL,
+      mappings_json JSON NULL,
+      history_json JSON NULL,
+      created_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_inv_sync_sheets_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_project_roster (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      project_id VARCHAR(36) NOT NULL,
+      user_id VARCHAR(36) NOT NULL,
+      user_name VARCHAR(150) NOT NULL,
+      role_in_project VARCHAR(30) NOT NULL DEFAULT 'member',
+      can_edit_tasks TINYINT(1) NOT NULL DEFAULT 1,
+      can_manage_roster TINYINT(1) NOT NULL DEFAULT 0,
+      can_edit_whiteboard TINYINT(1) NOT NULL DEFAULT 1,
+      allocation_pct INT NOT NULL DEFAULT 100,
+      added_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_project_roster_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_project_roster_member UNIQUE (tenant_id, project_id, user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_task_dependencies (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      project_id VARCHAR(36) NULL,
+      task_id VARCHAR(36) NOT NULL,
+      predecessor_task_id VARCHAR(36) NOT NULL,
+      dependency_type VARCHAR(10) NOT NULL DEFAULT 'FS',
+      lag_days INT NOT NULL DEFAULT 0,
+      created_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_task_deps_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_task_dep_pair UNIQUE (tenant_id, task_id, predecessor_task_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_task_comments (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      task_id VARCHAR(36) NOT NULL,
+      author_user_id VARCHAR(36) NULL,
+      author_name VARCHAR(150) NOT NULL,
+      content TEXT NOT NULL,
+      mentions_json JSON NULL,
+      attachments_json JSON NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_task_attachments (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      task_id VARCHAR(36) NOT NULL,
+      file_name VARCHAR(255) NOT NULL,
+      file_url TEXT NOT NULL,
+      mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
+      size_bytes BIGINT NOT NULL DEFAULT 0,
+      uploaded_by VARCHAR(36) NULL,
+      uploaded_by_name VARCHAR(150) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_task_attachments_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_task_whiteboard_snapshots (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      project_id VARCHAR(36) NOT NULL,
+      snapshot_name VARCHAR(200) NOT NULL,
+      version_no INT NOT NULL DEFAULT 1,
+      snapshot_json JSON NULL,
+      thumbnail_note TEXT NULL,
+      created_by VARCHAR(36) NULL,
+      created_by_name VARCHAR(150) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_wb_snapshots_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_cloud_file_categories (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      category_key VARCHAR(80) NOT NULL,
+      label VARCHAR(150) NOT NULL,
+      icon_type VARCHAR(40) NOT NULL DEFAULT 'folder',
+      visibility VARCHAR(30) NOT NULL DEFAULT 'company',
+      allowed_department_ids JSON NULL,
+      allowed_role_ids JSON NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_cloud_cats_tenant_id UNIQUE (tenant_id, id),
+      CONSTRAINT uk_tenant_cloud_cat_key UNIQUE (tenant_id, category_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_edu_announcements (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      announcement_type VARCHAR(40) NOT NULL DEFAULT 'subject_announcement',
+      course_id VARCHAR(36) NULL,
+      class_id VARCHAR(36) NULL,
+      subject_key VARCHAR(80) NULL,
+      title VARCHAR(255) NOT NULL,
+      content_html TEXT NOT NULL,
+      channels_json JSON NULL,
+      recipients_json JSON NULL,
+      sent_count INT NOT NULL DEFAULT 0,
+      status VARCHAR(30) NOT NULL DEFAULT 'sent',
+      created_by VARCHAR(36) NULL,
+      created_by_name VARCHAR(150) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_tenant_edu_announcements_tenant_id UNIQUE (tenant_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ];
 
   for (const stmt of mariaTables) {
     await client.query(stmt);
+  }
+
+  const mariaColumnUpgrades = [
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS shipping_fee_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS tax_pct DECIMAL(5,2) NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS notes TEXT NULL',
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS customer_name VARCHAR(200) NULL',
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255) NULL',
+    'ALTER TABLE tenant_quotes ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(40) NULL',
+    'ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS shipping_fee_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS voucher_code VARCHAR(80) NULL',
+    "ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer'",
+    'ALTER TABLE tenant_sales_orders ADD COLUMN IF NOT EXISTS split_payments_json JSON NULL',
+    'ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS subtotal_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS discount_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS tax_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS shipping_fee_vnd BIGINT NOT NULL DEFAULT 0',
+    "ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR(30) NOT NULL DEFAULT 'unpaid'",
+    'ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS paid_vnd BIGINT NOT NULL DEFAULT 0',
+    "ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS three_way_match_status VARCHAR(30) NOT NULL DEFAULT 'pending'",
+    'ALTER TABLE tenant_purchase_orders ADD COLUMN IF NOT EXISTS three_way_match_json JSON NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS project_id VARCHAR(36) NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS unit_code VARCHAR(80) NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS contract_value_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS expected_commission_vnd BIGINT NOT NULL DEFAULT 0',
+    "ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS currency VARCHAR(10) NOT NULL DEFAULT 'VND'",
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS exchange_rate DECIMAL(12,4) NOT NULL DEFAULT 1',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS unc_attachment_url TEXT NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS attachments_json JSON NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS commission_shares_json JSON NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS watchers_json JSON NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS history_json JSON NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS confirmed_by VARCHAR(36) NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS confirmed_at DATETIME(6) NULL',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS refunded_amount_vnd BIGINT NOT NULL DEFAULT 0',
+    'ALTER TABLE tenant_deposits ADD COLUMN IF NOT EXISTS refund_reason TEXT NULL',
+    "ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS prestige_tier VARCHAR(10) NOT NULL DEFAULT 'A'",
+    "ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS cooperation_status VARCHAR(30) NOT NULL DEFAULT 'active'",
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS website VARCHAR(255) NULL',
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS bank_name VARCHAR(120) NULL',
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS bank_account_no VARCHAR(80) NULL',
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS bank_account_holder VARCHAR(150) NULL',
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS categories_json JSON NULL',
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS notes TEXT NULL',
+    'ALTER TABLE tenant_suppliers ADD COLUMN IF NOT EXISTS metadata_json JSON NULL',
+    "ALTER TABLE tenant_cloud_files ADD COLUMN IF NOT EXISTS category_key VARCHAR(80) NOT NULL DEFAULT 'general'",
+    'ALTER TABLE tenant_cloud_files ADD COLUMN IF NOT EXISTS lead_id VARCHAR(36) NULL',
+    'ALTER TABLE tenant_cloud_files ADD COLUMN IF NOT EXISTS file_url TEXT NULL',
+    "ALTER TABLE tenant_edu_courses ADD COLUMN IF NOT EXISTS grading_scale VARCHAR(30) NOT NULL DEFAULT 'scale_10'",
+    'ALTER TABLE tenant_edu_courses ADD COLUMN IF NOT EXISTS subjects_json JSON NULL',
+    'ALTER TABLE tenant_edu_courses ADD COLUMN IF NOT EXISTS credits INT NOT NULL DEFAULT 3',
+    'ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS program_code VARCHAR(60) NULL',
+    "ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_status VARCHAR(30) NOT NULL DEFAULT 'none'",
+    'ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_reason TEXT NULL',
+    'ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_until DATE NULL',
+    'ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS postpone_ocr_json JSON NULL',
+    'ALTER TABLE tenant_edu_enrollments ADD COLUMN IF NOT EXISTS metadata_json JSON NULL',
+    "ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS subject_key VARCHAR(80) NOT NULL DEFAULT 'GENERAL'",
+    'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS subject_name VARCHAR(200) NULL',
+    'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS attendance_score DECIMAL(5,2) NULL',
+    'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS assignment_score DECIMAL(5,2) NULL',
+    'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS ects_score_6 DECIMAL(5,2) NULL',
+    'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS letter_grade VARCHAR(40) NULL',
+    "ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS pass_status VARCHAR(20) NOT NULL DEFAULT 'passed'",
+  ];
+
+  for (const alt of mariaColumnUpgrades) {
+    try {
+      await client.query(alt);
+    } catch {
+      // ignore if column already exists on older engines
+    }
   }
 }

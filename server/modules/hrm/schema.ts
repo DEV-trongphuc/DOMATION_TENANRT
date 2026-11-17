@@ -27,6 +27,8 @@ export const HRM_APPROVALS_TENANT_TABLES = [
   'tenant_payroll_slips',
   'tenant_commission_rules',
   'tenant_commission_ledgers',
+  'tenant_cooperation_slips',
+  'tenant_accounting_az_workspace',
 ] as const;
 
 export function parseJsonSafe<T>(val: unknown, fallback: T): T {
@@ -725,8 +727,63 @@ async function runPostgresHrmApprovalsDdl(client: DbClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_comm_ledgers_period ON tenant_commission_ledgers(tenant_id, period_key, user_id);
 
+    ALTER TABLE tenant_payroll_slips ADD COLUMN IF NOT EXISTS signed_by_employee BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE tenant_payroll_slips ADD COLUMN IF NOT EXISTS employee_signature_url TEXT;
+    ALTER TABLE tenant_payroll_slips ADD COLUMN IF NOT EXISTS employee_signed_at TIMESTAMPTZ;
+    ALTER TABLE tenant_payroll_slips ADD COLUMN IF NOT EXISTS dispute_status VARCHAR(30);
+    ALTER TABLE tenant_payroll_slips ADD COLUMN IF NOT EXISTS dispute_note TEXT;
+    ALTER TABLE tenant_payroll_slips ADD COLUMN IF NOT EXISTS disputed_at TIMESTAMPTZ;
+
+    CREATE TABLE IF NOT EXISTS tenant_cooperation_slips (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      slip_code VARCHAR(80),
+      title VARCHAR(255) NOT NULL,
+      lead_id UUID,
+      deal_id UUID,
+      partner_name VARCHAR(255),
+      partner_contact VARCHAR(120),
+      commission_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+      estimated_value_vnd NUMERIC(18,2) NOT NULL DEFAULT 0,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending_signatures',
+      terms_text TEXT,
+      line_items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      owner_user_id UUID,
+      approved_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS unit_code VARCHAR(80);
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS project_name VARCHAR(200);
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS expected_commission_vnd NUMERIC(18,2) NOT NULL DEFAULT 0;
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS total_percentage NUMERIC(6,2) NOT NULL DEFAULT 100;
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS dispute_details TEXT;
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+    ALTER TABLE tenant_cooperation_slips ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+    CREATE INDEX IF NOT EXISTS idx_coop_slips_status ON tenant_cooperation_slips(tenant_id, status);
+
+    CREATE TABLE IF NOT EXISTS tenant_accounting_az_workspace (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      fiscal_period VARCHAR(20) NOT NULL,
+      account_code VARCHAR(40) NOT NULL DEFAULT '111',
+      account_name VARCHAR(200) NOT NULL DEFAULT 'Tiền mặt',
+      voucher_no VARCHAR(80),
+      entry_type VARCHAR(30) NOT NULL DEFAULT 'journal',
+      debit_vnd NUMERIC(18,2) NOT NULL DEFAULT 0,
+      credit_vnd NUMERIC(18,2) NOT NULL DEFAULT 0,
+      balance_vnd NUMERIC(18,2) NOT NULL DEFAULT 0,
+      tax_period VARCHAR(20),
+      analytics_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      extra_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+    CREATE INDEX IF NOT EXISTS idx_acc_az_period ON tenant_accounting_az_workspace(tenant_id, fiscal_period, account_code);
+
     -- ========================================================================
-    -- 5. FORCE ROW LEVEL SECURITY + POLICIES + GRANTS ON ALL 19 TABLES
+    -- 5. FORCE ROW LEVEL SECURITY + POLICIES + GRANTS ON ALL 21 TABLES
     -- ========================================================================
     DO $$
     DECLARE
@@ -752,7 +809,9 @@ async function runPostgresHrmApprovalsDdl(client: DbClient): Promise<void> {
         'tenant_payroll_periods',
         'tenant_payroll_slips',
         'tenant_commission_rules',
-        'tenant_commission_ledgers'
+        'tenant_commission_ledgers',
+        'tenant_cooperation_slips',
+        'tenant_accounting_az_workspace'
       ]
       LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', tbl);
@@ -793,7 +852,9 @@ async function runPostgresHrmApprovalsDdl(client: DbClient): Promise<void> {
           'tenant_payroll_periods',
           'tenant_payroll_slips',
           'tenant_commission_rules',
-          'tenant_commission_ledgers'
+          'tenant_commission_ledgers',
+          'tenant_cooperation_slips',
+          'tenant_accounting_az_workspace'
         ]
         LOOP
           EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO autodata_app', tbl);
@@ -1324,11 +1385,73 @@ async function runMariaDbHrmApprovalsDdl(client: DbClient): Promise<void> {
       CONSTRAINT uk_tenant_commission_ledgers_tenant_id UNIQUE (tenant_id, id),
       INDEX idx_comm_ledgers_period (tenant_id, period_key, user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+    `CREATE TABLE IF NOT EXISTS tenant_cooperation_slips (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      slip_code VARCHAR(80) NULL,
+      title VARCHAR(255) NOT NULL,
+      lead_id VARCHAR(36) NULL,
+      deal_id VARCHAR(36) NULL,
+      partner_name VARCHAR(255) NULL,
+      partner_contact VARCHAR(120) NULL,
+      commission_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+      estimated_value_vnd DECIMAL(18,2) NOT NULL DEFAULT 0,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending_signatures',
+      terms_text TEXT NULL,
+      line_items_json JSON NOT NULL,
+      owner_user_id VARCHAR(36) NULL,
+      approved_by VARCHAR(36) NULL,
+      unit_code VARCHAR(80) NULL,
+      project_name VARCHAR(200) NULL,
+      expected_commission_vnd DECIMAL(18,2) NOT NULL DEFAULT 0,
+      total_percentage DECIMAL(6,2) NOT NULL DEFAULT 100,
+      dispute_details TEXT NULL,
+      approved_at DATETIME(6) NULL,
+      metadata_json JSON NOT NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      INDEX idx_coop_slips_status (tenant_id, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+    `CREATE TABLE IF NOT EXISTS tenant_accounting_az_workspace (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      fiscal_period VARCHAR(20) NOT NULL,
+      account_code VARCHAR(40) NOT NULL DEFAULT '111',
+      account_name VARCHAR(200) NOT NULL DEFAULT 'Tiền mặt',
+      voucher_no VARCHAR(80) NULL,
+      entry_type VARCHAR(30) NOT NULL DEFAULT 'journal',
+      debit_vnd DECIMAL(18,2) NOT NULL DEFAULT 0,
+      credit_vnd DECIMAL(18,2) NOT NULL DEFAULT 0,
+      balance_vnd DECIMAL(18,2) NOT NULL DEFAULT 0,
+      tax_period VARCHAR(20) NULL,
+      analytics_json JSON NOT NULL,
+      extra_json JSON NOT NULL,
+      created_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      INDEX idx_acc_az_period (tenant_id, fiscal_period, account_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ];
 
   for (const stmt of statements) {
     await client.query(stmt);
   }
+
+  await addMariaDbColumnSafe(client, 'tenant_payroll_slips', 'signed_by_employee', 'TINYINT(1) NOT NULL DEFAULT 0');
+  await addMariaDbColumnSafe(client, 'tenant_payroll_slips', 'employee_signature_url', 'TEXT NULL');
+  await addMariaDbColumnSafe(client, 'tenant_payroll_slips', 'employee_signed_at', 'DATETIME(6) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_payroll_slips', 'dispute_status', 'VARCHAR(30) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_payroll_slips', 'dispute_note', 'TEXT NULL');
+  await addMariaDbColumnSafe(client, 'tenant_payroll_slips', 'disputed_at', 'DATETIME(6) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'unit_code', 'VARCHAR(80) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'project_name', 'VARCHAR(200) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'expected_commission_vnd', 'DECIMAL(18,2) NOT NULL DEFAULT 0');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'total_percentage', 'DECIMAL(6,2) NOT NULL DEFAULT 100');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'dispute_details', 'TEXT NULL');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'approved_at', 'DATETIME(6) NULL');
+  await addMariaDbColumnSafe(client, 'tenant_cooperation_slips', 'metadata_json', 'JSON NULL');
 }
 
 /**

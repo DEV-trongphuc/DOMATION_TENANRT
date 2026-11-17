@@ -302,13 +302,25 @@ export async function handleLegacyCrm(
       }
     }
 
+    const curLeadRes = await client.query<{ custom_fields: Record<string, any> | null }>(
+      'SELECT custom_fields FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+      [ctx.tenantId, leadId]
+    );
+    const mergedCustomFields = {
+      ...(curLeadRes.rows[0]?.custom_fields && typeof curLeadRes.rows[0].custom_fields === 'object'
+        ? curLeadRes.rows[0].custom_fields
+        : {}),
+      ...(body.type !== undefined ? { type: body.type } : {}),
+      ...(body.note !== undefined ? { note: body.note } : {}),
+    };
+
     await client.query(
       `UPDATE leads
        SET name = COALESCE($3, name),
            phone = COALESCE($4, phone),
            email = COALESCE($5, email),
            source = COALESCE($6, source),
-           custom_fields = custom_fields || $7::jsonb,
+           custom_fields = $7::jsonb,
            updated_at = clock_timestamp()
        WHERE tenant_id = $1 AND id = $2`,
       [
@@ -318,10 +330,7 @@ export async function handleLegacyCrm(
         body.phone !== undefined ? String(body.phone) : null,
         body.email !== undefined ? String(body.email) : null,
         body.source !== undefined ? String(body.source) : null,
-        JSON.stringify({
-          ...(body.type !== undefined ? { type: body.type } : {}),
-          ...(body.note !== undefined ? { note: body.note } : {}),
-        }),
+        JSON.stringify(mergedCustomFields),
       ]
     );
     return { success: true, message: 'Đã cập nhật thông tin khách hàng.' };
@@ -795,10 +804,10 @@ export async function handleLegacyCrm(
       ),
       client.query(
         `SELECT
-           COUNT(*) FILTER (WHERE status = 'held')::int AS queue,
-           COUNT(*) FILTER (WHERE status = 'approved')::int AS assigned,
-           COUNT(*) FILTER (WHERE status = 'rejected')::int AS substandard,
-           COUNT(*) FILTER (WHERE status = 'blacklisted')::int AS blacklisted
+           COALESCE(SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END), 0) AS queue,
+           COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS assigned,
+           COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS substandard,
+           COALESCE(SUM(CASE WHEN status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted
          FROM held_leads
          WHERE tenant_id = $1`,
         [ctx.tenantId]
@@ -928,10 +937,10 @@ export async function handleLegacyCrm(
       ),
       client.query(
         `SELECT
-           COUNT(*)::int AS total,
-           COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
-           COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
-           COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+           COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
+           COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected
          FROM data_reports
          WHERE tenant_id = $1`,
         [ctx.tenantId]

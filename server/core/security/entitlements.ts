@@ -31,6 +31,7 @@ export type SaasModuleKey =
   // Core Workspace & Governance
   | 'settings'
   | 'org_rbac'
+  | 'users'
   | 'billing'
   | 'leads'
   // Package 1: Auto Data & CRM
@@ -73,6 +74,8 @@ export type SaasModuleKey =
   | 'enterprise_feed'
   | 'helpdesk'
   | 'crm_b2b'
+  | 'deals'
+  | 'companies'
   | 'finance'
   | 'quotes_orders'
   | 'inventory_assets'
@@ -102,6 +105,7 @@ export const SAAS_MODULES_CATALOG: SaasModuleDescriptor[] = [
   // Core
   { key: 'leads', name: 'Danh bạ Khách hàng 360° (Master Contact)', group: 'core', always_enabled: true },
   { key: 'org_rbac', name: 'Sơ đồ Tổ chức & Phân quyền RBAC', group: 'core', always_enabled: true },
+  { key: 'users', name: 'Nhân sự Tài khoản & Phân quyền Người dùng', group: 'core', always_enabled: true },
   { key: 'settings', name: 'Cấu hình Hệ thống & Từ điển Đa ngành', group: 'core', always_enabled: true },
   { key: 'billing', name: 'Gói cước & Ví thanh toán', group: 'core', always_enabled: true },
 
@@ -148,6 +152,8 @@ export const SAAS_MODULES_CATALOG: SaasModuleDescriptor[] = [
   { key: 'enterprise_feed', name: 'Bảng tin Doanh nghiệp & Vinh danh', group: 'erp_work' },
   { key: 'helpdesk', name: 'Helpdesk CSKH & Hỗ trợ SLA', group: 'erp_work' },
   { key: 'crm_b2b', name: 'B2B Accounts & Multi-Deals', group: 'erp_finance' },
+  { key: 'deals', name: 'Quản lý Cơ hội & Deals (Kanban)', group: 'erp_finance' },
+  { key: 'companies', name: 'Doanh nghiệp Khách hàng B2B (Companies)', group: 'erp_finance' },
   { key: 'finance', name: 'Tài chính, Thu-Chi & Đặt cọc', group: 'erp_finance' },
   { key: 'quotes_orders', name: 'Báo giá, Đơn bán (SO) & Đơn mua (PO)', group: 'erp_finance' },
   { key: 'inventory_assets', name: 'Kho vận FIFO, Sản phẩm & Tài sản', group: 'erp_finance' },
@@ -159,7 +165,7 @@ export const SAAS_MODULES_CATALOG: SaasModuleDescriptor[] = [
   { key: 'education', name: 'Phân hệ Đào tạo & Học vụ (Education Add-on)', group: 'addon' },
 ];
 
-const CORE_MODULES: SaasModuleKey[] = ['leads', 'org_rbac', 'settings', 'billing'];
+const CORE_MODULES: SaasModuleKey[] = ['leads', 'org_rbac', 'users', 'settings', 'billing'];
 
 /**
  * Bidirectional Module-Key Alias Registry (Backend `SAAS_MODULES_CATALOG` <-> Frontend UI Keys)
@@ -288,6 +294,8 @@ const DOMATION_PROMAX_MODULES: SaasModuleKey[] = Array.from(
     'enterprise_feed',
     'helpdesk',
     'crm_b2b',
+    'deals',
+    'companies',
     'finance',
     'quotes_orders',
     'inventory_assets',

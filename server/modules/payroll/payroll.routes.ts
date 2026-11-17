@@ -1203,3 +1203,1096 @@ payrollRouter.get('/periods/:id/export-csv', requirePermission('payroll', 'expor
     sendApiError(res, 500, 'EXPORT_PAYROLL_CSV_FAILED', err?.message || 'Không thể xuất bảng lương CSV.');
   }
 });
+
+// ============================================================================
+// 4. Employee Self-Service Payslips (`/my-payslips`, `/slips/:id/sign`, `/slips/:id/dispute`)
+// ============================================================================
+payrollRouter.get('/my-payslips', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const requestedPeriodKey = req.query.period_key ? String(req.query.period_key).trim() : '';
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [tenantRes, branchRes, slipsRes] = await Promise.all([
+        client.query('SELECT name FROM tenants WHERE id = $1 LIMIT 1', [ctx.tenantId]),
+        client.query(
+          'SELECT * FROM tenant_branches WHERE tenant_id = $1 AND is_active = true ORDER BY is_headquarters DESC, created_at ASC LIMIT 1',
+          [ctx.tenantId]
+        ),
+        client.query(
+          `SELECT s.*,
+                  p.period_key, p.title AS period_title, p.status AS period_status, p.year, p.month,
+                  e.employee_code, e.full_name AS employee_name, e.tax_code, e.bank_name, e.bank_account_number,
+                  d.name AS department_name, b.name AS branch_name
+           FROM tenant_payroll_slips s
+           INNER JOIN tenant_payroll_periods p ON p.tenant_id = s.tenant_id AND p.id = s.period_id
+           INNER JOIN tenant_hr_employees e ON e.tenant_id = s.tenant_id AND e.id = s.employee_id
+           LEFT JOIN tenant_departments d ON d.tenant_id = e.tenant_id AND d.id = e.department_id
+           LEFT JOIN tenant_branches b ON b.tenant_id = e.tenant_id AND b.id = e.branch_id
+           WHERE s.tenant_id = $1 AND (s.user_id = $2 OR e.user_id = $2)
+           ORDER BY p.year DESC, p.month DESC`,
+          [ctx.tenantId, ctx.userId]
+        ),
+      ]);
+
+      const br = branchRes.rows[0] || {};
+      const tenantName = String(tenantRes.rows[0]?.name || 'Doanh nghiệp');
+      const legalEntity = {
+        legal_entity_name: String(br.legal_entity_name || br.name || tenantName),
+        tax_code: String(br.tax_code || ''),
+        address: String(br.address || ''),
+        phone: String(br.phone || ''),
+        representative_name: String(br.representative_name || ''),
+      };
+
+      const normalizedSlips = slipsRes.rows.map((s) => ({
+        ...s,
+        base_salary_vnd: toNum(s.base_salary_vnd, 0),
+        prorated_base_pay_vnd: toNum(s.prorated_base_pay_vnd, 0),
+        allowances_vnd: toNum(s.allowances_vnd, 0),
+        tax_exempt_vnd: toNum(s.tax_exempt_vnd, 0),
+        overtime_pay_vnd: toNum(s.overtime_pay_vnd, 0),
+        commission_pay_vnd: toNum(s.commission_pay_vnd, 0),
+        bonus_vnd: toNum(s.bonus_vnd, 0),
+        gross_pay_vnd: toNum(s.gross_pay_vnd, 0),
+        emp_bhxh_vnd: toNum(s.emp_bhxh_vnd, 0),
+        emp_bhyt_vnd: toNum(s.emp_bhyt_vnd, 0),
+        emp_bhtn_vnd: toNum(s.emp_bhtn_vnd, 0),
+        emp_union_vnd: toNum(s.emp_union_vnd, 0),
+        family_deduction_vnd: toNum(s.family_deduction_vnd, 0),
+        taxable_income_vnd: toNum(s.taxable_income_vnd, 0),
+        assessable_income_vnd: toNum(s.assessable_income_vnd, 0),
+        pit_tax_vnd: toNum(s.pit_tax_vnd, 0),
+        advance_deduction_vnd: toNum(s.advance_deduction_vnd, 0),
+        other_deduction_vnd: toNum(s.other_deduction_vnd, 0),
+        net_pay_vnd: toNum(s.net_pay_vnd, 0),
+        signed_by_employee: toBool(s.signed_by_employee, false),
+        breakdown: parseJsonSafe<Record<string, unknown>>(s.breakdown, {}),
+      }));
+
+      const activeSlip =
+        (requestedPeriodKey && requestedPeriodKey !== 'all'
+          ? normalizedSlips.find((x) => String(x.period_key) === requestedPeriodKey)
+          : normalizedSlips[0]) || null;
+
+      return {
+        legal_entity: legalEntity,
+        selected_period_key: requestedPeriodKey || (activeSlip ? String(activeSlip.period_key) : ''),
+        payslip: activeSlip,
+        all_payslips: normalizedSlips,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_MY_PAYSLIPS_FAILED', err?.message || 'Không thể tải phiếu lương cá nhân.');
+  }
+});
+
+payrollRouter.post('/slips/:id/sign', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const slipId = String(req.params.id);
+    const sigUrl = String(req.body?.signature_data_url || req.body?.signature_url || '').trim();
+    if (!sigUrl) {
+      sendApiError(res, 422, 'SIGNATURE_REQUIRED', 'Vui lòng ký xác nhận phiếu lương.');
+      return;
+    }
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const sRes = await client.query<{ id: string; user_id: string | null; employee_id: string }>(
+        'SELECT id, user_id, employee_id FROM tenant_payroll_slips WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, slipId]
+      );
+      const s = sRes.rows[0];
+      if (!s) return { error: 'NOT_FOUND' as const };
+
+      // Allow employee owner or tenant owner
+      if (s.user_id && String(s.user_id) !== ctx.userId) {
+        const rbac = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
+        if (!rbac.userOrg?.is_tenant_owner) {
+          return { error: 'FORBIDDEN' as const };
+        }
+      }
+
+      await client.query(
+        `UPDATE tenant_payroll_slips
+         SET signed_by_employee = true,
+             employee_signature_url = $3,
+             employee_signed_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, slipId, sigUrl]
+      );
+      const r = await client.query('SELECT * FROM tenant_payroll_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      return { data: { ...r.rows[0], signed_by_employee: toBool(r.rows[0]?.signed_by_employee, true) } };
+    });
+
+    if ('error' in updated) {
+      if (updated.error === 'FORBIDDEN') {
+        sendApiError(res, 403, 'FORBIDDEN_SLIP_SIGN', 'Bạn chỉ được ký xác nhận phiếu lương của chính mình.');
+        return;
+      }
+      sendApiError(res, 404, 'SLIP_NOT_FOUND', 'Không tìm thấy phiếu lương.');
+      return;
+    }
+
+    res.json({ success: true, data: updated.data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SIGN_PAYSLIP_FAILED', err?.message || 'Không thể lưu chữ ký phiếu lương.');
+  }
+});
+
+payrollRouter.post('/slips/:id/dispute', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const slipId = String(req.params.id);
+    const note = String(req.body?.dispute_note || req.body?.note || req.body?.reason || '').trim();
+    const nextStatus = req.body?.status === 'resolved' ? 'resolved' : 'open';
+
+    if (!note && nextStatus === 'open') {
+      sendApiError(res, 422, 'DISPUTE_NOTE_REQUIRED', 'Vui lòng nhập nội dung thắc mắc bảng lương.');
+      return;
+    }
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const sRes = await client.query('SELECT id FROM tenant_payroll_slips WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      if (!sRes.rows[0]) return null;
+
+      await client.query(
+        `UPDATE tenant_payroll_slips
+         SET dispute_status = $3,
+             dispute_note = COALESCE($4, dispute_note),
+             disputed_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, slipId, nextStatus, note || null]
+      );
+      const r = await client.query('SELECT * FROM tenant_payroll_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      return r.rows[0];
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'SLIP_NOT_FOUND', 'Không tìm thấy phiếu lương.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DISPUTE_PAYSLIP_FAILED', err?.message || 'Không thể gửi phản hồi phiếu lương.');
+  }
+});
+
+// ============================================================================
+// 5. Multi-Sale Cooperation Slips (`/cooperation-slips`)
+// ============================================================================
+interface CooperationShareholder {
+  user_id: string;
+  name: string;
+  email: string;
+  percentage: number;
+  signed: boolean;
+  signature_url?: string | null;
+  signature_time: string | null;
+  signature_ip: string | null;
+}
+
+function normalizeCoopSlipRow(row: Record<string, unknown>) {
+  const shareholders = parseJsonSafe<CooperationShareholder[]>(row.line_items_json, []);
+  const meta = parseJsonSafe<Record<string, unknown>>(row.metadata_json, {});
+  return {
+    ...row,
+    estimated_value_vnd: toNum(row.estimated_value_vnd, 0),
+    expected_revenue: toNum(row.estimated_value_vnd, 0),
+    expected_commission_vnd: toNum(row.expected_commission_vnd, 0),
+    expected_commission: toNum(row.expected_commission_vnd, 0),
+    commission_pct: toNum(row.commission_pct, 0),
+    total_percentage: toNum(row.total_percentage, 100),
+    shareholders,
+    approver: meta.approver || null,
+    adjustment_request: meta.adjustment_request || null,
+  };
+}
+
+payrollRouter.get('/cooperation-slips', requirePermission('payroll', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const statusFilter = req.query.status ? String(req.query.status).trim() : 'all';
+    const q = req.query.q ? String(req.query.q).trim().toLowerCase() : '';
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      let sql = 'SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1';
+      const params: unknown[] = [ctx.tenantId];
+      if (statusFilter && statusFilter !== 'all') {
+        params.push(statusFilter);
+        sql += ` AND status = $${params.length}`;
+      }
+      sql += ' ORDER BY created_at DESC LIMIT 200';
+
+      const [slipsRes, usersRes] = await Promise.all([
+        client.query(sql, params),
+        client.query(
+          `SELECT id, full_name, email, role, department_id
+           FROM users
+           WHERE tenant_id = $1 AND is_system_bot = false
+           ORDER BY full_name ASC`,
+          [ctx.tenantId]
+        ),
+      ]);
+
+      let items = slipsRes.rows.map((r) => normalizeCoopSlipRow(r));
+      if (q) {
+        items = items.filter(
+          (item: Record<string, unknown>) =>
+            String(item.title || '').toLowerCase().includes(q) ||
+            String(item.slip_code || '').toLowerCase().includes(q) ||
+            String(item.partner_name || '').toLowerCase().includes(q) ||
+            String(item.unit_code || '').toLowerCase().includes(q) ||
+            String(item.project_name || '').toLowerCase().includes(q)
+        );
+      }
+
+      return {
+        items,
+        sales_accounts: usersRes.rows,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_COOPERATION_SLIPS_FAILED', err?.message || 'Không thể tải danh sách phiếu hợp tác.');
+  }
+});
+
+payrollRouter.post('/cooperation-slips', requirePermission('payroll', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const title = String(b.title || b.partner_name || 'Phiếu hợp tác kinh doanh').trim();
+    const rawShares = Array.isArray(b.shareholders) ? b.shareholders : [];
+
+    if (rawShares.length === 0) {
+      sendApiError(res, 422, 'SHAREHOLDERS_REQUIRED', 'Vui lòng phân bổ ít nhất 1 thành viên trên phiếu hợp tác.');
+      return;
+    }
+
+    const totalPct = rawShares.reduce((acc: number, s: any) => acc + toNum(s?.percentage, 0), 0);
+    if (Math.abs(totalPct - 100) > 0.05) {
+      sendApiError(
+        res,
+        422,
+        'INVALID_SHARE_TOTAL',
+        `Tổng tỷ lệ hợp tác bắt buộc bằng 100% (hiện tại: ${totalPct.toFixed(2)}%).`
+      );
+      return;
+    }
+
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const usersRes = await client.query<{ id: string; full_name: string; email: string }>(
+        'SELECT id, full_name, email FROM users WHERE tenant_id = $1',
+        [ctx.tenantId]
+      );
+      const userMap = new Map(usersRes.rows.map((u) => [String(u.id), u]));
+
+      const shareholders: CooperationShareholder[] = rawShares.map((s: any) => {
+        const uid = String(s.user_id || '').trim();
+        const u = userMap.get(uid);
+        return {
+          user_id: uid,
+          name: String(s.name || u?.full_name || 'Thành viên'),
+          email: String(s.email || u?.email || ''),
+          percentage: Math.round(toNum(s.percentage, 0) * 100) / 100,
+          signed: false,
+          signature_url: null,
+          signature_time: null,
+          signature_ip: null,
+        };
+      });
+
+      const id = crypto.randomUUID();
+      const ym = new Date().toISOString().slice(0, 7).replace('-', '');
+      const slipCode = b.slip_code
+        ? String(b.slip_code).trim()
+        : `HT-${ym}-${id.slice(0, 4).toUpperCase()}`;
+      const expectedRevenue = Math.max(0, toNum(b.estimated_value_vnd ?? b.expected_revenue, 0));
+      const expectedComm = Math.max(0, toNum(b.expected_commission_vnd ?? b.expected_commission, 0));
+      const commPct =
+        b.commission_pct !== undefined
+          ? toNum(b.commission_pct, 0)
+          : expectedRevenue > 0
+            ? Math.round((expectedComm / expectedRevenue) * 10000) / 100
+            : 0;
+
+      await client.query(
+        `INSERT INTO tenant_cooperation_slips (
+           id, tenant_id, slip_code, title, lead_id, deal_id, partner_name, partner_contact,
+           commission_pct, estimated_value_vnd, status, terms_text, line_items_json,
+           owner_user_id, unit_code, project_name, expected_commission_vnd, total_percentage, metadata_json
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8,
+           $9, $10, 'pending_signatures', $11, $12::jsonb,
+           $13, $14, $15, $16, $17, $18::jsonb
+         )`,
+        [
+          id,
+          ctx.tenantId,
+          slipCode,
+          title,
+          b.lead_id || null,
+          b.deal_id || null,
+          b.partner_name || b.full_name || null,
+          b.partner_contact || b.phone || null,
+          commPct,
+          expectedRevenue,
+          b.terms_text || null,
+          JSON.stringify(shareholders),
+          ctx.userId,
+          b.unit_code || null,
+          b.project_name || null,
+          expectedComm,
+          totalPct,
+          JSON.stringify({ version: 1 }),
+        ]
+      );
+
+      const r = await client.query('SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return normalizeCoopSlipRow(r.rows[0]);
+    });
+
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_COOPERATION_SLIP_FAILED', err?.message || 'Không thể khởi tạo phiếu hợp tác.');
+  }
+});
+
+payrollRouter.patch('/cooperation-slips/:id/shares', requirePermission('payroll', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const slipId = String(req.params.id);
+    const b = req.body || {};
+    const rawShares = Array.isArray(b.shareholders) ? b.shareholders : [];
+
+    const totalPct = rawShares.reduce((acc: number, s: any) => acc + toNum(s?.percentage, 0), 0);
+    if (rawShares.length === 0 || Math.abs(totalPct - 100) > 0.05) {
+      sendApiError(res, 422, 'INVALID_SHARE_TOTAL', 'Tổng tỷ lệ phân bổ phải bằng 100%.');
+      return;
+    }
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const curRes = await client.query(
+        'SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, slipId]
+      );
+      if (!curRes.rows[0]) return null;
+      const cur = curRes.rows[0];
+
+      const usersRes = await client.query<{ id: string; full_name: string; email: string }>(
+        'SELECT id, full_name, email FROM users WHERE tenant_id = $1',
+        [ctx.tenantId]
+      );
+      const userMap = new Map(usersRes.rows.map((u) => [String(u.id), u]));
+
+      const nextShares: CooperationShareholder[] = rawShares.map((s: any) => {
+        const uid = String(s.user_id || '').trim();
+        const u = userMap.get(uid);
+        return {
+          user_id: uid,
+          name: String(s.name || u?.full_name || 'Thành viên'),
+          email: String(s.email || u?.email || ''),
+          percentage: Math.round(toNum(s.percentage, 0) * 100) / 100,
+          signed: false,
+          signature_url: null,
+          signature_time: null,
+          signature_ip: null,
+        };
+      });
+
+      const meta = parseJsonSafe<Record<string, unknown>>(cur.metadata_json, {});
+      meta.version = Number(meta.version || 1) + 1;
+      meta.last_change_reason = b.change_reason || null;
+
+      const nextExpectedComm =
+        b.expected_commission_vnd !== undefined || b.expected_commission !== undefined
+          ? Math.max(0, toNum(b.expected_commission_vnd ?? b.expected_commission, 0))
+          : toNum(cur.expected_commission_vnd, 0);
+
+      await client.query(
+        `UPDATE tenant_cooperation_slips
+         SET line_items_json = $3::jsonb,
+             expected_commission_vnd = $4,
+             total_percentage = $5,
+             status = 'pending_signatures',
+             dispute_details = NULL,
+             metadata_json = $6::jsonb,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, slipId, JSON.stringify(nextShares), nextExpectedComm, totalPct, JSON.stringify(meta)]
+      );
+
+      const r = await client.query('SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      return normalizeCoopSlipRow(r.rows[0]);
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'COOP_SLIP_NOT_FOUND', 'Không tìm thấy phiếu hợp tác.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_COOP_SHARES_FAILED', err?.message || 'Không thể cập nhật tỷ lệ hợp tác.');
+  }
+});
+
+payrollRouter.post('/cooperation-slips/:id/sign', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const slipId = String(req.params.id);
+    const sigUrl = String(req.body?.signature_data_url || req.body?.signature_url || 'signed').trim();
+    const clientIp = String(req.ip || req.headers['x-forwarded-for'] || '127.0.0.1');
+
+    const result = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const curRes = await client.query(
+        'SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, slipId]
+      );
+      if (!curRes.rows[0]) return { error: 'NOT_FOUND' as const };
+      const cur = curRes.rows[0];
+      const shares = parseJsonSafe<CooperationShareholder[]>(cur.line_items_json, []);
+      const idx = shares.findIndex((s) => String(s.user_id) === ctx.userId);
+      if (idx < 0) return { error: 'NOT_SHAREHOLDER' as const };
+
+      shares[idx] = {
+        ...shares[idx],
+        signed: true,
+        signature_url: sigUrl,
+        signature_time: new Date().toISOString(),
+        signature_ip: clientIp,
+      };
+
+      const allSigned = shares.length > 0 && shares.every((s) => Boolean(s.signed));
+      const nextStatus =
+        cur.status === 'approved'
+          ? 'approved'
+          : allSigned
+            ? 'pending_manager_approval'
+            : 'pending_signatures';
+
+      await client.query(
+        `UPDATE tenant_cooperation_slips
+         SET line_items_json = $3::jsonb,
+             status = $4,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, slipId, JSON.stringify(shares), nextStatus]
+      );
+
+      const r = await client.query('SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      return { data: normalizeCoopSlipRow(r.rows[0]) };
+    });
+
+    if ('error' in result) {
+      if (result.error === 'NOT_SHAREHOLDER') {
+        sendApiError(res, 403, 'NOT_SHAREHOLDER', 'Bạn không nằm trong danh sách thành viên ký trên phiếu hợp tác này.');
+        return;
+      }
+      sendApiError(res, 404, 'COOP_SLIP_NOT_FOUND', 'Không tìm thấy phiếu hợp tác.');
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SIGN_COOP_SLIP_FAILED', err?.message || 'Không thể ký xác nhận phiếu hợp tác.');
+  }
+});
+
+payrollRouter.post('/cooperation-slips/:id/decide', requirePermission('payroll', 'approve'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const slipId = String(req.params.id);
+    const decision = String(req.body?.decision || 'approve').toLowerCase();
+    const isApprove = decision.startsWith('approv');
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const curRes = await client.query(
+        'SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, slipId]
+      );
+      if (!curRes.rows[0]) return null;
+      const cur = curRes.rows[0];
+      const shares = parseJsonSafe<CooperationShareholder[]>(cur.line_items_json, []);
+      const meta = parseJsonSafe<Record<string, unknown>>(cur.metadata_json, {});
+
+      const nextStatus = isApprove ? 'approved' : 'rejected';
+      meta.approver = {
+        user_id: ctx.userId,
+        name: ctx.userName || 'Quản lý phê duyệt',
+        email: ctx.userEmail || '',
+        approved_at: new Date().toISOString(),
+        comment: req.body?.comment || null,
+      };
+
+      await client.query(
+        `UPDATE tenant_cooperation_slips
+         SET status = $3,
+             approved_by = $4,
+             approved_at = clock_timestamp(),
+             metadata_json = $5::jsonb,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, slipId, nextStatus, ctx.userId, JSON.stringify(meta)]
+      );
+
+      // When approved and expected_commission_vnd > 0, record commission ledgers per shareholder
+      const totalComm = toNum(cur.expected_commission_vnd, 0);
+      if (isApprove && totalComm > 0 && shares.length > 0) {
+        const periodKey = String(req.body?.period_key || new Date().toISOString().slice(0, 7));
+        const totalRev = toNum(cur.estimated_value_vnd, 0);
+        for (const sh of shares) {
+          const shareComm = Math.round((totalComm * toNum(sh.percentage, 0)) / 100);
+          const shareRev = Math.round((totalRev * toNum(sh.percentage, 0)) / 100);
+          if (shareComm > 0 && sh.user_id) {
+            await client.query(
+              `INSERT INTO tenant_commission_ledgers (
+                 id, tenant_id, period_key, user_id, lead_id, source_title,
+                 revenue_base_vnd, commission_amount_vnd, status, notes
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved', $9)`,
+              [
+                crypto.randomUUID(),
+                ctx.tenantId,
+                periodKey,
+                sh.user_id,
+                cur.lead_id || null,
+                `Phiếu hợp tác ${cur.slip_code} (${sh.percentage}%) — ${cur.title}`,
+                shareRev,
+                shareComm,
+                `Tự động ghi nhận từ duyệt phiếu hợp tác ${cur.slip_code}`,
+              ]
+            );
+          }
+        }
+      }
+
+      const r = await client.query('SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      return normalizeCoopSlipRow(r.rows[0]);
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'COOP_SLIP_NOT_FOUND', 'Không tìm thấy phiếu hợp tác.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DECIDE_COOP_SLIP_FAILED', err?.message || 'Không thể phê duyệt phiếu hợp tác.');
+  }
+});
+
+payrollRouter.post('/cooperation-slips/:id/dispute', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const slipId = String(req.params.id);
+    const reason = String(req.body?.reason || req.body?.dispute_details || '').trim();
+    if (!reason) {
+      sendApiError(res, 422, 'DISPUTE_REASON_REQUIRED', 'Vui lòng nhập lý do yêu cầu điều chỉnh / khiếu nại.');
+      return;
+    }
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const curRes = await client.query(
+        'SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, slipId]
+      );
+      if (!curRes.rows[0]) return null;
+      const meta = parseJsonSafe<Record<string, unknown>>(curRes.rows[0].metadata_json, {});
+      meta.adjustment_request = {
+        user_id: ctx.userId,
+        name: ctx.userName || 'Thành viên',
+        email: ctx.userEmail || '',
+        reason,
+        requested_at: new Date().toISOString(),
+      };
+
+      await client.query(
+        `UPDATE tenant_cooperation_slips
+         SET status = 'disputed',
+             dispute_details = $3,
+             metadata_json = $4::jsonb,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, slipId, reason, JSON.stringify(meta)]
+      );
+      const r = await client.query('SELECT * FROM tenant_cooperation_slips WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        slipId,
+      ]);
+      return normalizeCoopSlipRow(r.rows[0]);
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'COOP_SLIP_NOT_FOUND', 'Không tìm thấy phiếu hợp tác.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DISPUTE_COOP_SLIP_FAILED', err?.message || 'Không thể gửi yêu cầu điều chỉnh phiếu hợp tác.');
+  }
+});
+
+// ============================================================================
+// 6. HRM & Payroll Accounting A-Z Workspace (`/accounting-az` — TT200/TT133)
+// ============================================================================
+function buildStatutoryPayrollJournalEntries(params: {
+  periodKey: string;
+  regime: 'TT200' | 'TT133';
+  totalGross: number;
+  empBhxh: number;
+  empBhyt: number;
+  empBhtn: number;
+  erInsuranceTotal: number;
+  totalPit: number;
+  totalNet: number;
+}) {
+  const { periodKey, regime, totalGross, empBhxh, empBhyt, empBhtn, erInsuranceTotal, totalPit, totalNet } = params;
+  const expenseAcc = regime === 'TT133' ? '6422' : '6421';
+  const expenseAccName =
+    regime === 'TT133'
+      ? 'Chi phí quản lý kinh doanh (TT133)'
+      : 'Chi phí nhân viên quản lý doanh nghiệp (TT200)';
+  const docDate = `${periodKey}-28`;
+  const entries: Array<{
+    seq: number;
+    date: string;
+    voucher_no: string;
+    description: string;
+    debit_account: string;
+    credit_account: string;
+    amount_vnd: number;
+    entry_group: string;
+  }> = [];
+
+  let seq = 1;
+  if (totalGross > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `PKT-LUONG-${periodKey}`,
+      description: `Hạch toán chi phí tiền lương, phụ cấp & hoa hồng kỳ ${periodKey} (${expenseAccName})`,
+      debit_account: expenseAcc,
+      credit_account: '3341',
+      amount_vnd: Math.round(totalGross),
+      entry_group: 'salary_accrual',
+    });
+  }
+  if (erInsuranceTotal > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `PKT-BHDN-${periodKey}`,
+      description: `Trích BHXH, BHYT, BHTN, KPCĐ phần doanh nghiệp đóng tính vào chi phí kỳ ${periodKey}`,
+      debit_account: expenseAcc,
+      credit_account: '338',
+      amount_vnd: Math.round(erInsuranceTotal),
+      entry_group: 'employer_insurance',
+    });
+  }
+  if (empBhxh > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `PKT-BHXH-${periodKey}`,
+      description: `Khấu trừ BHXH bắt buộc (8%) vào lương người lao động kỳ ${periodKey}`,
+      debit_account: '3341',
+      credit_account: '3383',
+      amount_vnd: Math.round(empBhxh),
+      entry_group: 'employee_insurance',
+    });
+  }
+  if (empBhyt > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `PKT-BHYT-${periodKey}`,
+      description: `Khấu trừ BHYT bắt buộc (1.5%) vào lương người lao động kỳ ${periodKey}`,
+      debit_account: '3341',
+      credit_account: '3384',
+      amount_vnd: Math.round(empBhyt),
+      entry_group: 'employee_insurance',
+    });
+  }
+  if (empBhtn > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `PKT-BHTN-${periodKey}`,
+      description: `Khấu trừ BHTN bắt buộc (1%) vào lương người lao động kỳ ${periodKey}`,
+      debit_account: '3341',
+      credit_account: '3386',
+      amount_vnd: Math.round(empBhtn),
+      entry_group: 'employee_insurance',
+    });
+  }
+  if (totalPit > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `PKT-TNCN-${periodKey}`,
+      description: `Khấu trừ Thuế TNCN phải nộp tại nguồn (05/KK-TNCN) kỳ ${periodKey}`,
+      debit_account: '3341',
+      credit_account: '3335',
+      amount_vnd: Math.round(totalPit),
+      entry_group: 'pit_withholding',
+    });
+  }
+  if (totalNet > 0) {
+    entries.push({
+      seq: seq++,
+      date: docDate,
+      voucher_no: `UNC-LUONG-${periodKey}`,
+      description: `Chi trả lương thực lĩnh (Net) qua tài khoản ngân hàng kỳ ${periodKey}`,
+      debit_account: '3341',
+      credit_account: '1121',
+      amount_vnd: Math.round(totalNet),
+      entry_group: 'bank_disbursement',
+    });
+  }
+
+  return entries;
+}
+
+payrollRouter.get('/accounting-az', requirePermission('payroll', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const periodKey = String(req.query.period_key || new Date().toISOString().slice(0, 7)).slice(0, 7);
+
+    const payload = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [tenantRes, branchesRes, cfg, empsRes, contractsRes, periodRes, wsRowsRes] = await Promise.all([
+        client.query('SELECT name FROM tenants WHERE id = $1 LIMIT 1', [ctx.tenantId]),
+        client.query(
+          'SELECT * FROM tenant_branches WHERE tenant_id = $1 AND is_active = true ORDER BY is_headquarters DESC, created_at ASC',
+          [ctx.tenantId]
+        ),
+        getOrSeedTenantPayrollConfigInTx(client, ctx.tenantId),
+        client.query(
+          `SELECT e.*, b.name AS branch_name, d.name AS department_name, p.name AS position_name
+           FROM tenant_hr_employees e
+           LEFT JOIN tenant_branches b ON b.tenant_id = e.tenant_id AND b.id = e.branch_id
+           LEFT JOIN tenant_departments d ON d.tenant_id = e.tenant_id AND d.id = e.department_id
+           LEFT JOIN tenant_positions p ON p.tenant_id = e.tenant_id AND p.id = e.position_id
+           WHERE e.tenant_id = $1
+           ORDER BY e.employee_code ASC`,
+          [ctx.tenantId]
+        ),
+        client.query(
+          `SELECT c.*, e.full_name AS employee_name, e.employee_code
+           FROM tenant_hr_contracts c
+           INNER JOIN tenant_hr_employees e ON e.tenant_id = c.tenant_id AND e.id = c.employee_id
+           WHERE c.tenant_id = $1
+           ORDER BY c.start_date DESC`,
+          [ctx.tenantId]
+        ),
+        client.query(
+          'SELECT * FROM tenant_payroll_periods WHERE tenant_id = $1 AND period_key = $2 LIMIT 1',
+          [ctx.tenantId, periodKey]
+        ),
+        client.query(
+          'SELECT * FROM tenant_accounting_az_workspace WHERE tenant_id = $1 AND fiscal_period = $2 ORDER BY created_at ASC',
+          [ctx.tenantId, periodKey]
+        ),
+      ]);
+
+      const hq = branchesRes.rows[0] || {};
+      const tenantName = String(tenantRes.rows[0]?.name || 'Doanh nghiệp');
+      const legalEntity = {
+        legal_entity_name: String(hq.legal_entity_name || hq.name || tenantName),
+        tax_code: String(hq.tax_code || ''),
+        address: String(hq.address || ''),
+        phone: String(hq.phone || ''),
+        email: String(hq.email || ctx.userEmail || ''),
+        representative_name: String(hq.representative_name || ''),
+        tax_authority_code: cfg.tax_authority_code || '',
+        tax_authority_name: cfg.tax_authority_name || '',
+      };
+
+      const period = periodRes.rows[0] || null;
+      let slips: any[] = [];
+      if (period) {
+        const sRes = await client.query(
+          `SELECT s.*, e.employee_code, e.full_name AS employee_name, e.tax_code,
+                  e.id_card_number, e.bank_name, e.bank_account_number, e.is_resident, e.employment_type,
+                  d.name AS department_name
+           FROM tenant_payroll_slips s
+           INNER JOIN tenant_hr_employees e ON e.tenant_id = s.tenant_id AND e.id = s.employee_id
+           LEFT JOIN tenant_departments d ON d.tenant_id = e.tenant_id AND d.id = e.department_id
+           WHERE s.tenant_id = $1 AND s.period_id = $2
+           ORDER BY e.employee_code ASC`,
+          [ctx.tenantId, period.id]
+        );
+        slips = sRes.rows.map((s) => ({
+          ...s,
+          base_salary_vnd: toNum(s.base_salary_vnd, 0),
+          gross_pay_vnd: toNum(s.gross_pay_vnd, 0),
+          emp_bhxh_vnd: toNum(s.emp_bhxh_vnd, 0),
+          emp_bhyt_vnd: toNum(s.emp_bhyt_vnd, 0),
+          emp_bhtn_vnd: toNum(s.emp_bhtn_vnd, 0),
+          er_insurance_total_vnd: toNum(s.er_insurance_total_vnd, 0),
+          taxable_income_vnd: toNum(s.taxable_income_vnd, 0),
+          assessable_income_vnd: toNum(s.assessable_income_vnd, 0),
+          pit_tax_vnd: toNum(s.pit_tax_vnd, 0),
+          net_pay_vnd: toNum(s.net_pay_vnd, 0),
+          breakdown: parseJsonSafe<Record<string, unknown>>(s.breakdown, {}),
+        }));
+      }
+
+      const cfgRow = wsRowsRes.rows.find((r) => r.entry_type === 'workspace_config');
+      const wsExtra = cfgRow ? parseJsonSafe<Record<string, unknown>>(cfgRow.extra_json, {}) : {};
+      const regime: 'TT200' | 'TT133' = wsExtra.accounting_regime === 'TT133' ? 'TT133' : 'TT200';
+
+      // Aggregate statutory journal totals from slips (or projected from active employees if period not generated yet)
+      let totalGross = 0;
+      let empBhxh = 0;
+      let empBhyt = 0;
+      let empBhtn = 0;
+      let erIns = 0;
+      let totalPit = 0;
+      let totalNet = 0;
+
+      if (slips.length > 0) {
+        for (const s of slips) {
+          totalGross += toNum(s.gross_pay_vnd, 0);
+          empBhxh += toNum(s.emp_bhxh_vnd, 0);
+          empBhyt += toNum(s.emp_bhyt_vnd, 0);
+          empBhtn += toNum(s.emp_bhtn_vnd, 0);
+          erIns += toNum(s.er_insurance_total_vnd, 0);
+          totalPit += toNum(s.pit_tax_vnd, 0);
+          totalNet += toNum(s.net_pay_vnd, 0);
+        }
+      } else {
+        for (const e of empsRes.rows) {
+          if (e.employment_status === 'resigned' || e.employment_status === 'terminated') continue;
+          const sim = calculateEmployeePayslip(
+            {
+              base_salary_vnd: toNum(e.base_salary_vnd, 0),
+              insurance_salary_vnd: toNum(e.insurance_salary_vnd, 0),
+              insurance_enrolled: toBool(e.insurance_enrolled, true),
+              is_resident: toBool(e.is_resident, true),
+              employment_type: String(e.employment_type || 'full_time'),
+              dependents_count: Number(e.dependents_count || 0),
+              union_member: toBool(e.union_member, false),
+              allowances_map: parseJsonSafe<Record<string, number>>(e.allowances_json, {}),
+              standard_workdays: 22,
+              actual_workdays: 22,
+              paid_leave_days: 0,
+              unpaid_leave_days: 0,
+              overtime_hours: 0,
+              commission_pay_vnd: 0,
+              bonus_vnd: 0,
+              advance_deduction_vnd: 0,
+              other_deduction_vnd: 0,
+            },
+            cfg
+          );
+          totalGross += sim.gross_pay_vnd;
+          empBhxh += sim.emp_bhxh_vnd;
+          empBhyt += sim.emp_bhyt_vnd;
+          empBhtn += sim.emp_bhtn_vnd;
+          erIns += sim.er_insurance_total_vnd;
+          totalPit += sim.pit_tax_vnd;
+          totalNet += sim.net_pay_vnd;
+        }
+      }
+
+      const autoJournalEntries = buildStatutoryPayrollJournalEntries({
+        periodKey,
+        regime,
+        totalGross,
+        empBhxh,
+        empBhyt,
+        empBhtn,
+        erInsuranceTotal: erIns,
+        totalPit,
+        totalNet,
+      });
+
+      const customJournalRows = wsRowsRes.rows
+        .filter((r) => r.entry_type === 'journal')
+        .map((r, i) => ({
+          id: r.id,
+          seq: autoJournalEntries.length + i + 1,
+          date: `${periodKey}-28`,
+          voucher_no: r.voucher_no || `PKT-CUSTOM-${i + 1}`,
+          description: r.account_name,
+          debit_account: r.account_code,
+          credit_account: String(parseJsonSafe<Record<string, unknown>>(r.extra_json, {}).credit_account || '1121'),
+          amount_vnd: toNum(r.debit_vnd || r.credit_vnd, 0),
+          entry_group: 'custom',
+        }));
+
+      // Compliance Alerts (Contract Expiry & Missing Tax/Bank Info)
+      const nowMs = Date.now();
+      const contractAlerts: Array<Record<string, unknown>> = [];
+      for (const c of contractsRes.rows) {
+        if (c.status === 'active' && c.end_date) {
+          const endMs = new Date(c.end_date).getTime();
+          const daysLeft = Math.ceil((endMs - nowMs) / 86_400_000);
+          if (daysLeft <= 45) {
+            contractAlerts.push({
+              contract_id: c.id,
+              contract_number: c.contract_number,
+              employee_name: c.employee_name,
+              employee_code: c.employee_code,
+              end_date: c.end_date,
+              days_left: daysLeft,
+              severity: daysLeft < 0 ? 'bad' : daysLeft <= 15 ? 'warn' : 'info',
+            });
+          }
+        }
+      }
+
+      const missingInfoEmployees = empsRes.rows
+        .filter((e) => e.employment_status === 'active' && (!e.tax_code || !e.bank_account_number || !e.id_card_number))
+        .map((e) => ({
+          id: e.id,
+          employee_code: e.employee_code,
+          full_name: e.full_name,
+          missing_fields: [
+            !e.tax_code ? 'Mã số thuế TNCN' : null,
+            !e.id_card_number ? 'CCCD/CMND' : null,
+            !e.bank_account_number ? 'Số tài khoản ngân hàng' : null,
+          ].filter(Boolean),
+        }));
+
+      return {
+        period_key: periodKey,
+        accounting_regime: regime,
+        legal_entity: legalEntity,
+        branches: branchesRes.rows,
+        payroll_config: cfg,
+        employees: empsRes.rows.map((e) => ({
+          ...e,
+          base_salary_vnd: toNum(e.base_salary_vnd, 0),
+          insurance_salary_vnd: toNum(e.insurance_salary_vnd, 0),
+          allowances_json: parseJsonSafe<Record<string, number>>(e.allowances_json, {}),
+        })),
+        contracts: contractsRes.rows,
+        period,
+        slips,
+        is_projected: slips.length === 0,
+        kpis: {
+          total_employees: empsRes.rows.length,
+          active_employees: empsRes.rows.filter((e) => e.employment_status === 'active').length,
+          total_gross_vnd: Math.round(totalGross),
+          total_emp_insurance_vnd: Math.round(empBhxh + empBhyt + empBhtn),
+          total_er_insurance_vnd: Math.round(erIns),
+          total_pit_tax_vnd: Math.round(totalPit),
+          total_net_vnd: Math.round(totalNet),
+        },
+        journal_entries: [...autoJournalEntries, ...customJournalRows],
+        alerts: {
+          contract_alerts: contractAlerts,
+          missing_info_employees: missingInfoEmployees,
+        },
+        workspace_state: wsExtra,
+      };
+    });
+
+    res.json({ success: true, data: payload });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_ACCOUNTING_AZ_FAILED', err?.message || 'Không thể tải không gian Kế toán A-Z.');
+  }
+});
+
+const saveAccountingAzHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const periodKey = String(b.period_key || b.fiscal_period || new Date().toISOString().slice(0, 7)).slice(0, 7);
+    const regime: 'TT200' | 'TT133' = b.accounting_regime === 'TT133' ? 'TT133' : 'TT200';
+
+    const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const existing = await client.query<{ id: string; extra_json: unknown }>(
+        `SELECT id, extra_json FROM tenant_accounting_az_workspace
+         WHERE tenant_id = $1 AND fiscal_period = $2 AND entry_type = 'workspace_config'
+         LIMIT 1`,
+        [ctx.tenantId, periodKey]
+      );
+
+      const nextExtra = {
+        ...(existing.rows[0] ? parseJsonSafe<Record<string, unknown>>(existing.rows[0].extra_json, {}) : {}),
+        accounting_regime: regime,
+        ...(b.sop_checklist ? { sop_checklist: b.sop_checklist } : {}),
+        ...(b.tax_rule_mode ? { tax_rule_mode: b.tax_rule_mode } : {}),
+        ...(b.notes !== undefined ? { notes: b.notes } : {}),
+      };
+
+      if (existing.rows[0]) {
+        await client.query(
+          `UPDATE tenant_accounting_az_workspace
+           SET extra_json = $3::jsonb,
+               updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, existing.rows[0].id, JSON.stringify(nextExtra)]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO tenant_accounting_az_workspace (
+             id, tenant_id, fiscal_period, account_code, account_name,
+             entry_type, debit_vnd, credit_vnd, balance_vnd, analytics_json, extra_json, created_by
+           ) VALUES ($1, $2, $3, 'CFG', 'Cấu hình Kế toán A-Z', 'workspace_config', 0, 0, 0, '{}'::jsonb, $4::jsonb, $5)`,
+          [crypto.randomUUID(), ctx.tenantId, periodKey, JSON.stringify(nextExtra), ctx.userId]
+        );
+      }
+
+      if (b.custom_journal_entry && typeof b.custom_journal_entry === 'object') {
+        const cj = b.custom_journal_entry;
+        const amt = Math.max(0, toNum(cj.amount_vnd, 0));
+        if (amt > 0) {
+          await client.query(
+            `INSERT INTO tenant_accounting_az_workspace (
+               id, tenant_id, fiscal_period, account_code, account_name, voucher_no,
+               entry_type, debit_vnd, credit_vnd, balance_vnd, analytics_json, extra_json, created_by
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'journal', $7, $7, 0, '{}'::jsonb, $8::jsonb, $9)`,
+            [
+              crypto.randomUUID(),
+              ctx.tenantId,
+              periodKey,
+              String(cj.debit_account || '6421'),
+              String(cj.description || 'Bút toán bổ sung'),
+              String(cj.voucher_no || `PKT-BS-${periodKey}`),
+              amt,
+              JSON.stringify({ credit_account: String(cj.credit_account || '1121') }),
+              ctx.userId,
+            ]
+          );
+        }
+      }
+
+      return { period_key: periodKey, accounting_regime: regime, workspace_state: nextExtra };
+    });
+
+    res.json({ success: true, data: saved });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SAVE_ACCOUNTING_AZ_FAILED', err?.message || 'Không thể lưu dữ liệu Kế toán A-Z.');
+  }
+};
+
+payrollRouter.put('/accounting-az', requirePermission('payroll', 'edit'), saveAccountingAzHandler);
+payrollRouter.post('/accounting-az', requirePermission('payroll', 'edit'), saveAccountingAzHandler);

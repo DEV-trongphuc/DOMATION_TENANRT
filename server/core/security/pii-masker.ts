@@ -1,4 +1,47 @@
 import type { TenantContext } from '../context/tenant-context.ts';
+import { tenantRedis } from '../cache/tenant-redis.ts';
+import type { ResolvedUserRbacResult } from './rbac.ts';
+
+export interface PiiActorFlags {
+  canUnmaskPhone?: boolean;
+  canBypassPreAccept?: boolean;
+  canViewInternalNotes?: boolean;
+}
+
+export function derivePiiActorFlagsFromRbac(
+  resolved: ResolvedUserRbacResult | null | undefined,
+  ctx?: TenantContext
+): Required<PiiActorFlags> & { hasResolved: boolean } {
+  if (!resolved) {
+    return {
+      hasResolved: false,
+      canUnmaskPhone: !ctx?.isExternalAgency,
+      canBypassPreAccept: false,
+      canViewInternalNotes: !ctx?.isExternalAgency,
+    };
+  }
+  const leadsPerm = resolved.effectivePermissions?.leads;
+  const scope = String(leadsPerm?.scope || 'none');
+  const isOwner = Boolean(resolved.userOrg?.is_tenant_owner);
+  const canManageOrOversight =
+    isOwner ||
+    Boolean(leadsPerm?.actions?.manage_config) ||
+    Boolean(leadsPerm?.actions?.assign) ||
+    scope === 'company' ||
+    scope === 'branch' ||
+    scope === 'department' ||
+    scope === 'sub_departments';
+  const canUnmask = Boolean(leadsPerm && scope !== 'none' && leadsPerm.actions?.unmask_phone);
+  const isExternal = Boolean(resolved.userOrg?.is_external_agency ?? ctx?.isExternalAgency);
+  const canViewInternalNotes = !isExternal || isOwner || Boolean(leadsPerm?.actions?.manage_config);
+
+  return {
+    hasResolved: true,
+    canUnmaskPhone: canUnmask,
+    canBypassPreAccept: canManageOrOversight,
+    canViewInternalNotes,
+  };
+}
 
 export interface PiiMaskOptions {
   pii_masking_enabled?: boolean;
@@ -114,35 +157,68 @@ export function shouldMaskPiiForActor(
   ctx: TenantContext,
   piiConfig: boolean | PiiMaskOptions = true,
   leadContext?: { is_accepted?: boolean },
-  explicitCanUnmaskPhone?: boolean
+  explicitCanUnmaskPhone?: boolean,
+  actorFlags?: PiiActorFlags
 ): boolean {
   // Granular RBAC Zero-Short-Circuit: if `unmask_phone` is explicitly false, ALWAYS mask on server!
-  if (explicitCanUnmaskPhone === false) {
+  if (explicitCanUnmaskPhone === false || actorFlags?.canUnmaskPhone === false) {
     return true;
   }
   const cfg = resolvePiiOptions(piiConfig);
   if (!cfg.pii_masking_enabled) return false;
-  if (explicitCanUnmaskPhone === true) {
-    // Still enforce pre-accept masking if configured on unaccepted lead
-    if (ctx.userRole === 'sale' && cfg.pii_mask_before_accept && !leadContext?.is_accepted) {
+
+  const cached =
+    ctx.tenantId && ctx.userId
+      ? tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(ctx.tenantId, ctx.userId)
+      : null;
+  const derived = derivePiiActorFlagsFromRbac(cached, ctx);
+
+  const canUnmask =
+    explicitCanUnmaskPhone !== undefined
+      ? explicitCanUnmaskPhone
+      : actorFlags?.canUnmaskPhone !== undefined
+        ? actorFlags.canUnmaskPhone
+        : derived.canUnmaskPhone;
+  if (!canUnmask) {
+    return true;
+  }
+
+  const canBypassPreAccept =
+    actorFlags?.canBypassPreAccept !== undefined
+      ? actorFlags.canBypassPreAccept
+      : derived.canBypassPreAccept;
+
+  if (!canBypassPreAccept) {
+    if (ctx.isExternalAgency) return true;
+    if (cfg.pii_mask_before_accept && leadContext && !leadContext.is_accepted) {
       return true;
     }
-    return false;
+    if (!derived.hasResolved && explicitCanUnmaskPhone === undefined && cfg.pii_mask_all_sales) {
+      return true;
+    }
   }
-  if (ctx.userRole !== 'sale') return false;
-  if (ctx.isExternalAgency) return true;
-  if (cfg.pii_mask_all_sales) return true;
-  if (cfg.pii_mask_before_accept && !leadContext?.is_accepted) return true;
+
   return false;
 }
 
 export function shouldHideInternalNotesForActor(
   ctx: TenantContext,
-  piiConfig: boolean | PiiMaskOptions = true
+  piiConfig: boolean | PiiMaskOptions = true,
+  actorFlags?: PiiActorFlags
 ): boolean {
   const cfg = resolvePiiOptions(piiConfig);
   if (!cfg.pii_hide_internal_notes) return false;
-  return Boolean(ctx.userRole === 'sale' && ctx.isExternalAgency);
+  if (actorFlags?.canViewInternalNotes !== undefined) {
+    return !actorFlags.canViewInternalNotes;
+  }
+  const cached =
+    ctx.tenantId && ctx.userId
+      ? tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(ctx.tenantId, ctx.userId)
+      : null;
+  if (cached) {
+    return !derivePiiActorFlagsFromRbac(cached, ctx).canViewInternalNotes;
+  }
+  return Boolean(ctx.isExternalAgency);
 }
 
 export function transformLeadForActor<
@@ -151,10 +227,11 @@ export function transformLeadForActor<
   lead: T,
   ctx: TenantContext,
   piiConfig: boolean | PiiMaskOptions = true,
-  explicitCanUnmaskPhone?: boolean
-): T {
+  explicitCanUnmaskPhone?: boolean,
+  actorFlags?: PiiActorFlags
+): T & { pii_masked: boolean } {
   const cfg = resolvePiiOptions(piiConfig);
-  if (!shouldMaskPiiForActor(ctx, cfg, lead, explicitCanUnmaskPhone)) {
+  if (!shouldMaskPiiForActor(ctx, cfg, lead, explicitCanUnmaskPhone, actorFlags)) {
     return { ...lead, pii_masked: false };
   }
   return {
@@ -171,7 +248,7 @@ export function transformLeadForActor<
  */
 export function maskContactPiiIfDisallowed<
   T extends { phone?: string | null; email?: string | null; pii_masked?: boolean },
->(record: T, canUnmaskPhone: boolean, piiConfig?: PiiMaskOptions): T {
+>(record: T, canUnmaskPhone: boolean, piiConfig?: PiiMaskOptions): T & { pii_masked: boolean } {
   if (canUnmaskPhone) {
     return { ...record, pii_masked: false };
   }

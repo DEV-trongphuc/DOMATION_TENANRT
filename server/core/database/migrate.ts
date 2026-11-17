@@ -14,8 +14,9 @@ export async function runDatabaseMigrations(options?: { seedSuperAdmin?: boolean
   const pool = getDatabasePool();
   const client = await pool.connect();
 
+  let isMariaDb = false;
   try {
-    const isMariaDb = client.dialect === 'mariadb' || pool.dialect === 'mariadb';
+    isMariaDb = client.dialect === 'mariadb' || pool.dialect === 'mariadb';
 
     if (isMariaDb) {
       await runMariaDbMigrations(client, options);
@@ -24,6 +25,74 @@ export async function runDatabaseMigrations(options?: { seedSuperAdmin?: boolean
     }
   } finally {
     client.release();
+  }
+
+  // Idempotently consolidate Wave 2 & Full-Clone Stage 1-4 module schemas right at boot/migration
+  const wave2SchemaLoaders: Array<[string, string]> = [
+    ['../../modules/hrm/schema.ts', 'ensureHrmApprovalsSchema'],
+    ['../../modules/marketing/schema.ts', 'ensureMarketingSchema'],
+    ['../../modules/erp-ops/schema.ts', 'ensureErpOpsSchema'],
+    ['../../modules/dom-agent/schema.ts', 'ensureDomAgentSchema'],
+    ['../../modules/attendance/schema.ts', 'ensureAttendanceWaveASchema'],
+    ['../../modules/org-rbac/schema.ts', 'ensureOrgRbacWaveASchema'],
+    ['../../modules/crm-360/schema.ts', 'ensureCrm360Schema'],
+  ];
+  for (const [modPath, fnName] of wave2SchemaLoaders) {
+    try {
+      const mod = await import(modPath);
+      if (typeof mod?.[fnName] === 'function') {
+        await mod[fnName]();
+      }
+    } catch {
+      // Optional module schema unavailable in isolated schema tests
+    }
+  }
+
+  const postClient = await pool.connect();
+  try {
+    if (isMariaDb) {
+      await postClient
+        .query('ALTER TABLE tenant_cron_runs MODIFY COLUMN tenant_id VARCHAR(36) NULL')
+        .catch(() => {});
+    } else {
+      const postPgSql = `
+        ALTER TABLE IF EXISTS tenant_cron_runs ALTER COLUMN tenant_id DROP NOT NULL;
+        DO $$
+        DECLARE
+          pol_rec RECORD;
+        BEGIN
+          FOR pol_rec IN
+            SELECT schemaname, tablename, policyname
+            FROM pg_policies
+            WHERE schemaname = 'public'
+              AND policyname LIKE 'tenant_isolation_%'
+              AND qual IS NOT NULL
+              AND qual NOT LIKE '%NULLIF%'
+              AND qual LIKE '%current_setting%app.current_tenant_id%'
+          LOOP
+            EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', pol_rec.policyname, pol_rec.schemaname, pol_rec.tablename);
+            EXECUTE format(
+              'CREATE POLICY %I ON %I.%I USING (tenant_id = NULLIF(current_setting(''app.current_tenant_id'', true), '''')::uuid) WITH CHECK (tenant_id = NULLIF(current_setting(''app.current_tenant_id'', true), '''')::uuid)',
+              pol_rec.policyname, pol_rec.schemaname, pol_rec.tablename
+            );
+          END LOOP;
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'autodata_app') THEN
+            GRANT USAGE ON SCHEMA public TO autodata_app;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO autodata_app;
+            GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO autodata_app;
+          END IF;
+        EXCEPTION
+          WHEN insufficient_privilege THEN NULL;
+        END $$;
+      `;
+      if (postClient.exec) {
+        await postClient.exec(postPgSql).catch(() => {});
+      } else {
+        await postClient.query(postPgSql).catch(() => {});
+      }
+    }
+  } finally {
+    postClient.release();
   }
 }
 
@@ -826,6 +895,88 @@ async function runPostgresMigrations(
     CREATE INDEX IF NOT EXISTS idx_lead_tags_lead ON lead_tags(tenant_id, lead_id);
     CREATE INDEX IF NOT EXISTS idx_lead_tags_tag ON lead_tags(tenant_id, tag_id);
 
+    -- Full-Clone Stage 1-4 Alterations (RBAC Screen Access + Branch Whitelist & Manager)
+    ALTER TABLE tenant_roles ADD COLUMN IF NOT EXISTS screen_access JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE tenant_roles ADD COLUMN IF NOT EXISTS quick_actions JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_roles ADD COLUMN IF NOT EXISTS default_route VARCHAR(120);
+
+    ALTER TABLE tenant_role_permissions ADD COLUMN IF NOT EXISTS screen_access JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE tenant_role_permissions ADD COLUMN IF NOT EXISTS quick_actions JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_role_permissions ADD COLUMN IF NOT EXISTS default_route VARCHAR(120);
+
+    ALTER TABLE tenant_branches ADD COLUMN IF NOT EXISTS branch_ip_whitelist JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE tenant_branches ADD COLUMN IF NOT EXISTS manager_user_id UUID;
+
+    -- Note: Attendance Wave A tables, Org-RBAC Settings + tenant_cron_runs, CRM-360 tenant_deal_stage_history,
+    -- HRM cooperation/accounting, ERP-Ops item/invoice/pos/task tables, and Marketing tables are created canonically
+    -- by their respective ensure*Schema() module initializers at the end of runDatabaseMigrations().
+
+    CREATE TABLE IF NOT EXISTS tenant_domain_events_outbox (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      event_type VARCHAR(120) NOT NULL,
+      aggregate_type VARCHAR(80) NOT NULL DEFAULT 'system',
+      aggregate_id VARCHAR(120),
+      payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending',
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      max_retries INTEGER NOT NULL DEFAULT 5,
+      next_retry_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      processed_at TIMESTAMPTZ,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+    CREATE INDEX IF NOT EXISTS idx_outbox_pending ON tenant_domain_events_outbox(tenant_id, status, next_retry_at);
+
+    CREATE TABLE IF NOT EXISTS tenant_user_notification_settings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      channels_json JSONB NOT NULL DEFAULT '{"in_app":true,"email":true,"zalo":true}'::jsonb,
+      events_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      quiet_hours_start VARCHAR(10),
+      quiet_hours_end VARCHAR(10),
+      mute_all BOOLEAN NOT NULL DEFAULT false,
+      settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_user_notif_settings UNIQUE (tenant_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS crm_public_leads_pool (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      lead_id UUID NOT NULL,
+      branch_id UUID,
+      released_by UUID,
+      release_reason TEXT,
+      pool_status VARCHAR(30) NOT NULL DEFAULT 'available',
+      claimed_by UUID,
+      claimed_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+      metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      CONSTRAINT uk_public_pool_lead UNIQUE (tenant_id, lead_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_public_pool_status ON crm_public_leads_pool(tenant_id, pool_status, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS tenant_geoip_blocks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      rule_type VARCHAR(30) NOT NULL DEFAULT 'country',
+      target_value VARCHAR(120) NOT NULL,
+      action_mode VARCHAR(30) NOT NULL DEFAULT 'block',
+      reason TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      hit_count INTEGER NOT NULL DEFAULT 0,
+      created_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+    CREATE INDEX IF NOT EXISTS idx_geoip_blocks_active ON tenant_geoip_blocks(tenant_id, is_active, rule_type);
+
     DO $$
     DECLARE
       tbl TEXT;
@@ -836,7 +987,9 @@ async function runPostgresMigrations(
         'tenant_positions', 'tenant_role_permissions', 'tenant_department_permissions',
         'tenant_user_permission_overrides', 'tenant_stage_transition_rules',
         'tenant_custom_kpis', 'tenant_policy_documents', 'tenant_audiences',
-        'tenant_audience_members', 'tenant_audience_exclusions', 'tenant_tags', 'lead_tags'
+        'tenant_audience_members', 'tenant_audience_exclusions', 'tenant_tags', 'lead_tags',
+        'tenant_domain_events_outbox', 'tenant_user_notification_settings',
+        'crm_public_leads_pool', 'tenant_geoip_blocks'
       ]
       LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', tbl);
@@ -1478,6 +1631,84 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ];
   for (const stmt of mariaWave1Tables) {
+    await client.query(stmt);
+  }
+
+  // Full-Clone Stage 1-4 MariaDB Additive Columns & 37 Full-Clone Tables
+  await addMariaDbColumnIfNotExists(client, 'tenant_roles', 'screen_access', 'JSON NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_roles', 'quick_actions', 'JSON NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_roles', 'default_route', 'VARCHAR(120) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_role_permissions', 'screen_access', 'JSON NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_role_permissions', 'quick_actions', 'JSON NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_role_permissions', 'default_route', 'VARCHAR(120) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_branches', 'branch_ip_whitelist', 'JSON NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_branches', 'manager_user_id', 'VARCHAR(36) NULL');
+
+  const mariaFullCloneTables: string[] = [
+    `CREATE TABLE IF NOT EXISTS tenant_domain_events_outbox (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      event_type VARCHAR(120) NOT NULL,
+      aggregate_type VARCHAR(80) NOT NULL DEFAULT 'system',
+      aggregate_id VARCHAR(120) NULL,
+      payload_json JSON NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending',
+      retry_count INT NOT NULL DEFAULT 0,
+      max_retries INT NOT NULL DEFAULT 5,
+      next_retry_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      processed_at DATETIME(6) NULL,
+      last_error TEXT NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      INDEX idx_outbox_pending (tenant_id, status, next_retry_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_user_notification_settings (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      user_id VARCHAR(36) NOT NULL,
+      channels_json JSON NULL,
+      events_json JSON NULL,
+      quiet_hours_start VARCHAR(10) NULL,
+      quiet_hours_end VARCHAR(10) NULL,
+      mute_all TINYINT(1) NOT NULL DEFAULT 0,
+      settings_json JSON NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_user_notif_settings UNIQUE (tenant_id, user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_public_leads_pool (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      lead_id VARCHAR(36) NOT NULL,
+      branch_id VARCHAR(36) NULL,
+      released_by VARCHAR(36) NULL,
+      release_reason TEXT NULL,
+      pool_status VARCHAR(30) NOT NULL DEFAULT 'available',
+      claimed_by VARCHAR(36) NULL,
+      claimed_at DATETIME(6) NULL,
+      expires_at DATETIME(6) NULL,
+      metadata_json JSON NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT uk_public_pool_lead UNIQUE (tenant_id, lead_id),
+      INDEX idx_public_pool_status (tenant_id, pool_status, created_at DESC)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS tenant_geoip_blocks (
+      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+      tenant_id VARCHAR(36) NOT NULL,
+      rule_type VARCHAR(30) NOT NULL DEFAULT 'country',
+      target_value VARCHAR(120) NOT NULL,
+      action_mode VARCHAR(30) NOT NULL DEFAULT 'block',
+      reason TEXT NULL,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      hit_count INT NOT NULL DEFAULT 0,
+      created_by VARCHAR(36) NULL,
+      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      INDEX idx_geoip_blocks_active (tenant_id, is_active, rule_type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  ];
+  for (const stmt of mariaFullCloneTables) {
     await client.query(stmt);
   }
 

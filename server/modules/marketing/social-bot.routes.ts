@@ -53,7 +53,8 @@ export function generateBotReplyFromRag(
   botName: string,
   brandPersona: string,
   faqRules: FaqRuleItemDto[],
-  extracted: { phone: string | null; email: string | null }
+  extracted: { phone: string | null; email: string | null },
+  trainingDocs?: Array<{ title?: string; content_text?: string }>
 ): { reply: string; matchedQuestion: string | null } {
   const lower = String(messageText || '').toLowerCase();
 
@@ -64,6 +65,26 @@ export function generateBotReplyFromRag(
       (rule.question && lower.includes(String(rule.question).toLowerCase().slice(0, 18)));
     if (hit && rule.answer) {
       return { reply: rule.answer, matchedQuestion: rule.question || null };
+    }
+  }
+
+  if (Array.isArray(trainingDocs)) {
+    const tokens = lower
+      .split(/\s+/)
+      .map((w) => w.replace(/[^a-zA-Z0-9à-ỹ]/gi, ''))
+      .filter((w) => w.length >= 4);
+    for (const doc of trainingDocs) {
+      const titleLower = String(doc.title || '').toLowerCase();
+      const bodyText = String(doc.content_text || '').trim();
+      if (!bodyText) continue;
+      const bodyLower = bodyText.toLowerCase();
+      const matchedTokens = tokens.filter((tk) => titleLower.includes(tk) || bodyLower.includes(tk));
+      if (matchedTokens.length >= 2 || (titleLower && lower.includes(titleLower))) {
+        return {
+          reply: bodyText.slice(0, 420),
+          matchedQuestion: String(doc.title || 'Knowledge Doc'),
+        };
+      }
     }
   }
 
@@ -300,7 +321,13 @@ socialBotRouter.post('/bot-test', requirePermission('mkt_social_bot', 'view'), a
     }
 
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const botRow = await getOrCreateTenantBotConfig(client, ctx.tenantId);
+      const [botRow, docsRes] = await Promise.all([
+        getOrCreateTenantBotConfig(client, ctx.tenantId),
+        client.query(
+          "SELECT title, content_text FROM mkt_ai_training_docs WHERE tenant_id = $1 AND status = 'indexed' ORDER BY updated_at DESC LIMIT 50",
+          [ctx.tenantId]
+        ),
+      ]);
       const botCfg = mapBotConfig(botRow);
       const extracted = extractContactEntitiesFromText(message);
       const rag = generateBotReplyFromRag(
@@ -308,7 +335,8 @@ socialBotRouter.post('/bot-test', requirePermission('mkt_social_bot', 'view'), a
         botCfg.bot_name,
         botCfg.brand_persona,
         botCfg.faq_rules,
-        extracted
+        extracted,
+        docsRes.rows
       );
       return {
         bot_name: botCfg.bot_name,
@@ -726,5 +754,649 @@ socialBotRouter.post('/conversations/:id/push-lead', requirePermission('mkt_soci
     res.json({ success: true, data: out });
   } catch (err: any) {
     sendApiError(res, 500, 'PUSH_SOCIAL_LEAD_FAILED', err?.message || 'Không thể đẩy hồ sơ từ hộp thư Social.');
+  }
+});
+
+// UnifiedChat: Toggle Human Takeover (`bot_paused`), Status (`open|resolved`) & Mark Read
+socialBotRouter.patch('/conversations/:id', requirePermission('mkt_social_bot', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const exRes = await client.query(
+        'SELECT * FROM mkt_social_conversations WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      const ex = exRes.rows[0];
+      if (!ex) return null;
+
+      const botPaused =
+        req.body?.bot_paused !== undefined ? Boolean(req.body.bot_paused) : Boolean(ex.bot_paused);
+      const status =
+        req.body?.status !== undefined ? String(req.body.status) : String(ex.status || 'open');
+      const unreadCount =
+        req.body?.mark_read === true
+          ? 0
+          : req.body?.unread_count !== undefined
+            ? Math.max(0, Number(req.body.unread_count))
+            : Number(ex.unread_count || 0);
+
+      await client.query(
+        `UPDATE mkt_social_conversations
+         SET bot_paused = $3, status = $4, unread_count = $5
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, req.params.id, botPaused, status, unreadCount]
+      );
+      const r = await client.query('SELECT * FROM mkt_social_conversations WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      return r.rows[0];
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'CONVERSATION_NOT_FOUND', 'Không tìm thấy hội thoại.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_CONVERSATION_FAILED', err?.message || 'Không thể cập nhật trạng thái hội thoại.');
+  }
+});
+
+// ScenarioCanvas & MetaScenarioModal (`mkt_automation_scenarios`) CRUD
+function mapScenarioRow(row: Record<string, unknown>) {
+  return {
+    ...row,
+    keywords: parseJsonCol<string[]>(row.keywords_json, []),
+    nodes: parseJsonCol<Array<Record<string, unknown>>>(row.nodes_json, []),
+    edges: parseJsonCol<Array<Record<string, unknown>>>(row.edges_json, []),
+    settings: parseJsonCol<Record<string, unknown>>(row.settings_json, {}),
+    is_active: Boolean(row.is_active),
+    matched_count: Number(row.matched_count || 0),
+    converted_count: Number(row.converted_count || 0),
+  };
+}
+
+socialBotRouter.get('/scenarios', requirePermission('mkt_social_bot', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const items = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM mkt_automation_scenarios WHERE tenant_id = $1 ORDER BY updated_at DESC',
+        [ctx.tenantId]
+      );
+      return r.rows.map(mapScenarioRow);
+    });
+    res.json({ success: true, data: { items } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_SCENARIOS_FAILED', err?.message || 'Không thể tải danh sách kịch bản Chatbot.');
+  }
+});
+
+socialBotRouter.post('/scenarios', requirePermission('mkt_social_bot', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const name = String(req.body?.name || '').trim();
+    if (!name) {
+      sendApiError(res, 422, 'SCENARIO_NAME_REQUIRED', 'Vui lòng nhập tên kịch bản tự động.');
+      return;
+    }
+
+    const channel = ['messenger', 'zalo_oa', 'web_chat', 'omnichannel'].includes(String(req.body?.channel || ''))
+      ? String(req.body.channel)
+      : 'messenger';
+    const triggerType = String(req.body?.trigger_type || 'keyword').trim();
+    const keywords = Array.isArray(req.body?.keywords) ? req.body.keywords.map(String) : [];
+    const nodes = Array.isArray(req.body?.nodes) ? req.body.nodes : [];
+    const edges = Array.isArray(req.body?.edges) ? req.body.edges : [];
+    const settings = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
+    const isActive = req.body?.is_active !== undefined ? Boolean(req.body.is_active) : true;
+    const id = crypto.randomUUID();
+
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO mkt_automation_scenarios (
+           id, tenant_id, name, channel, trigger_type, keywords_json, nodes_json, edges_json, settings_json, is_active, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11)`,
+        [
+          id,
+          ctx.tenantId,
+          name,
+          channel,
+          triggerType,
+          JSON.stringify(keywords),
+          JSON.stringify(nodes),
+          JSON.stringify(edges),
+          JSON.stringify(settings),
+          isActive,
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_automation_scenarios WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return mapScenarioRow(r.rows[0]);
+    });
+
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_SCENARIO_FAILED', err?.message || 'Không thể tạo kịch bản tự động.');
+  }
+});
+
+socialBotRouter.put('/scenarios/:id', requirePermission('mkt_social_bot', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const exRes = await client.query(
+        'SELECT * FROM mkt_automation_scenarios WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      const ex = exRes.rows[0];
+      if (!ex) return null;
+
+      const name = req.body?.name !== undefined ? String(req.body.name).trim() : String(ex.name);
+      const channel = req.body?.channel !== undefined ? String(req.body.channel) : String(ex.channel);
+      const triggerType =
+        req.body?.trigger_type !== undefined ? String(req.body.trigger_type) : String(ex.trigger_type);
+      const keywords = Array.isArray(req.body?.keywords)
+        ? req.body.keywords.map(String)
+        : parseJsonCol(ex.keywords_json, []);
+      const nodes = Array.isArray(req.body?.nodes) ? req.body.nodes : parseJsonCol(ex.nodes_json, []);
+      const edges = Array.isArray(req.body?.edges) ? req.body.edges : parseJsonCol(ex.edges_json, []);
+      const settings =
+        req.body?.settings && typeof req.body.settings === 'object'
+          ? req.body.settings
+          : parseJsonCol(ex.settings_json, {});
+      const isActive =
+        req.body?.is_active !== undefined ? Boolean(req.body.is_active) : Boolean(ex.is_active);
+
+      await client.query(
+        `UPDATE mkt_automation_scenarios
+         SET name = $3, channel = $4, trigger_type = $5,
+             keywords_json = $6::jsonb, nodes_json = $7::jsonb, edges_json = $8::jsonb,
+             settings_json = $9::jsonb, is_active = $10, updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          name,
+          channel,
+          triggerType,
+          JSON.stringify(keywords),
+          JSON.stringify(nodes),
+          JSON.stringify(edges),
+          JSON.stringify(settings),
+          isActive,
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_automation_scenarios WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      return mapScenarioRow(r.rows[0]);
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'SCENARIO_NOT_FOUND', 'Không tìm thấy kịch bản tự động.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_SCENARIO_FAILED', err?.message || 'Không thể cập nhật kịch bản tự động.');
+  }
+});
+
+socialBotRouter.delete('/scenarios/:id', requirePermission('mkt_social_bot', 'delete'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM mkt_automation_scenarios WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_SCENARIO_FAILED', err?.message || 'Không thể xóa kịch bản tự động.');
+  }
+});
+
+// ZaloOAManager (`mkt_zalo_oa_configs`), ZaloTemplateCreateModal (`mkt_zalo_templates`) & ZaloBroadcastTab
+socialBotRouter.get('/zalo-oa', requirePermission('mkt_social_bot', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query('SELECT * FROM mkt_zalo_oa_configs WHERE tenant_id = $1 LIMIT 1', [
+        ctx.tenantId,
+      ]);
+      if (r.rows[0]) {
+        return {
+          ...r.rows[0],
+          settings: parseJsonCol(r.rows[0].settings_json, {}),
+        };
+      }
+      const vault = await readTenantChannelVault(client, ctx.tenantId, ['zalo_oa', 'zalo_zns']);
+      return {
+        id: null,
+        oa_id: String(vault.config.oa_id || ''),
+        oa_name: String(vault.config.oa_name || 'Zalo Official Account'),
+        app_id: String(vault.config.app_id || ''),
+        status: vault.configured ? 'connected' : 'sandbox',
+        daily_quota: 1000,
+        sent_today: 0,
+        quality_rating: 'high',
+        settings: {},
+      };
+    });
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_ZALO_OA_FAILED', err?.message || 'Không thể tải cấu hình Zalo OA.');
+  }
+});
+
+socialBotRouter.put('/zalo-oa', requirePermission('mkt_social_bot', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const oaId = String(req.body?.oa_id || '').trim();
+    const oaName = String(req.body?.oa_name || 'Zalo Official Account').trim();
+    const appId = String(req.body?.app_id || '').trim();
+    const dailyQuota = Math.max(10, Math.round(Number(req.body?.daily_quota || 1000)));
+    const qualityRating = String(req.body?.quality_rating || 'high');
+    const status = String(req.body?.status || 'connected');
+    const settings = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
+
+    const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO mkt_zalo_oa_configs (
+           id, tenant_id, oa_id, oa_name, app_id, status, daily_quota, quality_rating, settings_json
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+         ON CONFLICT (tenant_id) DO UPDATE SET
+           oa_id = EXCLUDED.oa_id,
+           oa_name = EXCLUDED.oa_name,
+           app_id = EXCLUDED.app_id,
+           status = EXCLUDED.status,
+           daily_quota = EXCLUDED.daily_quota,
+           quality_rating = EXCLUDED.quality_rating,
+           settings_json = EXCLUDED.settings_json,
+           updated_at = clock_timestamp()`,
+        [
+          crypto.randomUUID(),
+          ctx.tenantId,
+          oaId,
+          oaName,
+          appId,
+          status,
+          dailyQuota,
+          qualityRating,
+          JSON.stringify(settings),
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_zalo_oa_configs WHERE tenant_id = $1 LIMIT 1', [
+        ctx.tenantId,
+      ]);
+      return r.rows[0];
+    });
+
+    res.json({ success: true, data: saved });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SAVE_ZALO_OA_FAILED', err?.message || 'Không thể lưu cấu hình Zalo OA.');
+  }
+});
+
+socialBotRouter.get('/zalo-templates', requirePermission('mkt_social_bot', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const items = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 ORDER BY updated_at DESC',
+        [ctx.tenantId]
+      );
+      return r.rows.map((row) => ({
+        ...row,
+        params_schema: parseJsonCol(row.params_schema_json, []),
+        buttons: parseJsonCol(row.buttons_json, []),
+      }));
+    });
+    res.json({ success: true, data: { items } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_ZALO_TEMPLATES_FAILED', err?.message || 'Không thể tải danh sách mẫu Zalo ZNS/ZBS.');
+  }
+});
+
+socialBotRouter.post('/zalo-templates', requirePermission('mkt_social_bot', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const name = String(req.body?.name || '').trim();
+    if (!name) {
+      sendApiError(res, 422, 'ZALO_TEMPLATE_NAME_REQUIRED', 'Vui lòng nhập tên mẫu Zalo ZNS/ZBS.');
+      return;
+    }
+
+    const templateCode =
+      String(req.body?.template_code || '').trim() || `ZNS_${crypto.randomInt(100000, 999999)}`;
+    const templateType = ['zns_transaction', 'zns_otp', 'zns_promotion', 'zbs_broadcast'].includes(
+      String(req.body?.template_type || '')
+    )
+      ? String(req.body.template_type)
+      : 'zns_transaction';
+    const status = String(req.body?.status || 'approved');
+    const priceVnd = Math.max(0, Math.round(Number(req.body?.price_vnd ?? 250)));
+    const contentBody = String(req.body?.content_body || '').trim();
+    const paramsSchema = Array.isArray(req.body?.params_schema) ? req.body.params_schema : [];
+    const buttons = Array.isArray(req.body?.buttons) ? req.body.buttons : [];
+    const oaId = req.body?.oa_id ? String(req.body.oa_id) : null;
+    const id = crypto.randomUUID();
+
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO mkt_zalo_templates (
+           id, tenant_id, oa_id, template_code, name, template_type, status,
+           price_vnd, content_body, params_schema_json, buttons_json, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12)`,
+        [
+          id,
+          ctx.tenantId,
+          oaId,
+          templateCode,
+          name,
+          templateType,
+          status,
+          priceVnd,
+          contentBody,
+          JSON.stringify(paramsSchema),
+          JSON.stringify(buttons),
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return {
+        ...r.rows[0],
+        params_schema: parseJsonCol(r.rows[0].params_schema_json, []),
+        buttons: parseJsonCol(r.rows[0].buttons_json, []),
+      };
+    });
+
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_ZALO_TEMPLATE_FAILED', err?.message || 'Không thể tạo mẫu Zalo ZNS/ZBS.');
+  }
+});
+
+socialBotRouter.put('/zalo-templates/:id', requirePermission('mkt_social_bot', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const exRes = await client.query(
+        'SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      const ex = exRes.rows[0];
+      if (!ex) return null;
+
+      const name = req.body?.name !== undefined ? String(req.body.name).trim() : String(ex.name);
+      const contentBody =
+        req.body?.content_body !== undefined ? String(req.body.content_body) : String(ex.content_body || '');
+      const status = req.body?.status !== undefined ? String(req.body.status) : String(ex.status);
+      const paramsSchema = Array.isArray(req.body?.params_schema)
+        ? req.body.params_schema
+        : parseJsonCol(ex.params_schema_json, []);
+      const buttons = Array.isArray(req.body?.buttons)
+        ? req.body.buttons
+        : parseJsonCol(ex.buttons_json, []);
+
+      await client.query(
+        `UPDATE mkt_zalo_templates
+         SET name = $3, content_body = $4, status = $5,
+             params_schema_json = $6::jsonb, buttons_json = $7::jsonb, updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [
+          ctx.tenantId,
+          req.params.id,
+          name,
+          contentBody,
+          status,
+          JSON.stringify(paramsSchema),
+          JSON.stringify(buttons),
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      return r.rows[0];
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'ZALO_TEMPLATE_NOT_FOUND', 'Không tìm thấy mẫu Zalo.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_ZALO_TEMPLATE_FAILED', err?.message || 'Không thể cập nhật mẫu Zalo.');
+  }
+});
+
+socialBotRouter.delete('/zalo-templates/:id', requirePermission('mkt_social_bot', 'delete'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM mkt_zalo_templates WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_ZALO_TEMPLATE_FAILED', err?.message || 'Không thể xóa mẫu Zalo.');
+  }
+});
+
+socialBotRouter.post('/zalo-broadcast', requirePermission('mkt_social_bot', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const templateId = String(req.body?.template_id || '').trim();
+    const audienceId = req.body?.audience_id ? String(req.body.audience_id).trim() : null;
+    const rawLeadIds: string[] = Array.isArray(req.body?.lead_ids) ? req.body.lead_ids.map(String) : [];
+
+    const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const tplRes = templateId
+        ? await client.query('SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+            ctx.tenantId,
+            templateId,
+          ])
+        : { rows: [] };
+      const tpl = tplRes.rows[0];
+
+      let sql = "SELECT id, name, phone, zns_consent FROM leads WHERE tenant_id = $1 AND is_deleted = false AND phone IS NOT NULL AND zns_consent != 'opted_out'";
+      const params: unknown[] = [ctx.tenantId];
+      if (audienceId) {
+        params.push(audienceId);
+        sql += ` AND id IN (SELECT lead_id FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id = $2)`;
+      } else if (rawLeadIds.length > 0) {
+        const ph = rawLeadIds.map((lid) => {
+          params.push(lid);
+          return `$${params.length}`;
+        });
+        sql += ` AND id IN (${ph.join(', ')})`;
+      }
+      sql += ' LIMIT 200';
+
+      const leadsRes = await client.query(sql, params);
+      const dispatchedCount = leadsRes.rows.length;
+
+      for (const lead of leadsRes.rows) {
+        await client.query(
+          `INSERT INTO lead_timeline_events (
+             id, tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+           ) VALUES ($1, $2, $3, 'zns_sent', 'communication', $4, 'tenant_admin', $5, $6, $7, $8::jsonb)`,
+          [
+            crypto.randomUUID(),
+            ctx.tenantId,
+            lead.id,
+            ctx.userId,
+            ctx.userName || 'Zalo Broadcast',
+            `Gửi Zalo Broadcast: ${tpl?.name || req.body?.campaign_name || 'Thông báo Zalo OA'}`,
+            String(tpl?.content_body || req.body?.message || '').slice(0, 240),
+            JSON.stringify({ template_id: templateId || null }),
+          ]
+        );
+      }
+
+      if (tpl) {
+        await client.query(
+          `UPDATE mkt_zalo_templates
+           SET sent_count = sent_count + $3, delivered_count = delivered_count + $3, updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, tpl.id, dispatchedCount]
+        );
+      }
+
+      await client.query(
+        'UPDATE mkt_zalo_oa_configs SET sent_today = sent_today + $2, updated_at = clock_timestamp() WHERE tenant_id = $1',
+        [ctx.tenantId, dispatchedCount]
+      );
+
+      return {
+        sent_count: dispatchedCount,
+        estimated_cost_vnd: dispatchedCount * Number(tpl?.price_vnd || 250),
+        template_name: tpl?.name || null,
+      };
+    });
+
+    res.json({ success: true, data: outcome });
+  } catch (err: any) {
+    sendApiError(res, 500, 'ZALO_BROADCAST_FAILED', err?.message || 'Không thể phát hành chiến dịch Zalo Broadcast.');
+  }
+});
+
+// AITraining: Customer Knowledge & Document RAG Studio (`mkt_ai_training_docs`)
+socialBotRouter.get('/training-docs', requirePermission('mkt_social_bot', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const items = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM mkt_ai_training_docs WHERE tenant_id = $1 ORDER BY updated_at DESC',
+        [ctx.tenantId]
+      );
+      return r.rows.map((row) => ({
+        ...row,
+        metadata: parseJsonCol(row.metadata_json, {}),
+      }));
+    });
+    res.json({ success: true, data: { items } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_TRAINING_DOCS_FAILED', err?.message || 'Không thể tải kho tri thức huấn luyện AI.');
+  }
+});
+
+socialBotRouter.post('/training-docs', requirePermission('mkt_social_bot', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const title = String(req.body?.title || '').trim();
+    const contentText = String(req.body?.content_text || '').trim();
+    if (!title) {
+      sendApiError(res, 422, 'DOC_TITLE_REQUIRED', 'Vui lòng nhập tiêu đề tài liệu tri thức.');
+      return;
+    }
+
+    const docType = ['faq', 'pdf', 'url', 'policy', 'product'].includes(String(req.body?.doc_type || ''))
+      ? String(req.body.doc_type)
+      : 'faq';
+    const sourceUrl = req.body?.source_url ? String(req.body.source_url).trim() : null;
+    const tokenCount = Math.max(1, Math.ceil(contentText.length / 4));
+    const chunkCount = Math.max(1, Math.ceil(contentText.length / 800));
+    const id = crypto.randomUUID();
+
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO mkt_ai_training_docs (
+           id, tenant_id, title, doc_type, source_url, content_text,
+           chunk_count, token_count, status, metadata_json, created_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'indexed', $9::jsonb, $10)`,
+        [
+          id,
+          ctx.tenantId,
+          title,
+          docType,
+          sourceUrl,
+          contentText,
+          chunkCount,
+          tokenCount,
+          JSON.stringify(req.body?.metadata || {}),
+          ctx.userId,
+        ]
+      );
+      const r = await client.query('SELECT * FROM mkt_ai_training_docs WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        id,
+      ]);
+      return r.rows[0];
+    });
+
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_TRAINING_DOC_FAILED', err?.message || 'Không thể nạp tài liệu huấn luyện AI.');
+  }
+});
+
+socialBotRouter.put('/training-docs/:id', requirePermission('mkt_social_bot', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const exRes = await client.query(
+        'SELECT * FROM mkt_ai_training_docs WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, req.params.id]
+      );
+      const ex = exRes.rows[0];
+      if (!ex) return null;
+
+      const title = req.body?.title !== undefined ? String(req.body.title).trim() : String(ex.title);
+      const contentText =
+        req.body?.content_text !== undefined ? String(req.body.content_text) : String(ex.content_text || '');
+      const status = req.body?.status !== undefined ? String(req.body.status) : String(ex.status || 'indexed');
+      const tokenCount = Math.max(1, Math.ceil(contentText.length / 4));
+      const chunkCount = Math.max(1, Math.ceil(contentText.length / 800));
+
+      await client.query(
+        `UPDATE mkt_ai_training_docs
+         SET title = $3, content_text = $4, status = $5,
+             token_count = $6, chunk_count = $7, updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, req.params.id, title, contentText, status, tokenCount, chunkCount]
+      );
+      const r = await client.query('SELECT * FROM mkt_ai_training_docs WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      return r.rows[0];
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'DOC_NOT_FOUND', 'Không tìm thấy tài liệu huấn luyện.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_TRAINING_DOC_FAILED', err?.message || 'Không thể cập nhật tài liệu huấn luyện.');
+  }
+});
+
+socialBotRouter.delete('/training-docs/:id', requirePermission('mkt_social_bot', 'delete'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query('DELETE FROM mkt_ai_training_docs WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+    });
+    res.json({ success: true, data: { deleted: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_TRAINING_DOC_FAILED', err?.message || 'Không thể xóa tài liệu huấn luyện.');
   }
 });

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
 import { getTenantContext } from '../../core/context/tenant-context.ts';
+import { hashPassword, verifyPassword } from '../../core/crypto/password.ts';
 import {
   requireEntitlement,
   requirePermission,
@@ -13,19 +14,239 @@ import {
   ensureErpOpsSchema,
   parseJsonSafe,
 } from '../erp-ops/schema.ts';
+import { ensureHrmApprovalsSchema } from '../hrm/schema.ts';
 
 export const router = Router();
 
 router.use(requireTenantAuth);
-router.use(requireEntitlement('erp_workchat'));
 router.use(async (_req, _res, next) => {
   try {
-    await ensureErpOpsSchema();
+    await Promise.all([ensureErpOpsSchema(), ensureHrmApprovalsSchema()]);
     next();
   } catch (err) {
     next(err);
   }
 });
+
+// ============================================================================
+// 0. Personal Account Self-Service (`/my-account`) — Available on ALL 4 Packages
+// ============================================================================
+router.get('/my-account', async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [uRes, empRes, assetsRes, tenantRes] = await Promise.all([
+        client.query(
+          `SELECT id, full_name, email, phone, role, avatar_url, branch_id, department_id, team_id,
+                  is_tenant_owner, last_login_at, created_at
+           FROM users
+           WHERE tenant_id = $1 AND id = $2
+           LIMIT 1`,
+          [ctx.tenantId, ctx.userId]
+        ),
+        client.query(
+          `SELECT * FROM tenant_hr_employees
+           WHERE tenant_id = $1 AND user_id = $2
+           LIMIT 1`,
+          [ctx.tenantId, ctx.userId]
+        ),
+        client.query(
+          `SELECT a.*
+           FROM tenant_hr_handover_assets a
+           INNER JOIN tenant_hr_employees e ON e.tenant_id = a.tenant_id AND e.id = a.employee_id
+           WHERE a.tenant_id = $1 AND e.user_id = $2
+           ORDER BY a.handed_over_at DESC`,
+          [ctx.tenantId, ctx.userId]
+        ),
+        client.query('SELECT name, settings FROM tenants WHERE id = $1 LIMIT 1', [ctx.tenantId]),
+      ]);
+
+      const u = uRes.rows[0] || {};
+      const emp = empRes.rows[0] || null;
+      const settings = parseJsonSafe<Record<string, unknown>>(tenantRes.rows[0]?.settings, {});
+      const sigMap = parseJsonSafe<Record<string, string>>(settings.user_signatures, {});
+      const twoFactorMap = parseJsonSafe<Record<string, boolean>>(settings.user_two_factor, {});
+
+      return {
+        user: {
+          ...u,
+          two_factor_enabled: Boolean(twoFactorMap[ctx.userId] ?? false),
+          signature_url: sigMap[ctx.userId] || (emp ? (emp as Record<string, unknown>).signature_url : null) || null,
+        },
+        employee: emp,
+        assigned_assets: assetsRes.rows,
+        company_name: String(tenantRes.rows[0]?.name || 'Doanh nghiệp'),
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_MY_ACCOUNT_FAILED', err?.message || 'Không thể tải hồ sơ cá nhân.');
+  }
+});
+
+const updateMyAccountHandler = async (req: any, res: any) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const fullName = b.full_name || b.name ? String(b.full_name || b.name).trim() : null;
+      const phone = b.phone !== undefined ? (b.phone ? String(b.phone).trim() : null) : undefined;
+      const avatarUrl = b.avatar_url || b.avatar ? String(b.avatar_url || b.avatar).trim() : undefined;
+
+      if (fullName || phone !== undefined || avatarUrl !== undefined) {
+        await client.query(
+          `UPDATE users
+           SET full_name = COALESCE($3, full_name),
+               phone = CASE WHEN $4 = 1 THEN $5 ELSE phone END,
+               avatar_url = CASE WHEN $6 = 1 THEN $7 ELSE avatar_url END,
+               updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [
+            ctx.tenantId,
+            ctx.userId,
+            fullName,
+            phone !== undefined ? 1 : 0,
+            phone ?? null,
+            avatarUrl !== undefined ? 1 : 0,
+            avatarUrl ?? null,
+          ]
+        );
+      }
+
+      // Sync optional employee HR self-service fields if employee record exists
+      const empRes = await client.query<{ id: string }>(
+        'SELECT id FROM tenant_hr_employees WHERE tenant_id = $1 AND user_id = $2 LIMIT 1',
+        [ctx.tenantId, ctx.userId]
+      );
+      if (empRes.rows[0]) {
+        await client.query(
+          `UPDATE tenant_hr_employees
+           SET full_name = COALESCE($3, full_name),
+               phone = COALESCE($4, phone),
+               id_card_number = COALESCE($5, id_card_number),
+               bank_name = COALESCE($6, bank_name),
+               bank_account_number = COALESCE($7, bank_account_number),
+               address = COALESCE($8, address),
+               updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [
+            ctx.tenantId,
+            empRes.rows[0].id,
+            fullName,
+            b.phone ? String(b.phone).trim() : null,
+            b.citizen_id || b.id_card_number ? String(b.citizen_id || b.id_card_number).trim() : null,
+            b.bank_name ? String(b.bank_name).trim() : null,
+            b.bank_account || b.bank_account_number ? String(b.bank_account || b.bank_account_number).trim() : null,
+            b.address ? String(b.address).trim() : null,
+          ]
+        );
+      }
+
+      if (typeof b.signature_url === 'string') {
+        const tRes = await client.query<{ settings: unknown }>(
+          'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        );
+        const settings = parseJsonSafe<Record<string, unknown>>(tRes.rows[0]?.settings, {});
+        const sigMap = parseJsonSafe<Record<string, string>>(settings.user_signatures, {});
+        sigMap[ctx.userId] = b.signature_url;
+        settings.user_signatures = sigMap;
+        await client.query(
+          'UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1',
+          [ctx.tenantId, JSON.stringify(settings)]
+        );
+      }
+
+      const fresh = await client.query(
+        `SELECT id, full_name, email, phone, role, avatar_url, branch_id, department_id, is_tenant_owner
+         FROM users WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+        [ctx.tenantId, ctx.userId]
+      );
+      return {
+        ...fresh.rows[0],
+        signature_url: typeof b.signature_url === 'string' ? b.signature_url : undefined,
+      };
+    });
+
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'UPDATE_MY_ACCOUNT_FAILED', err?.message || 'Không thể cập nhật thông tin tài khoản.');
+  }
+};
+
+router.put('/my-account', updateMyAccountHandler);
+router.patch('/my-account', updateMyAccountHandler);
+
+router.post('/my-account/change-password', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const oldPassword = String(req.body?.old_password || req.body?.oldPassword || '');
+    const newPassword = String(req.body?.new_password || req.body?.newPassword || '');
+
+    if (!oldPassword || newPassword.length < 8) {
+      sendApiError(res, 422, 'INVALID_PASSWORD', 'Mật khẩu mới phải có tối thiểu 8 ký tự.');
+      return;
+    }
+
+    const result = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const uRes = await client.query<{ id: string; password_hash: string }>(
+        'SELECT id, password_hash FROM users WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, ctx.userId]
+      );
+      if (!uRes.rows[0]) return { error: 'USER_NOT_FOUND' as const };
+      const ok = await verifyPassword(oldPassword, uRes.rows[0].password_hash);
+      if (!ok) return { error: 'WRONG_OLD_PASSWORD' as const };
+
+      const nextHash = await hashPassword(newPassword);
+      await client.query(
+        'UPDATE users SET password_hash = $3, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2',
+        [ctx.tenantId, ctx.userId, nextHash]
+      );
+      return { ok: true as const };
+    });
+
+    if ('error' in result) {
+      if (result.error === 'WRONG_OLD_PASSWORD') {
+        sendApiError(res, 403, 'WRONG_OLD_PASSWORD', 'Mật khẩu hiện tại không chính xác.');
+        return;
+      }
+      sendApiError(res, 404, 'USER_NOT_FOUND', 'Không tìm thấy tài khoản.');
+      return;
+    }
+
+    res.json({ success: true, data: { updated: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CHANGE_PASSWORD_FAILED', err?.message || 'Không thể đổi mật khẩu.');
+  }
+});
+
+router.get('/my-account/activity-logs', async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const items = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        `SELECT id, action, entity_type, entity_id, details AS metadata, ip_address, created_at
+         FROM admin_audit_logs
+         WHERE tenant_id = $1 AND actor_id = $2
+         ORDER BY created_at DESC
+         LIMIT 50`,
+        [ctx.tenantId, ctx.userId]
+      );
+      return r.rows.map((row) => ({
+        ...row,
+        metadata: parseJsonSafe(row.metadata, {}),
+      }));
+    });
+    res.json({ success: true, data: { items } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_ACTIVITY_LOGS_FAILED', err?.message || 'Không thể tải nhật ký hoạt động.');
+  }
+});
+
+// Gate WorkChat channels, feed & kudos under `erp_workchat` entitlement
+router.use(requireEntitlement('erp_workchat'));
 
 export interface CommercialStickerPackMeta {
   id: string;
@@ -557,6 +778,348 @@ router.post('/presence/heartbeat', requirePermission('workchat', 'view'), async 
 });
 
 // ============================================================================
+// 2B. Media Vault, Wallpapers, Smart ERP Card Picker & Chat-to-Task
+// ============================================================================
+router.get('/channels/:id/vault', requirePermission('workchat', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const channelId = String(req.params.id);
+
+    const vault = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const ch = await client.query(
+        'SELECT id, name, channel_type, topic FROM tenant_workchat_channels WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, channelId]
+      );
+      if (!ch.rows[0]) return null;
+
+      const msgsRes = await client.query(
+        `SELECT id, sender_name, message_type, content, attachments_json, is_pinned, created_at
+         FROM tenant_workchat_messages
+         WHERE tenant_id = $1 AND channel_id = $2 AND is_deleted = false
+         ORDER BY created_at DESC
+         LIMIT 300`,
+        [ctx.tenantId, channelId]
+      );
+
+      const media: Array<Record<string, unknown>> = [];
+      const files: Array<Record<string, unknown>> = [];
+      const links: Array<Record<string, unknown>> = [];
+      const erpCards: Array<Record<string, unknown>> = [];
+      const pinned: Array<Record<string, unknown>> = [];
+
+      const urlRegex = /https?:\/\/[^\s<>")]+/gi;
+
+      for (const m of msgsRes.rows) {
+        const atts = parseJsonSafe<Array<Record<string, unknown>>>(m.attachments_json, []);
+        if (m.is_pinned) {
+          pinned.push({
+            message_id: m.id,
+            sender_name: m.sender_name,
+            content: m.content,
+            created_at: m.created_at,
+          });
+        }
+        if (m.message_type === 'card_link') {
+          erpCards.push({
+            message_id: m.id,
+            sender_name: m.sender_name,
+            content: m.content,
+            attachments: atts,
+            created_at: m.created_at,
+          });
+        }
+        for (const a of atts) {
+          const kind = String(a.kind || a.type || 'file').toLowerCase();
+          const url = String(a.url || '');
+          if (kind === 'image' || /\.(png|jpe?g|gif|webp)$/i.test(url)) {
+            media.push({ ...a, message_id: m.id, sender_name: m.sender_name, created_at: m.created_at });
+          } else if (kind === 'erp_card' || kind === 'task_card' || kind === 'voucher') {
+            erpCards.push({ ...a, message_id: m.id, sender_name: m.sender_name, created_at: m.created_at });
+          } else {
+            files.push({ ...a, message_id: m.id, sender_name: m.sender_name, created_at: m.created_at });
+          }
+        }
+        const matchedUrls = String(m.content || '').match(urlRegex) || [];
+        for (const u of matchedUrls) {
+          links.push({
+            url: u,
+            message_id: m.id,
+            sender_name: m.sender_name,
+            created_at: m.created_at,
+          });
+        }
+      }
+
+      return {
+        channel: ch.rows[0],
+        media,
+        files,
+        links,
+        erp_cards: erpCards,
+        pinned,
+      };
+    });
+
+    if (!vault) {
+      sendApiError(res, 404, 'CHANNEL_NOT_FOUND', 'Không tìm thấy kênh trò chuyện.');
+      return;
+    }
+
+    res.json({ success: true, data: vault });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CHANNEL_VAULT_FAILED', err?.message || 'Không thể tải kho lưu trữ kênh.');
+  }
+});
+
+router.patch('/channels/:id/wallpaper', requirePermission('workchat', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const channelId = String(req.params.id);
+    const wallpaperKey = String(req.body?.wallpaper_key || req.body?.wallpaper || 'sapphire_clean').trim();
+
+    const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const ch = await client.query('SELECT id FROM tenant_workchat_channels WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        ctx.tenantId,
+        channelId,
+      ]);
+      if (!ch.rows[0]) return null;
+
+      const tRes = await client.query<{ settings: unknown }>('SELECT settings FROM tenants WHERE id = $1 LIMIT 1', [
+        ctx.tenantId,
+      ]);
+      const settings = parseJsonSafe<Record<string, unknown>>(tRes.rows[0]?.settings, {});
+      const wpMap = parseJsonSafe<Record<string, string>>(settings.workchat_wallpapers, {});
+      wpMap[`${ctx.userId}:${channelId}`] = wallpaperKey;
+      wpMap[channelId] = wallpaperKey;
+      settings.workchat_wallpapers = wpMap;
+
+      await client.query(
+        'UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1',
+        [ctx.tenantId, JSON.stringify(settings)]
+      );
+      return { channel_id: channelId, wallpaper_key: wallpaperKey };
+    });
+
+    if (!saved) {
+      sendApiError(res, 404, 'CHANNEL_NOT_FOUND', 'Không tìm thấy kênh trò chuyện.');
+      return;
+    }
+    res.json({ success: true, data: saved });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SAVE_WALLPAPER_FAILED', err?.message || 'Không thể lưu hình nền trò chuyện.');
+  }
+});
+
+router.get('/erp-cards', requirePermission('workchat', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const cardType = String(req.query.type || 'all').trim().toLowerCase();
+
+    const items = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const cards: Array<Record<string, unknown>> = [];
+
+      if (cardType === 'all' || cardType === 'task') {
+        const tRes = await client.query(
+          `SELECT id, title, status_key AS status, priority, due_date
+           FROM tenant_tasks
+           WHERE tenant_id = $1
+           ORDER BY created_at DESC LIMIT 15`,
+          [ctx.tenantId]
+        );
+        for (const r of tRes.rows) {
+          if (!q || String(r.title || '').toLowerCase().includes(q)) {
+            cards.push({
+              entity_type: 'task',
+              entity_id: r.id,
+              title: r.title,
+              subtitle: `Công việc • ${r.status} (${r.priority})`,
+              status: r.status,
+              route: '/erp/projects',
+            });
+          }
+        }
+      }
+
+      if (cardType === 'all' || cardType === 'approval') {
+        const aRes = await client.query(
+          `SELECT id, request_code, title, category, status, amount_vnd
+           FROM tenant_approval_requests
+           WHERE tenant_id = $1
+           ORDER BY created_at DESC LIMIT 15`,
+          [ctx.tenantId]
+        );
+        for (const r of aRes.rows) {
+          if (!q || String(r.title || '').toLowerCase().includes(q) || String(r.request_code || '').toLowerCase().includes(q)) {
+            cards.push({
+              entity_type: 'approval',
+              entity_id: r.id,
+              code: r.request_code,
+              title: r.title,
+              subtitle: `Tờ trình ${r.request_code} • ${Number(r.amount_vnd || 0).toLocaleString('vi-VN')}₫`,
+              status: r.status,
+              route: '/erp/approvals',
+            });
+          }
+        }
+      }
+
+      if (cardType === 'all' || cardType === 'deal') {
+        const dRes = await client.query(
+          `SELECT id, title, stage, amount_vnd
+           FROM tenant_deals
+           WHERE tenant_id = $1
+           ORDER BY created_at DESC LIMIT 15`,
+          [ctx.tenantId]
+        );
+        for (const r of dRes.rows) {
+          if (!q || String(r.title || '').toLowerCase().includes(q)) {
+            cards.push({
+              entity_type: 'deal',
+              entity_id: r.id,
+              title: r.title,
+              subtitle: `Cơ hội B2B • ${r.stage} • ${Number(r.amount_vnd || 0).toLocaleString('vi-VN')}₫`,
+              status: r.stage,
+              route: '/deals',
+            });
+          }
+        }
+      }
+
+      if (cardType === 'all' || cardType === 'cooperation_slip') {
+        const cRes = await client.query(
+          `SELECT id, slip_code, title, status, expected_commission_vnd
+           FROM tenant_cooperation_slips
+           WHERE tenant_id = $1
+           ORDER BY created_at DESC LIMIT 10`,
+          [ctx.tenantId]
+        );
+        for (const r of cRes.rows) {
+          if (!q || String(r.title || '').toLowerCase().includes(q)) {
+            cards.push({
+              entity_type: 'cooperation_slip',
+              entity_id: r.id,
+              code: r.slip_code,
+              title: r.title,
+              subtitle: `Phiếu hợp tác • Hoa hồng ${Number(r.expected_commission_vnd || 0).toLocaleString('vi-VN')}₫`,
+              status: r.status,
+              route: '/cooperation-slips',
+            });
+          }
+        }
+      }
+
+      return cards.slice(0, 30);
+    });
+
+    res.json({ success: true, data: { items } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SEARCH_ERP_CARDS_FAILED', err?.message || 'Không thể tra cứu thẻ nghiệp vụ ERP.');
+  }
+});
+
+router.post('/messages/:id/create-task', requirePermission('workchat', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const msgId = String(req.params.id);
+    const b = req.body || {};
+
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const msgRes = await client.query(
+        'SELECT * FROM tenant_workchat_messages WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, msgId]
+      );
+      const msg = msgRes.rows[0];
+      if (!msg) return null;
+
+      // Resolve project_id from body, channel, or create/reuse default general project
+      let projectId: string | null = b.project_id ? String(b.project_id) : null;
+      if (!projectId) {
+        const chRes = await client.query<{ project_id: string | null }>(
+          'SELECT project_id FROM tenant_workchat_channels WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, msg.channel_id]
+        );
+        projectId = chRes.rows[0]?.project_id || null;
+      }
+      if (!projectId) {
+        const pRes = await client.query<{ id: string }>(
+          'SELECT id FROM tenant_projects WHERE tenant_id = $1 ORDER BY created_at ASC LIMIT 1',
+          [ctx.tenantId]
+        );
+        if (pRes.rows[0]) {
+          projectId = pRes.rows[0].id;
+        } else {
+          projectId = crypto.randomUUID();
+          await client.query(
+            `INSERT INTO tenant_projects (id, tenant_id, code, name, status, owner_user_id)
+             VALUES ($1, $2, 'PRJ-WORKCHAT', 'Công việc từ WorkChat', 'active', $3)`,
+            [projectId, ctx.tenantId, ctx.userId]
+          );
+        }
+      }
+
+      const taskId = crypto.randomUUID();
+      const title = String(b.title || msg.content || 'Công việc chuyển từ WorkChat').trim().slice(0, 240);
+      const priority = ['low', 'medium', 'high', 'urgent'].includes(String(b.priority))
+        ? String(b.priority)
+        : 'medium';
+      const assigneeId = b.assignee_user_id ? String(b.assignee_user_id) : ctx.userId;
+      const dueDate = b.due_date ? String(b.due_date) : null;
+
+      await client.query(
+        `INSERT INTO tenant_tasks (
+           id, tenant_id, project_id, title, description, status_key, priority, assignee_user_id, reporter_user_id, due_date
+         ) VALUES ($1, $2, $3, $4, $5, 'todo', $6, $7, $8, $9)`,
+        [
+          taskId,
+          ctx.tenantId,
+          projectId,
+          title,
+          b.description ? String(b.description) : `Trích xuất từ tin nhắn WorkChat của ${msg.sender_name}: "${msg.content}"`,
+          priority,
+          assigneeId,
+          ctx.userId,
+          dueDate,
+        ]
+      );
+
+      // Attach task_card reference onto the source chat message
+      const curAtts = parseJsonSafe<Array<Record<string, unknown>>>(msg.attachments_json, []);
+      curAtts.push({
+        kind: 'task_card',
+        task_id: taskId,
+        title,
+        priority,
+        status: 'todo',
+      });
+      await client.query(
+        'UPDATE tenant_workchat_messages SET attachments_json = $3::jsonb, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2',
+        [ctx.tenantId, msgId, JSON.stringify(curAtts)]
+      );
+
+      const taskRow = await client.query('SELECT * FROM tenant_tasks WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        ctx.tenantId,
+        taskId,
+      ]);
+      const row = taskRow.rows[0] || {};
+      return {
+        ...row,
+        status: (row as Record<string, unknown>).status_key || 'todo',
+      };
+    });
+
+    if (!created) {
+      sendApiError(res, 404, 'MESSAGE_NOT_FOUND', 'Không tìm thấy tin nhắn cần tạo công việc.');
+      return;
+    }
+
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_TASK_FROM_CHAT_FAILED', err?.message || 'Không thể tạo công việc từ tin nhắn.');
+  }
+});
+
+// ============================================================================
 // 3. Enterprise Internal Feed & Kudos Wall Leaderboard
 // ============================================================================
 router.get('/feed', requirePermission('workchat', 'view'), async (req, res) => {
@@ -690,6 +1253,76 @@ router.post('/feed/:id/like', requirePermission('workchat', 'view'), async (req,
     res.json({ success: true, data: updated });
   } catch (err: any) {
     sendApiError(res, 500, 'LIKE_FEED_FAILED', err?.message || 'Không thể tương tác bài viết.');
+  }
+});
+
+router.post('/feed/:id/react', requirePermission('workchat', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const postId = String(req.params.id);
+    const reactionType = ['like', 'love', 'haha', 'rocket', 'clap', 'flex'].includes(String(req.body?.reaction_type))
+      ? String(req.body.reaction_type)
+      : 'like';
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const cur = await client.query<{ id: string; reactions_json: unknown }>(
+        'SELECT id, reactions_json FROM tenant_feed_posts WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, postId]
+      );
+      if (!cur.rows[0]) return null;
+      const reactions = parseJsonSafe<Record<string, string[]>>(cur.rows[0].reactions_json, {});
+
+      // Remove previous reaction from other buckets if user switched reaction type
+      let toggledOff = false;
+      for (const rKey of ['like', 'love', 'haha', 'rocket', 'clap', 'flex', 'likes']) {
+        const bucket = Array.isArray(reactions[rKey]) ? [...reactions[rKey]] : [];
+        const idx = bucket.indexOf(ctx.userId);
+        if (idx >= 0) {
+          if (rKey === reactionType) toggledOff = true;
+          bucket.splice(idx, 1);
+          if (bucket.length === 0) delete reactions[rKey];
+          else reactions[rKey] = bucket;
+        }
+      }
+
+      if (!toggledOff) {
+        const nextBucket = Array.isArray(reactions[reactionType]) ? [...reactions[reactionType]] : [];
+        nextBucket.push(ctx.userId);
+        reactions[reactionType] = nextBucket;
+      }
+
+      let totalReactions = 0;
+      const summary: Record<string, number> = {};
+      for (const [k, arr] of Object.entries(reactions)) {
+        if (Array.isArray(arr) && arr.length > 0) {
+          summary[k] = arr.length;
+          totalReactions += arr.length;
+        }
+      }
+
+      await client.query(
+        `UPDATE tenant_feed_posts
+         SET reactions_json = $3::jsonb,
+             likes_count = $4,
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, postId, JSON.stringify(reactions), totalReactions]
+      );
+      return {
+        id: postId,
+        likes_count: totalReactions,
+        user_reaction: toggledOff ? null : reactionType,
+        reactions_summary: summary,
+      };
+    });
+
+    if (!updated) {
+      sendApiError(res, 404, 'FEED_POST_NOT_FOUND', 'Không tìm thấy bài viết.');
+      return;
+    }
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    sendApiError(res, 500, 'REACT_FEED_FAILED', err?.message || 'Không thể thả biểu cảm bài viết.');
   }
 });
 

@@ -6,9 +6,33 @@ import { runZaloTokenRefresher } from './subroutines/zalo-refresher.ts';
 import { runSubscriptionExpiryManager } from './subroutines/billing-manager.ts';
 import { runWebhookDlqRetryWorker } from './subroutines/webhook-retry.ts';
 import { runMetaCapiRetryWorker } from './subroutines/capi-retry.ts';
+import {
+  recordCronRunLog,
+  runAttendanceConfirmWorker,
+  runAudienceReevalWorker,
+  runMarketingCampaignsWorker,
+  runMarketingFlowsWorker,
+  runOutboxEventsWorker,
+  runRemindersWorker,
+} from './subroutines/wave2-workers.ts';
 
 const LOCK_KEY_PG = `hashtext('autodata_master_cron_lock')`;
 const LOCK_KEY_MARIADB = `'autodata_master_cron_lock'`;
+
+export const ALL_CRON_SUBROUTINES = [
+  'sla',
+  'drain',
+  'zalo',
+  'billing',
+  'webhook',
+  'capi',
+  'marketing_flows',
+  'marketing_campaigns',
+  'audience_reeval',
+  'attendance_confirm',
+  'reminders',
+  'outbox_events',
+] as const;
 
 export interface CronRunStats {
   durationMs: number;
@@ -18,6 +42,12 @@ export interface CronRunStats {
   subscriptionsProcessed: number;
   webhooksReplayedCount: number;
   capiRetriedCount: number;
+  marketingFlowsProcessed: number;
+  marketingCampaignsProcessed: number;
+  audiencesReevalCount: number;
+  attendanceConfirmationsCount: number;
+  remindersDispatchedCount: number;
+  outboxEventsProcessed: number;
   errors: string[];
 }
 
@@ -35,6 +65,12 @@ export async function executeMasterCron(options?: {
     subscriptionsProcessed: 0,
     webhooksReplayedCount: 0,
     capiRetriedCount: 0,
+    marketingFlowsProcessed: 0,
+    marketingCampaignsProcessed: 0,
+    audiencesReevalCount: 0,
+    attendanceConfirmationsCount: 0,
+    remindersDispatchedCount: 0,
+    outboxEventsProcessed: 0,
     errors: [],
   };
 
@@ -84,68 +120,125 @@ export async function executeMasterCron(options?: {
       `[MasterCron] Lock acquired (${isMariaDb ? 'MariaDB GET_LOCK' : 'PostgreSQL pg_try_advisory_lock'}). Starting consolidated subroutines...`
     );
 
-    const requestedSubroutines = options?.subroutines || ['sla', 'drain', 'zalo', 'billing', 'webhook', 'capi'];
+    const requestedSubroutines = options?.subroutines || [...ALL_CRON_SUBROUTINES];
 
-    // Subroutine A: Direct DB SLA Sweeper
-    if (requestedSubroutines.includes('sla')) {
+    const runLoggedSubroutine = async (
+      key: string,
+      label: string,
+      fn: () => Promise<number>,
+      assign: (count: number) => void
+    ) => {
+      if (!requestedSubroutines.includes(key)) return;
+      const subStart = Date.now();
+      let processed = 0;
+      let errCount = 0;
+      let errMsg: string | undefined;
       try {
-        stats.slaBreachedCount = await runDirectDbSlaSweeper(options?.tenantId);
+        processed = await fn();
+        assign(processed);
       } catch (err: any) {
-        stats.errors.push(`Subroutine A (SLA): ${err?.message}`);
-        console.error('[MasterCron] Error in Subroutine A (SLA):', err);
+        errCount = 1;
+        errMsg = `${label}: ${err?.message}`;
+        stats.errors.push(errMsg);
+        console.error(`[MasterCron] Error in ${label}:`, err);
       }
-    }
+      await recordCronRunLog({
+        tenantId: options?.tenantId,
+        subroutine: key,
+        status: errCount > 0 ? 'error' : 'success',
+        processedCount: processed,
+        errorCount: errCount,
+        durationMs: Date.now() - subStart,
+        details: errMsg ? { error: errMsg } : {},
+      });
+    };
 
-    // Subroutine B: Unassigned Lead Drainer
-    if (requestedSubroutines.includes('drain')) {
-      try {
-        stats.leadsDrainedCount = await runUnassignedLeadDrainer(options?.tenantId);
-      } catch (err: any) {
-        stats.errors.push(`Subroutine B (Drain): ${err?.message}`);
-        console.error('[MasterCron] Error in Subroutine B (Drain):', err);
+    await runLoggedSubroutine('sla', 'Subroutine A (SLA)', () => runDirectDbSlaSweeper(options?.tenantId), (n) => {
+      stats.slaBreachedCount = n;
+    });
+    await runLoggedSubroutine('drain', 'Subroutine B (Drain)', () => runUnassignedLeadDrainer(options?.tenantId), (n) => {
+      stats.leadsDrainedCount = n;
+    });
+    await runLoggedSubroutine(
+      'zalo',
+      'Subroutine C (Zalo)',
+      async () => (await runZaloTokenRefresher(options?.tenantId)).refreshedCount,
+      (n) => {
+        stats.zaloRefreshedCount = n;
       }
-    }
-
-    // Subroutine C: Zalo Token Refresher
-    if (requestedSubroutines.includes('zalo')) {
-      try {
-        const res = await runZaloTokenRefresher(options?.tenantId);
-        stats.zaloRefreshedCount = res.refreshedCount;
-      } catch (err: any) {
-        stats.errors.push(`Subroutine C (Zalo): ${err?.message}`);
-        console.error('[MasterCron] Error in Subroutine C (Zalo):', err);
+    );
+    await runLoggedSubroutine(
+      'billing',
+      'Subroutine D (Billing)',
+      () => runSubscriptionExpiryManager(options?.tenantId),
+      (n) => {
+        stats.subscriptionsProcessed = n;
       }
-    }
-
-    // Subroutine D: Subscription & Trial Expiry Manager
-    if (requestedSubroutines.includes('billing')) {
-      try {
-        stats.subscriptionsProcessed = await runSubscriptionExpiryManager(options?.tenantId);
-      } catch (err: any) {
-        stats.errors.push(`Subroutine D (Billing): ${err?.message}`);
-        console.error('[MasterCron] Error in Subroutine D (Billing):', err);
+    );
+    await runLoggedSubroutine(
+      'webhook',
+      'Subroutine E (Webhook)',
+      () => runWebhookDlqRetryWorker(options?.tenantId),
+      (n) => {
+        stats.webhooksReplayedCount = n;
       }
-    }
-
-    // Subroutine E: Outbound Webhook DLQ Retry Worker
-    if (requestedSubroutines.includes('webhook')) {
-      try {
-        stats.webhooksReplayedCount = await runWebhookDlqRetryWorker(options?.tenantId);
-      } catch (err: any) {
-        stats.errors.push(`Subroutine E (Webhook): ${err?.message}`);
-        console.error('[MasterCron] Error in Subroutine E (Webhook):', err);
+    );
+    await runLoggedSubroutine(
+      'capi',
+      'Subroutine F (CAPI)',
+      () => runMetaCapiRetryWorker(options?.tenantId),
+      (n) => {
+        stats.capiRetriedCount = n;
       }
-    }
-
-    // Subroutine F: Meta CAPI Transient Error Retry Worker
-    if (requestedSubroutines.includes('capi')) {
-      try {
-        stats.capiRetriedCount = await runMetaCapiRetryWorker(options?.tenantId);
-      } catch (err: any) {
-        stats.errors.push(`Subroutine F (CAPI): ${err?.message}`);
-        console.error('[MasterCron] Error in Subroutine F (CAPI):', err);
+    );
+    await runLoggedSubroutine(
+      'marketing_flows',
+      'Subroutine G (Marketing Flows)',
+      () => runMarketingFlowsWorker(options?.tenantId),
+      (n) => {
+        stats.marketingFlowsProcessed = n;
       }
-    }
+    );
+    await runLoggedSubroutine(
+      'marketing_campaigns',
+      'Subroutine H (Marketing Campaigns)',
+      () => runMarketingCampaignsWorker(options?.tenantId),
+      (n) => {
+        stats.marketingCampaignsProcessed = n;
+      }
+    );
+    await runLoggedSubroutine(
+      'audience_reeval',
+      'Subroutine I (Audience Reeval)',
+      () => runAudienceReevalWorker(options?.tenantId),
+      (n) => {
+        stats.audiencesReevalCount = n;
+      }
+    );
+    await runLoggedSubroutine(
+      'attendance_confirm',
+      'Subroutine J (Attendance Confirm)',
+      () => runAttendanceConfirmWorker(options?.tenantId),
+      (n) => {
+        stats.attendanceConfirmationsCount = n;
+      }
+    );
+    await runLoggedSubroutine(
+      'reminders',
+      'Subroutine K (Reminders)',
+      () => runRemindersWorker(options?.tenantId),
+      (n) => {
+        stats.remindersDispatchedCount = n;
+      }
+    );
+    await runLoggedSubroutine(
+      'outbox_events',
+      'Subroutine L (Outbox Events)',
+      () => runOutboxEventsWorker(options?.tenantId),
+      (n) => {
+        stats.outboxEventsProcessed = n;
+      }
+    );
   } finally {
     if (pool.isEmbedded) {
       try {
@@ -189,7 +282,7 @@ if (isDirectCli) {
         process.exit(0);
       }
       console.log(
-        `[MasterCron] Completed in ${stats.durationMs}ms. Results: SLA breached=${stats.slaBreachedCount}, Leads drained=${stats.leadsDrainedCount}, Zalo refreshed=${stats.zaloRefreshedCount}, Subs processed=${stats.subscriptionsProcessed}, Webhooks=${stats.webhooksReplayedCount}, CAPI=${stats.capiRetriedCount}. Errors=${stats.errors.length}`
+        `[MasterCron] Completed in ${stats.durationMs}ms. Results: SLA=${stats.slaBreachedCount}, Drain=${stats.leadsDrainedCount}, Zalo=${stats.zaloRefreshedCount}, Billing=${stats.subscriptionsProcessed}, Webhooks=${stats.webhooksReplayedCount}, CAPI=${stats.capiRetriedCount}, Flows=${stats.marketingFlowsProcessed}, Campaigns=${stats.marketingCampaignsProcessed}, Audiences=${stats.audiencesReevalCount}, AttConfirm=${stats.attendanceConfirmationsCount}, Reminders=${stats.remindersDispatchedCount}, Outbox=${stats.outboxEventsProcessed}. Errors=${stats.errors.length}`
       );
       process.exit(stats.errors.length > 0 ? 1 : 0);
     })

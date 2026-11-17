@@ -18,7 +18,7 @@ import { operationsRouter } from './routes/operations.routes.ts';
 import { publicRouter } from './routes/public.routes.ts';
 import { legacyRouter } from './routes/legacy.routes.ts';
 import { mountEcosystemModules } from './modules/index.ts';
-import { requireTenantAuth, requireRoles, sendApiError } from './core/security/rbac.ts';
+import { ensureRbacScreenColumns, requireAnyPermission, requireTenantAuth, sendApiError } from './core/security/rbac.ts';
 import { getTenantContext } from './core/context/tenant-context.ts';
 import { replayWebhookDlqItem } from './services/webhook.service.ts';
 
@@ -110,6 +110,15 @@ export function createApp(): Express {
   });
 
   // Core API v1 routes
+  app.use('/api/v1', async (_req, _res, next) => {
+    try {
+      await ensureRbacScreenColumns();
+    } catch {
+      // Non-fatal fallback; per-route middleware also guards schema initialization
+    }
+    next();
+  });
+
   app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/admin', adminRouter);
   app.use('/api/v1/users', usersRouter);
@@ -161,7 +170,11 @@ export function createApp(): Express {
   app.use('/api/v1/legacy', legacyRouter);
 
   // Direct DLQ replay alias matching OpenAPI spec (`POST /api/v1/webhooks/dlq/:id/replay`)
-  app.post('/api/v1/webhooks/dlq/:id/replay', requireTenantAuth, requireRoles('tenant_admin'), async (req, res) => {
+  app.post(
+    '/api/v1/webhooks/dlq/:id/replay',
+    requireTenantAuth,
+    requireAnyPermission([['integrations_crm', 'manage_config'], ['integrations_marketing', 'manage_config'], ['settings', 'manage_config']]),
+    async (req, res) => {
     try {
       const ctx = getTenantContext();
       const outcome = await replayWebhookDlqItem(ctx.tenantId, req.params.id);

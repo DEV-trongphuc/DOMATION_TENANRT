@@ -74,10 +74,11 @@ describe('Wave 2 Phase 5: Multi-Tenant DOM Agent, 72 RBAC Tools, Department-ACL 
     }
   });
 
-  it('1. Registers >= 72 categorized tools across all 5 ecosystem groups with zero legacy branding leaks', async () => {
-    assert.ok(
-      DOM_AGENT_TOOLS_REGISTRY.length >= 72,
-      `Expected >= 72 tools, got ${DOM_AGENT_TOOLS_REGISTRY.length}`
+  it('1. Registers 80 categorized tools across all 5 ecosystem groups with zero legacy branding leaks', async () => {
+    assert.equal(
+      DOM_AGENT_TOOLS_REGISTRY.length,
+      80,
+      `Expected exact 80 tools, got ${DOM_AGENT_TOOLS_REGISTRY.length}`
     );
 
     const groupCounts = new Map<string, number>();
@@ -87,11 +88,11 @@ describe('Wave 2 Phase 5: Multi-Tenant DOM Agent, 72 RBAC Tools, Department-ACL 
       assert.doesNotMatch(combined, /SI Agent|SI IDEAS|@ideas\.edu\.vn/i);
     }
 
-    assert.equal(groupCounts.get('crm_autodata'), 14);
-    assert.equal(groupCounts.get('marketing_audiences'), 16);
+    assert.equal(groupCounts.get('crm_autodata'), 16);
+    assert.equal(groupCounts.get('marketing_audiences'), 17);
     assert.equal(groupCounts.get('org_rbac_rag'), 10);
-    assert.equal(groupCounts.get('hrm_payroll'), 12);
-    assert.equal(groupCounts.get('erp_ops_finance'), 20);
+    assert.equal(groupCounts.get('hrm_payroll'), 15);
+    assert.equal(groupCounts.get('erp_ops_finance'), 22);
 
     const boot = await apiRequest(harness.baseUrl, '/api/v1/dom-agent/bootstrap', {
       token: alpha.token,
@@ -100,7 +101,7 @@ describe('Wave 2 Phase 5: Multi-Tenant DOM Agent, 72 RBAC Tools, Department-ACL 
     assert.equal(boot.status, 200);
     assert.equal(boot.json.data.config.agent_name, 'DOM Agent');
     assert.equal(boot.json.data.config.avatar_url, '/imgs/autodata/ICON.png');
-    assert.ok(boot.json.data.tools.length >= 72);
+    assert.equal(boot.json.data.tools.length, 80);
     assert.equal(boot.json.data.package_code, 'autodata_crm');
   });
 

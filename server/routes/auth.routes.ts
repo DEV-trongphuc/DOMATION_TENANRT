@@ -13,8 +13,10 @@ import {
 import { getTenantContext } from '../core/context/tenant-context.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import {
+  ensureRbacScreenColumns,
   requireTenantAuth,
-  requireRoles,
+  requirePermission,
+  resolveUserEffectivePermissions,
   sendApiError,
   extractRequestedTenantSlug,
 } from '../core/security/rbac.ts';
@@ -495,12 +497,25 @@ authRouter.post(['/register', '/register-tenant'], async (req, res) => {
       auth_provider: 'password',
     }).catch(() => {});
 
+    await ensureRbacScreenColumns();
+    const regRbac = await withTenantTransaction(provisioned.tenant.id, (client) =>
+      resolveUserEffectivePermissions(client, provisioned.tenant.id, provisioned.user.id)
+    );
+
     res.status(201).json({
       success: true,
       data: {
         action: 'enter_workspace',
         tenant: provisioned.tenant,
-        user: provisioned.user,
+        user: {
+          ...provisioned.user,
+          is_tenant_owner: Boolean(provisioned.user.is_tenant_owner),
+        },
+        is_tenant_owner: Boolean(provisioned.user.is_tenant_owner),
+        effective_permissions: regRbac.effectivePermissions,
+        screen_access: regRbac.screen_access,
+        quick_actions: regRbac.quick_actions,
+        default_route: regRbac.default_route,
         workspace: provisioned.seedInfo,
         workspaces,
         account_token: accountToken,
@@ -635,6 +650,7 @@ authRouter.post('/login', async (req, res) => {
       phone: string | null;
       avatar_url: string | null;
       role: 'tenant_admin' | 'manager' | 'sale';
+      is_tenant_owner?: boolean;
       is_external_agency: boolean;
       profile_status: string | null;
       is_available: boolean | null;
@@ -667,6 +683,7 @@ authRouter.post('/login', async (req, res) => {
           phone: string | null;
           avatar_url: string | null;
           role: 'tenant_admin' | 'manager' | 'sale';
+          is_tenant_owner?: boolean;
           is_external_agency: boolean;
           profile_status: string | null;
           is_available: boolean | null;
@@ -679,7 +696,7 @@ authRouter.post('/login', async (req, res) => {
           is_completed: boolean | null;
           dismissed_at: string | null;
         }>(
-          `SELECT u.id, u.email, u.password_hash, u.full_name, u.phone, u.avatar_url, u.role, u.is_external_agency,
+          `SELECT u.id, u.email, u.password_hash, u.full_name, u.phone, u.avatar_url, u.role, u.is_tenant_owner, u.is_external_agency,
                   p.status AS profile_status, p.is_available, p.vacation_mode, p.skipped_credit, p.work_schedule, p.zalo_chat_id,
                   ob.current_step, ob.completed_steps, ob.is_completed, ob.dismissed_at
            FROM users u
@@ -792,6 +809,11 @@ authRouter.post('/login', async (req, res) => {
     const loginAction =
       requestedSlug || workspaces.length <= 1 ? 'enter_workspace' : 'select_workspace';
 
+    await ensureRbacScreenColumns();
+    const loginRbac = await withTenantTransaction(targetTenant.id, (client) =>
+      resolveUserEffectivePermissions(client, targetTenant.id, user.id)
+    );
+
     res.status(200).json({
       success: true,
       data: {
@@ -829,6 +851,7 @@ authRouter.post('/login', async (req, res) => {
           phone: user.phone,
           avatar_url: user.avatar_url,
           role: user.role,
+          is_tenant_owner: Boolean(user.is_tenant_owner),
           is_external_agency: user.is_external_agency,
           tenant_id: targetTenant.id,
           status: user.profile_status || 'active',
@@ -838,6 +861,11 @@ authRouter.post('/login', async (req, res) => {
           work_schedule: user.work_schedule,
           zalo_chat_id: user.zalo_chat_id,
         },
+        is_tenant_owner: Boolean(user.is_tenant_owner),
+        effective_permissions: loginRbac.effectivePermissions,
+        screen_access: loginRbac.screen_access,
+        quick_actions: loginRbac.quick_actions,
+        default_route: loginRbac.default_route,
         onboarding:
           user.current_step !== null
             ? {
@@ -1031,7 +1059,7 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
 
   const userRow = await withTenantTransaction(tenantRow.id, async (client) => {
     const r = await client.query<any>(
-      `SELECT u.id, u.email, u.full_name, u.phone, u.avatar_url, u.role, u.is_external_agency,
+      `SELECT u.id, u.email, u.full_name, u.phone, u.avatar_url, u.role, u.is_tenant_owner, u.is_external_agency,
               p.status AS profile_status, p.is_available, p.vacation_mode, p.skipped_credit, p.work_schedule, p.zalo_chat_id,
               ob.current_step, ob.completed_steps, ob.screen_tours, ob.is_completed, ob.dismissed_at
        FROM users u
@@ -1085,6 +1113,11 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
   );
   const refreshToken = signTenantRefreshToken(userRow.id, tenantRow.id, refreshTtlSec);
 
+  await ensureRbacScreenColumns();
+  const wsRbac = await withTenantTransaction(tenantRow.id, (client) =>
+    resolveUserEffectivePermissions(client, tenantRow.id, userRow.id)
+  );
+
   return {
     tenant: {
       id: tenantRow.id,
@@ -1111,6 +1144,7 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
       phone: userRow.phone,
       avatar_url: userRow.avatar_url,
       role: userRow.role,
+      is_tenant_owner: Boolean(userRow.is_tenant_owner),
       is_external_agency: userRow.is_external_agency,
       tenant_id: tenantRow.id,
       status: userRow.profile_status || 'active',
@@ -1120,6 +1154,11 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
       work_schedule: userRow.work_schedule,
       zalo_chat_id: userRow.zalo_chat_id,
     },
+    is_tenant_owner: Boolean(userRow.is_tenant_owner),
+    effective_permissions: wsRbac.effectivePermissions,
+    screen_access: wsRbac.screen_access,
+    quick_actions: wsRbac.quick_actions,
+    default_route: wsRbac.default_route,
     onboarding:
       userRow.current_step !== null && userRow.current_step !== undefined
         ? {
@@ -1351,6 +1390,7 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const billingCatalog = await getPlatformBillingCatalog();
+    await ensureRbacScreenColumns();
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       const combined = await client.query(
         `SELECT
@@ -1397,6 +1437,7 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
         entitlements: r.t_entitlements,
         settings: r.t_settings,
       });
+      const resolvedRbac = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
       return {
         tenant: {
           id: r.t_id,
@@ -1451,6 +1492,11 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
               zalo_chat_id: r.p_zalo_chat_id,
             }
           : null,
+        is_tenant_owner: Boolean(r.u_is_tenant_owner),
+        effective_permissions: resolvedRbac.effectivePermissions,
+        screen_access: resolvedRbac.screen_access,
+        quick_actions: resolvedRbac.quick_actions,
+        default_route: resolvedRbac.default_route,
         onboarding:
           r.ob_current_step !== null && r.ob_current_step !== undefined
             ? {
@@ -1520,7 +1566,7 @@ authRouter.patch('/onboarding', requireTenantAuth, async (req, res) => {
 });
 
 // Update Tenant Organization Settings
-authRouter.patch('/tenant-settings', requireTenantAuth, requireRoles('tenant_admin'), async (req, res) => {
+authRouter.patch('/tenant-settings', requireTenantAuth, requirePermission('settings', 'manage_config'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { name, domain, industry, settings, reset_to_defaults } = req.body || {};
@@ -1578,10 +1624,92 @@ authRouter.patch('/tenant-settings', requireTenantAuth, requireRoles('tenant_adm
           JSON.stringify({ reset_to_defaults: Boolean(reset_to_defaults) }),
         ]
       );
+
+      // Sync explicit legacy role_permissions / pii_mask_all_sales changes onto seeded system roles if present
+      if (settings && typeof settings === 'object') {
+        const parseActionsObj = (raw: unknown): Record<string, any> => {
+          if (!raw) return {};
+          if (typeof raw === 'string') {
+            try {
+              const parsed = JSON.parse(raw);
+              return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+            } catch {
+              return {};
+            }
+          }
+          return typeof raw === 'object' && !Array.isArray(raw) ? { ...(raw as Record<string, any>) } : {};
+        };
+        const srp = (settings as any).role_permissions;
+        const sysRolesRes = await client.query<{ id: string; role_key: string }>(
+          'SELECT id, role_key FROM tenant_roles WHERE tenant_id = $1 AND is_system = true',
+          [ctx.tenantId]
+        );
+        const sysMap = new Map(sysRolesRes.rows.map((row) => [row.role_key.toLowerCase(), row.id]));
+        const mgrRoleId = sysMap.get('manager');
+        const saleRoleId = sysMap.get('sale');
+        if (mgrRoleId && srp && typeof srp === 'object') {
+          if (srp.allow_manager_manage_pipelines !== undefined) {
+            const mpRes = await client.query<{ id: string; actions: unknown }>(
+              `SELECT id, actions FROM tenant_role_permissions WHERE tenant_id = $1 AND role_id = $2 AND module_key = 'pipelines' LIMIT 1`,
+              [ctx.tenantId, mgrRoleId]
+            );
+            if (mpRes.rows[0]) {
+              const nextActions = {
+                ...parseActionsObj(mpRes.rows[0].actions),
+                manage_config: Boolean(normalized.role_permissions.allow_manager_manage_pipelines),
+              };
+              await client.query(
+                'UPDATE tenant_role_permissions SET actions = $3::jsonb, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2',
+                [ctx.tenantId, mpRes.rows[0].id, JSON.stringify(nextActions)]
+              );
+            }
+          }
+          if (srp.allow_manager_export_csv !== undefined) {
+            const meRes = await client.query<{ id: string; actions: unknown }>(
+              `SELECT id, actions FROM tenant_role_permissions WHERE tenant_id = $1 AND role_id = $2 AND module_key = 'leads' LIMIT 1`,
+              [ctx.tenantId, mgrRoleId]
+            );
+            if (meRes.rows[0]) {
+              const nextActions = {
+                ...parseActionsObj(meRes.rows[0].actions),
+                export: Boolean(normalized.role_permissions.allow_manager_export_csv),
+              };
+              await client.query(
+                'UPDATE tenant_role_permissions SET actions = $3::jsonb, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2',
+                [ctx.tenantId, meRes.rows[0].id, JSON.stringify(nextActions)]
+              );
+            }
+          }
+        }
+        if (saleRoleId) {
+          const rpRes = await client.query<{ id: string; actions: unknown }>(
+            `SELECT id, actions FROM tenant_role_permissions WHERE tenant_id = $1 AND role_id = $2 AND module_key = 'leads' LIMIT 1`,
+            [ctx.tenantId, saleRoleId]
+          );
+          if (rpRes.rows[0]) {
+            const nextActions = parseActionsObj(rpRes.rows[0].actions);
+            if (srp && srp.allow_sale_create_lead !== undefined) {
+              nextActions.create = Boolean(normalized.role_permissions.allow_sale_create_lead);
+            }
+            if (srp && srp.allow_sale_reassign_lead !== undefined) {
+              nextActions.assign = Boolean(normalized.role_permissions.allow_sale_reassign_lead);
+            }
+            if ((settings as any).pii_mask_all_sales !== undefined) {
+              nextActions.unmask_phone = !Boolean(normalized.pii_mask_all_sales);
+            }
+            await client.query(
+              'UPDATE tenant_role_permissions SET actions = $3::jsonb, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2',
+              [ctx.tenantId, rpRes.rows[0].id, JSON.stringify(nextActions)]
+            );
+          }
+        }
+      }
+
       return r.rows[0];
     });
 
     tenantRedis.invalidateTenantCache(ctx.tenantId, ctx.tenantSlug);
+    tenantRedis.invalidateEffectivePermissions(ctx.tenantId);
     if (updated) {
       const norm = normalizeTenantSettings(updated.settings);
       tenantRedis.setCachedTenantMeta(ctx.tenantId, {

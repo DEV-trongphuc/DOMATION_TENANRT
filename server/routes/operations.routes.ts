@@ -2,7 +2,14 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
-import { requireTenantAuth, requireRoles, sendApiError } from '../core/security/rbac.ts';
+import {
+  checkEffectivePermission,
+  getResolvedUserRbac,
+  requireAnyPermission,
+  requirePermission,
+  requireTenantAuth,
+  sendApiError,
+} from '../core/security/rbac.ts';
 import { validateAndNormalizePhone } from '../services/phone.service.ts';
 import { ingestAndDistributeLead } from '../services/distribution.service.ts';
 import { getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
@@ -19,9 +26,13 @@ operationsRouter.get('/co-managers/:userId', async (req, res) => {
   try {
     const ctx = getTenantContext();
     const targetUserId = req.params.userId;
-    if (ctx.userRole === 'sale' && ctx.userId !== targetUserId) {
-      sendApiError(res, 403, 'FORBIDDEN', 'Bạn chỉ được xem Người đồng quản lý của chính mình.');
-      return;
+    if (ctx.userId !== targetUserId) {
+      const resolved = await getResolvedUserRbac(req);
+      const usersView = checkEffectivePermission(resolved, 'users', 'view');
+      if (!resolved.userOrg?.is_tenant_owner && (!usersView.allowed || usersView.scope === 'own')) {
+        sendApiError(res, 403, 'FORBIDDEN', 'Bạn chỉ được xem Người đồng quản lý của chính mình.');
+        return;
+      }
     }
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
       const r = await client.query(
@@ -43,9 +54,13 @@ operationsRouter.post('/co-managers/:userId', async (req, res) => {
   try {
     const ctx = getTenantContext();
     const targetUserId = req.params.userId;
-    if (ctx.userRole === 'sale' && ctx.userId !== targetUserId) {
-      sendApiError(res, 403, 'FORBIDDEN', 'Bạn chỉ được thêm Người đồng quản lý cho chính mình.');
-      return;
+    if (ctx.userId !== targetUserId) {
+      const resolved = await getResolvedUserRbac(req);
+      const usersEdit = checkEffectivePermission(resolved, 'users', 'edit');
+      if (!resolved.userOrg?.is_tenant_owner && (!usersEdit.allowed || usersEdit.scope === 'own')) {
+        sendApiError(res, 403, 'FORBIDDEN', 'Bạn chỉ được thêm Người đồng quản lý cho chính mình.');
+        return;
+      }
     }
 
     const { name, email, phone, zalo_chat_id } = req.body || {};
@@ -114,13 +129,19 @@ operationsRouter.patch('/co-managers/:managerId', async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { name, email, phone, zalo_chat_id, status } = req.body || {};
+    const resolvedRbac = await getResolvedUserRbac(req);
+    const canManageOtherCoManagers = Boolean(
+      resolvedRbac.userOrg?.is_tenant_owner ||
+        (checkEffectivePermission(resolvedRbac, 'users', 'edit').allowed &&
+          checkEffectivePermission(resolvedRbac, 'users', 'edit').scope !== 'own')
+    );
     const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
       const existing = await client.query<{ consultant_user_id: string }>(
         'SELECT consultant_user_id FROM consultant_managers WHERE tenant_id = $1 AND id = $2 LIMIT 1',
         [ctx.tenantId, req.params.managerId]
       );
       if (!existing.rows[0]) throw new Error('NOT_FOUND');
-      if (ctx.userRole === 'sale' && existing.rows[0].consultant_user_id !== ctx.userId) {
+      if (!canManageOtherCoManagers && existing.rows[0].consultant_user_id !== ctx.userId) {
         throw new Error('FORBIDDEN');
       }
 
@@ -160,13 +181,19 @@ operationsRouter.patch('/co-managers/:managerId', async (req, res) => {
 operationsRouter.delete('/co-managers/:managerId', async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolvedRbac = await getResolvedUserRbac(req);
+    const canManageOtherCoManagers = Boolean(
+      resolvedRbac.userOrg?.is_tenant_owner ||
+        (checkEffectivePermission(resolvedRbac, 'users', 'edit').allowed &&
+          checkEffectivePermission(resolvedRbac, 'users', 'edit').scope !== 'own')
+    );
     await withTenantTransaction(ctx.tenantId, async (client) => {
       const existing = await client.query<{ consultant_user_id: string }>(
         'SELECT consultant_user_id FROM consultant_managers WHERE tenant_id = $1 AND id = $2 LIMIT 1',
         [ctx.tenantId, req.params.managerId]
       );
       if (!existing.rows[0]) return;
-      if (ctx.userRole === 'sale' && existing.rows[0].consultant_user_id !== ctx.userId) {
+      if (!canManageOtherCoManagers && existing.rows[0].consultant_user_id !== ctx.userId) {
         throw new Error('FORBIDDEN');
       }
       await client.query('DELETE FROM consultant_managers WHERE tenant_id = $1 AND id = $2', [
@@ -190,8 +217,14 @@ operationsRouter.delete('/co-managers/:managerId', async (req, res) => {
 export const listPersonalLeadsHandler = async (req: any, res: any) => {
   try {
     const ctx = getTenantContext();
+    const resolvedRbac = await getResolvedUserRbac(req);
+    const leadsView = checkEffectivePermission(resolvedRbac, 'leads', 'view');
+    const canViewOtherOwners = Boolean(
+      resolvedRbac.userOrg?.is_tenant_owner ||
+        (leadsView.allowed && leadsView.scope !== 'own' && leadsView.scope !== 'none')
+    );
     const ownerFilter =
-      ctx.userRole === 'sale'
+      !canViewOtherOwners
         ? ctx.userId
         : req.query.owner_user_id
           ? String(req.query.owner_user_id)
@@ -314,7 +347,7 @@ operationsRouter.delete('/personal-leads/:id', deletePersonalLeadHandler);
 // ============================================================================
 // 3. AI Gatekeeper (`ai_screener_configs`, `held_leads`, `blacklist_entries`)
 // ============================================================================
-operationsRouter.get('/gatekeeper/config', requireRoles('tenant_admin', 'manager'), async (_req, res) => {
+operationsRouter.get('/gatekeeper/config', requirePermission('gatekeeper', 'view'), async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const cfg = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -340,7 +373,10 @@ operationsRouter.get('/gatekeeper/config', requireRoles('tenant_admin', 'manager
   }
 });
 
-operationsRouter.put('/gatekeeper/config', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.put(
+  '/gatekeeper/config',
+  requireAnyPermission([['gatekeeper', 'edit'], ['gatekeeper', 'manage_config']]),
+  async (req, res) => {
   try {
     const ctx = getTenantContext();
     const {
@@ -396,7 +432,7 @@ operationsRouter.put('/gatekeeper/config', requireRoles('tenant_admin', 'manager
   }
 });
 
-operationsRouter.get('/gatekeeper/held-leads', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.get('/gatekeeper/held-leads', requirePermission('gatekeeper', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const statusFilter = req.query.status ? String(req.query.status) : 'held';
@@ -421,10 +457,10 @@ operationsRouter.get('/gatekeeper/held-leads', requireRoles('tenant_admin', 'man
         client.query<{ total: number }>(`SELECT COUNT(*)::int AS total FROM held_leads WHERE ${where}`, params),
         client.query<{ held: number; approved: number; rejected: number; blacklisted: number }>(
           `SELECT
-             COUNT(*) FILTER (WHERE status = 'held')::int AS held,
-             COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
-             COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected,
-             COUNT(*) FILTER (WHERE status = 'blacklisted')::int AS blacklisted
+             COALESCE(SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END), 0) AS held,
+             COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
+             COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected,
+             COALESCE(SUM(CASE WHEN status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted
            FROM held_leads WHERE tenant_id = $1`,
           [ctx.tenantId]
         ),
@@ -434,10 +470,16 @@ operationsRouter.get('/gatekeeper/held-leads', requireRoles('tenant_admin', 'man
         ),
       ]);
 
+      const statsRow = statsRes.rows[0] || { held: 0, approved: 0, rejected: 0, blacklisted: 0 };
       const total = Number(cntRes.rows[0]?.total || 0);
       return {
         items: rowsRes.rows,
-        stats: statsRes.rows[0] || { held: 0, approved: 0, rejected: 0, blacklisted: 0 },
+        stats: {
+          held: Number(statsRow.held || 0),
+          approved: Number(statsRow.approved || 0),
+          rejected: Number(statsRow.rejected || 0),
+          blacklisted: Number(statsRow.blacklisted || 0),
+        },
         pagination: { total, page, total_pages: Math.max(1, Math.ceil(total / limit)) },
       };
     });
@@ -448,7 +490,7 @@ operationsRouter.get('/gatekeeper/held-leads', requireRoles('tenant_admin', 'man
   }
 });
 
-operationsRouter.post('/gatekeeper/held-leads/:id/resolve', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.post('/gatekeeper/held-leads/:id/resolve', requirePermission('gatekeeper', 'approve'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { action = 'approve' } = req.body || {};
@@ -512,7 +554,7 @@ operationsRouter.post('/gatekeeper/held-leads/:id/resolve', requireRoles('tenant
   }
 });
 
-operationsRouter.get('/gatekeeper/blacklist', requireRoles('tenant_admin', 'manager'), async (_req, res) => {
+operationsRouter.get('/gatekeeper/blacklist', requirePermission('gatekeeper', 'view'), async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -528,7 +570,10 @@ operationsRouter.get('/gatekeeper/blacklist', requireRoles('tenant_admin', 'mana
   }
 });
 
-operationsRouter.post('/gatekeeper/blacklist', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.post(
+  '/gatekeeper/blacklist',
+  requireAnyPermission([['gatekeeper', 'edit'], ['gatekeeper', 'manage_config']]),
+  async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { entry_type = 'phone', value, reason = '' } = req.body || {};
@@ -554,7 +599,10 @@ operationsRouter.post('/gatekeeper/blacklist', requireRoles('tenant_admin', 'man
   }
 });
 
-operationsRouter.delete('/gatekeeper/blacklist/:id', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.delete(
+  '/gatekeeper/blacklist/:id',
+  requireAnyPermission([['gatekeeper', 'edit'], ['gatekeeper', 'manage_config']]),
+  async (req, res) => {
   try {
     const ctx = getTenantContext();
     await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -572,7 +620,7 @@ operationsRouter.delete('/gatekeeper/blacklist/:id', requireRoles('tenant_admin'
 // ============================================================================
 // 4. Admin Audit Logs & Rollback (`admin_audit_logs`)
 // ============================================================================
-operationsRouter.get('/admin-audit', requireRoles('tenant_admin'), async (_req, res) => {
+operationsRouter.get('/admin-audit', requirePermission('settings', 'view'), async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -588,7 +636,7 @@ operationsRouter.get('/admin-audit', requireRoles('tenant_admin'), async (_req, 
   }
 });
 
-operationsRouter.post('/admin-audit/:id/rollback', requireRoles('tenant_admin'), async (req, res) => {
+operationsRouter.post('/admin-audit/:id/rollback', requirePermission('settings', 'manage_config'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const out = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -636,7 +684,7 @@ operationsRouter.post('/admin-audit/:id/rollback', requireRoles('tenant_admin'),
 // ============================================================================
 // 5. Batch Duplicate Check & Silent Import (`lead_import_batches`)
 // ============================================================================
-operationsRouter.post('/leads/batch-check', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.post('/leads/batch-check', requirePermission('leads', 'import'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const cfg = await getTenantSettingsCached(ctx.tenantId);
@@ -666,16 +714,19 @@ operationsRouter.post('/leads/batch-check', requireRoles('tenant_admin', 'manage
       const existingMap = new Map<string, any>();
 
       if (validPhones.length > 0) {
+        const phonePlaceholders = validPhones.map((_, i) => `$${i + 2}`).join(', ');
         const exRes = await client.query(
-          `SELECT DISTINCT ON (l.phone) l.phone, l.id, l.name, l.created_at, u.full_name AS owner_name
+          `SELECT l.phone, l.id, l.name, l.created_at, u.full_name AS owner_name
            FROM leads l
            LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
-           WHERE l.tenant_id = $1 AND l.phone = ANY($2::text[]) AND l.is_deleted = false
-           ORDER BY l.phone, l.created_at DESC`,
-          [ctx.tenantId, validPhones]
+           WHERE l.tenant_id = $1 AND l.phone IN (${phonePlaceholders}) AND l.is_deleted = false
+           ORDER BY l.created_at DESC`,
+          [ctx.tenantId, ...validPhones]
         );
         for (const ex of exRes.rows) {
-          existingMap.set(ex.phone, ex);
+          if (!existingMap.has(ex.phone)) {
+            existingMap.set(ex.phone, ex);
+          }
         }
       }
 
@@ -695,7 +746,7 @@ operationsRouter.post('/leads/batch-check', requireRoles('tenant_admin', 'manage
   }
 });
 
-operationsRouter.get('/leads/import-batches', requireRoles('tenant_admin', 'manager'), async (_req, res) => {
+operationsRouter.get('/leads/import-batches', requirePermission('leads', 'import'), async (_req, res) => {
   try {
     const ctx = getTenantContext();
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -711,7 +762,7 @@ operationsRouter.get('/leads/import-batches', requireRoles('tenant_admin', 'mana
   }
 });
 
-operationsRouter.post('/leads/batch-import', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+operationsRouter.post('/leads/batch-import', requirePermission('leads', 'import'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { file_name = 'import.xlsx', rows = [], is_silent = true, skip_duplicates = true } = req.body || {};

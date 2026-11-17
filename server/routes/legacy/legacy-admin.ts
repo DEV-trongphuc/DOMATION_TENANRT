@@ -5,6 +5,7 @@ import { normalizeTenantSettings, type TenantSettings } from '../../core/setting
 import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
 import { buildLegacyDateFilter, formatDateTimeVnSql } from './legacy-helpers.ts';
+import { getZonedDateParts } from '../workspace.routes.ts';
 import { hashPassword, verifyPassword } from '../../core/crypto/password.ts';
 import { encryptTenantSecret } from '../../core/crypto/vault.ts';
 import {
@@ -596,29 +597,39 @@ export async function handleLegacyAdmin(
     const qParams: unknown[] = [ctx.tenantId, consId];
     const cond = df.bindSql('created_at', qParams);
 
-    const [sumRes, dailyRes] = await Promise.all([
+    const [sumRes, leadDatesRes] = await Promise.all([
       client.query(
-        `SELECT COUNT(*)::int AS total,
-                COUNT(*) FILTER (WHERE is_accepted = true)::int AS accepted,
-                COUNT(*) FILTER (WHERE LOWER(quality_status) IN ('qualified','booked','booking','closed','good'))::int AS qualified
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN is_accepted = true THEN 1 ELSE 0 END), 0) AS accepted,
+                COALESCE(SUM(CASE WHEN LOWER(quality_status) IN ('qualified','booked','booking','closed','good') THEN 1 ELSE 0 END), 0) AS qualified
          FROM leads
          WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = false AND status != 'archived' AND (${cond})`,
         qParams
       ),
-      client.query(
-        `SELECT to_char(created_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'DD/MM') AS date, COUNT(*)::int AS count
+      client.query<{ created_at: Date | string }>(
+        `SELECT created_at
          FROM leads
-         WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = false AND status != 'archived' AND (${cond})
-         GROUP BY date, to_char(created_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD')
-         ORDER BY to_char(created_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD') ASC LIMIT 31`,
+         WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = false AND status != 'archived' AND (${cond})`,
         qParams
       ),
     ]);
+    const dayMap = new Map<string, { date: string; count: number }>();
+    for (const row of leadDatesRes.rows) {
+      const zp = getZonedDateParts(row.created_at, 'Asia/Ho_Chi_Minh');
+      if (!zp) continue;
+      const cur = dayMap.get(zp.ymd) || { date: zp.ddmm, count: 0 };
+      cur.count++;
+      dayMap.set(zp.ymd, cur);
+    }
+    const dailyChart = [...dayMap.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .slice(0, 31)
+      .map(([, val]) => val);
     return {
       success: true,
       data: {
         ...(sumRes.rows[0] || { total: 0, accepted: 0, qualified: 0 }),
-        chart: dailyRes.rows,
+        chart: dailyChart,
       },
     };
   }
@@ -887,12 +898,22 @@ export async function handleLegacyAdmin(
       mappings: Array.isArray(body.mappings) ? body.mappings : [],
     };
     if (isEdit && body.id) {
+      const existingW = await client.query<{ field_mappings: Record<string, any> | null }>(
+        'SELECT field_mappings FROM tenant_webhooks WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, String(body.id)]
+      );
+      const mergedMappings = {
+        ...(existingW.rows[0]?.field_mappings && typeof existingW.rows[0].field_mappings === 'object'
+          ? existingW.rows[0].field_mappings
+          : {}),
+        ...meta,
+      };
       await client.query(
         `UPDATE tenant_webhooks
-         SET name = $3, url = COALESCE($4, url), field_mappings = COALESCE(field_mappings, '{}'::jsonb) || $5::jsonb,
+         SET name = $3, url = COALESCE($4, url), field_mappings = $5::jsonb,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
-        [ctx.tenantId, String(body.id), name, body.sheet_url || null, JSON.stringify(meta)]
+        [ctx.tenantId, String(body.id), name, body.sheet_url || null, JSON.stringify(mergedMappings)]
       );
       return { success: true, message: 'Đã cập nhật kết nối.' };
     }
@@ -921,9 +942,19 @@ export async function handleLegacyAdmin(
     } else {
       const key = action === 'toggle_require_both' ? 'require_both_contact' : 'notify_admin';
       const val = Number(params.get(action === 'toggle_require_both' ? 'require' : 'notify')) === 1;
+      const curW = await client.query<{ field_mappings: Record<string, any> | null }>(
+        'SELECT field_mappings FROM tenant_webhooks WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, id]
+      );
+      const nextMappings = {
+        ...(curW.rows[0]?.field_mappings && typeof curW.rows[0].field_mappings === 'object'
+          ? curW.rows[0].field_mappings
+          : {}),
+        [key]: val,
+      };
       await client.query(
-        `UPDATE tenant_webhooks SET field_mappings = COALESCE(field_mappings,'{}'::jsonb) || $3::jsonb WHERE tenant_id = $1 AND id = $2`,
-        [ctx.tenantId, id, JSON.stringify({ [key]: val })]
+        `UPDATE tenant_webhooks SET field_mappings = $3::jsonb WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, id, JSON.stringify(nextMappings)]
       );
     }
     return { success: true };
@@ -954,9 +985,10 @@ export async function handleLegacyAdmin(
         const cur = Array.isArray(w.field_mappings?.mappings) ? w.field_mappings.mappings : [];
         const next = cur.filter((m: any) => String(m.id) !== mappingId);
         if (next.length !== cur.length) {
+          const nextMappings = { ...(w.field_mappings && typeof w.field_mappings === 'object' ? w.field_mappings : {}), mappings: next };
           await client.query(
-            `UPDATE tenant_webhooks SET field_mappings = COALESCE(field_mappings,'{}'::jsonb) || $3::jsonb WHERE tenant_id = $1 AND id = $2`,
-            [ctx.tenantId, w.id, JSON.stringify({ mappings: next })]
+            `UPDATE tenant_webhooks SET field_mappings = $3::jsonb WHERE tenant_id = $1 AND id = $2`,
+            [ctx.tenantId, w.id, JSON.stringify(nextMappings)]
           );
         }
       }
@@ -975,9 +1007,15 @@ export async function handleLegacyAdmin(
         system_field: body.system_field || 'name',
       };
       const next = action === 'edit_mapping' ? cur.map((m: any) => (String(m.id) === mappingId ? item : m)) : [...cur, item];
+      const nextMappings = {
+        ...(wRes.rows[0]?.field_mappings && typeof wRes.rows[0].field_mappings === 'object'
+          ? wRes.rows[0].field_mappings
+          : {}),
+        mappings: next,
+      };
       await client.query(
-        `UPDATE tenant_webhooks SET field_mappings = COALESCE(field_mappings,'{}'::jsonb) || $3::jsonb WHERE tenant_id = $1 AND id = $2`,
-        [ctx.tenantId, connId, JSON.stringify({ mappings: next })]
+        `UPDATE tenant_webhooks SET field_mappings = $3::jsonb WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, connId, JSON.stringify(nextMappings)]
       );
     }
     return { success: true };
@@ -1032,9 +1070,17 @@ export async function handleLegacyAdmin(
     const payload = { ...body };
     if (action === 'save_ticket_settings') {
       const admins = Array.isArray(body.admin_ids) ? body.admin_ids : Array.isArray(body.ticket_notify_admins) ? body.ticket_notify_admins : [];
+      const curT = await client.query<{ settings: Record<string, any> | null }>(
+        'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+        [ctx.tenantId]
+      );
+      const mergedSettings = {
+        ...(curT.rows[0]?.settings && typeof curT.rows[0].settings === 'object' ? curT.rows[0].settings : {}),
+        ticket_notify_admins: admins,
+      };
       await client.query(
-        `UPDATE tenants SET settings = COALESCE(settings,'{}'::jsonb) || $2::jsonb, updated_at = clock_timestamp() WHERE id = $1`,
-        [ctx.tenantId, JSON.stringify({ ticket_notify_admins: admins })]
+        `UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1`,
+        [ctx.tenantId, JSON.stringify(mergedSettings)]
       );
       tenantRedis.invalidateTenantCache(ctx.tenantId);
       return { success: true, message: 'Đã lưu cấu hình thông báo Ticket.' };
@@ -1611,7 +1657,7 @@ export async function handleLegacyAdmin(
   if (action === 'ai_chat') {
     const prompt = String(body.message || body.prompt || '').trim();
     const sum = await client.query(
-      `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status = 'assigned')::int AS assigned
+      `SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END), 0) AS assigned
        FROM leads WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived'`,
       [ctx.tenantId]
     );

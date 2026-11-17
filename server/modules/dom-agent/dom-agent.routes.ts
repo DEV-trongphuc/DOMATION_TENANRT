@@ -22,8 +22,12 @@ import {
 } from './rag.service.ts';
 import {
   executeDomAgentToolInTx,
+  hasModuleEntitlement,
   listDomAgentToolsForCaller,
 } from './tools-registry.ts';
+import { ensureHrmApprovalsSchema, ensureDefaultApprovalWorkflowsInTx } from '../hrm/schema.ts';
+import { createApprovalRequestInTx } from '../approvals/approval-engine.ts';
+import { ensureErpOpsSchema } from '../erp-ops/schema.ts';
 import {
   buildSpecialistsCatalog,
   generateMorningBriefingInTx,
@@ -591,6 +595,262 @@ domAgentRouter.post('/chat', async (req, res) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Không thể xử lý yêu cầu hội thoại DOM Agent.';
     sendApiError(res, 500, 'DOM_AGENT_CHAT_FAILED', msg);
+  }
+});
+
+// SSE Chunk Streaming Endpoint (`POST /api/v1/dom-agent/chat/stream`)
+domAgentRouter.post('/chat/stream', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+
+    const turnOutcome = await withTenantTransaction(ctx.tenantId, (client) =>
+      runDomAgentChatTurnInTx(client, ctx, {
+        threadId: b.thread_id ? String(b.thread_id) : null,
+        specialistKey: b.specialist_key ? String(b.specialist_key) : 'orchestrator',
+        message: String(b.message || b.prompt || ''),
+        explicitToolName: b.tool_name ? String(b.tool_name) : undefined,
+        explicitToolArgs:
+          b.tool_args && typeof b.tool_args === 'object'
+            ? (b.tool_args as Record<string, unknown>)
+            : undefined,
+      })
+    );
+
+    if (!turnOutcome.ok) {
+      sendApiError(res, turnOutcome.status, turnOutcome.code, turnOutcome.message);
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const writeSse = (event: string, payload: unknown) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    const data = turnOutcome.data;
+    writeSse('meta', {
+      thread: data.thread,
+      user_message: data.user_message,
+      engine_mode: data.engine_mode,
+    });
+
+    for (const te of data.tool_executions) {
+      writeSse('tool', te);
+    }
+
+    const fullContent = String(data.assistant_message.content || '');
+    const chunkSize = 48;
+    for (let i = 0; i < fullContent.length; i += chunkSize) {
+      writeSse('delta', { delta: fullContent.slice(i, i + chunkSize) });
+    }
+
+    if (data.chart_data) {
+      writeSse('chart', data.chart_data);
+    }
+    if (data.action_proposal) {
+      writeSse('proposal', data.action_proposal);
+    }
+
+    writeSse('done', data);
+    res.end();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Không thể xử lý luồng streaming DOM Agent.';
+    if (!res.headersSent) {
+      sendApiError(res, 500, 'DOM_AGENT_STREAM_FAILED', msg);
+    } else {
+      res.write(`event: error\ndata: ${JSON.stringify({ message: msg })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// Confirm-Before-Write Action Proposal Executor (`POST /api/v1/dom-agent/proposals/execute`)
+domAgentRouter.post('/proposals/execute', async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const b = req.body || {};
+    const actionType = String(b.action_type || '').trim().toLowerCase();
+    const title = String(b.title || b.summary || 'Đề xuất xác nhận từ DOM Agent').trim();
+    const params: Record<string, unknown> =
+      b.params && typeof b.params === 'object' ? (b.params as Record<string, unknown>) : {};
+
+    if (!actionType) {
+      sendApiError(res, 422, 'ACTION_TYPE_REQUIRED', 'Thiếu loại hành động đề xuất (action_type).');
+      return;
+    }
+
+    await Promise.all([ensureHrmApprovalsSchema(), ensureErpOpsSchema()]);
+
+    const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const rbac = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
+      const isOwner = Boolean(rbac.userOrg?.is_tenant_owner);
+
+      // Map action_type -> target module + required action
+      const targetSpec =
+        actionType === 'leave' || actionType === 'expense' || actionType === 'cash_advance' || actionType === 'advance_payment'
+          ? { moduleKey: 'approvals', action: 'create' as const }
+          : actionType === 'task'
+            ? { moduleKey: 'projects', action: 'create' as const }
+            : { moduleKey: 'leads', action: 'create' as const };
+
+      if (!hasModuleEntitlement(rbac.enabledModules, targetSpec.moduleKey)) {
+        await client.query(
+          `INSERT INTO tenant_ai_tool_audit_logs (
+             id, tenant_id, user_id, tool_name, module_key, required_action, data_scope,
+             allowed, denial_reason, args_summary, latency_ms
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'none', false, 'MODULE_NOT_ENTITLED', $7::jsonb, 1)`,
+          [
+            crypto.randomUUID(),
+            ctx.tenantId,
+            ctx.userId,
+            `proposal:${actionType}`,
+            targetSpec.moduleKey,
+            targetSpec.action,
+            JSON.stringify({ title }),
+          ]
+        );
+        return {
+          ok: false as const,
+          status: 403,
+          code: 'MODULE_NOT_ENTITLED',
+          message: `Gói dịch vụ hiện tại chưa mở khóa phân hệ '${targetSpec.moduleKey}'.`,
+        };
+      }
+
+      const perm = rbac.effectivePermissions[targetSpec.moduleKey];
+      if (!isOwner && (!perm || perm.scope === 'none' || !perm.actions[targetSpec.action])) {
+        await client.query(
+          `INSERT INTO tenant_ai_tool_audit_logs (
+             id, tenant_id, user_id, tool_name, module_key, required_action, data_scope,
+             allowed, denial_reason, args_summary, latency_ms
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, false, 'FORBIDDEN_RBAC_PERMISSION', $8::jsonb, 1)`,
+          [
+            crypto.randomUUID(),
+            ctx.tenantId,
+            ctx.userId,
+            `proposal:${actionType}`,
+            targetSpec.moduleKey,
+            targetSpec.action,
+            perm?.scope || 'none',
+            JSON.stringify({ title }),
+          ]
+        );
+        return {
+          ok: false as const,
+          status: 403,
+          code: 'FORBIDDEN_RBAC_PERMISSION',
+          message: `Tài khoản của bạn không có quyền '${targetSpec.action}' trên phân hệ '${targetSpec.moduleKey}'.`,
+        };
+      }
+
+      let createdEntity: Record<string, unknown> = {};
+
+      if (actionType === 'leave' || actionType === 'expense' || actionType === 'cash_advance' || actionType === 'advance_payment') {
+        await ensureDefaultApprovalWorkflowsInTx(client, ctx.tenantId);
+        const cat = actionType === 'leave' ? 'leave' : 'expense';
+        const wfRes = await client.query<{ id: string }>(
+          `SELECT id FROM tenant_approval_workflows
+           WHERE tenant_id = $1 AND is_active = true
+           ORDER BY CASE WHEN category = $2 THEN 0 ELSE 1 END, created_at ASC
+           LIMIT 1`,
+          [ctx.tenantId, cat]
+        );
+        const wfId = wfRes.rows[0]?.id;
+        if (!wfId) {
+          return { ok: false as const, status: 404, code: 'WORKFLOW_NOT_FOUND', message: 'Chưa có luồng phê duyệt khả dụng.' };
+        }
+        const appr = await createApprovalRequestInTx(client, {
+          tenantId: ctx.tenantId,
+          workflowId: wfId,
+          requesterUserId: ctx.userId,
+          title,
+          description: String(params.reason || params.notes || b.summary || ''),
+          amountVnd: Number(params.amount_vnd ?? params.amount ?? 0),
+          startDate: params.start_date ? String(params.start_date) : null,
+          endDate: params.end_date ? String(params.end_date) : null,
+          formData: params,
+        });
+        createdEntity = {
+          entity_type: 'approval_request',
+          id: appr.request.id,
+          request_code: appr.request.request_code,
+          status: appr.request.status,
+          route: '/erp/approvals',
+        };
+      } else if (actionType === 'task') {
+        const execTask = await executeDomAgentToolInTx(client, ctx, 'ops_create_task', {
+          title,
+          description: String(params.reason || params.description || b.summary || ''),
+          priority: String(params.priority || 'high'),
+        });
+        if (!execTask.allowed) {
+          return {
+            ok: false as const,
+            status: 403,
+            code: execTask.error_code || 'FORBIDDEN_RBAC_PERMISSION',
+            message: execTask.denial_reason || 'Không đủ quyền tạo công việc.',
+          };
+        }
+        createdEntity = {
+          entity_type: 'task',
+          ...(execTask.output || {}),
+          route: '/erp/projects',
+        };
+      } else {
+        const execLead = await executeDomAgentToolInTx(client, ctx, 'crm_upsert_lead', {
+          name: String(params.name || title),
+          phone: params.phone ? String(params.phone) : undefined,
+          email: params.email ? String(params.email) : undefined,
+          product_interest: params.product_interest ? String(params.product_interest) : undefined,
+        });
+        if (!execLead.allowed) {
+          return {
+            ok: false as const,
+            status: 403,
+            code: execLead.error_code || 'FORBIDDEN_RBAC_PERMISSION',
+            message: execLead.denial_reason || 'Không đủ quyền tạo khách hàng.',
+          };
+        }
+        createdEntity = {
+          entity_type: 'lead',
+          ...(execLead.output || {}),
+          route: '/data',
+        };
+      }
+
+      await client.query(
+        `INSERT INTO tenant_ai_tool_audit_logs (
+           id, tenant_id, user_id, tool_name, module_key, required_action, data_scope,
+           allowed, args_summary, latency_ms
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8::jsonb, 2)`,
+        [
+          crypto.randomUUID(),
+          ctx.tenantId,
+          ctx.userId,
+          `proposal:${actionType}`,
+          targetSpec.moduleKey,
+          targetSpec.action,
+          perm?.scope || 'all',
+          JSON.stringify({ title, entity_type: createdEntity.entity_type }),
+        ]
+      );
+
+      return { ok: true as const, data: createdEntity };
+    });
+
+    if (!outcome.ok) {
+      sendApiError(res, outcome.status, outcome.code, outcome.message);
+      return;
+    }
+
+    res.status(201).json({ success: true, data: outcome.data });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Không thể thực thi đề xuất từ DOM Agent.';
+    sendApiError(res, 500, 'EXECUTE_PROPOSAL_FAILED', msg);
   }
 });
 

@@ -202,8 +202,13 @@ function escapeHtml(raw: unknown): string {
     .replace(/"/g, '&quot;');
 }
 
-export function renderMergeTags(templateStr: string, context: Record<string, unknown>): string {
+export function renderMergeTags(
+  templateStr: string,
+  context: Record<string, unknown>,
+  fallbackVars?: Record<string, string>
+): string {
   if (!templateStr) return '';
+  const fb = fallbackVars && typeof fallbackVars === 'object' ? fallbackVars : {};
   return String(templateStr).replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (_match, rawPath: string) => {
     const parts = rawPath.split('.');
     let cursor: unknown = context;
@@ -215,12 +220,17 @@ export function renderMergeTags(templateStr: string, context: Record<string, unk
         break;
       }
     }
-    if (cursor === undefined || cursor === null || cursor === '') {
+    if (cursor === undefined || cursor === null || String(cursor).trim() === '') {
       // Flat fallback (e.g. {{name}} -> context.lead.name)
       const leadObj = context.lead as Record<string, unknown> | undefined;
-      if (leadObj && rawPath in leadObj && leadObj[rawPath] !== undefined && leadObj[rawPath] !== null) {
+      if (leadObj && rawPath in leadObj && leadObj[rawPath] !== undefined && leadObj[rawPath] !== null && String(leadObj[rawPath]).trim() !== '') {
         return String(leadObj[rawPath]);
       }
+      const wrappedKey = `{{${rawPath}}}`;
+      if (fb[wrappedKey]) return String(fb[wrappedKey]);
+      if (fb[rawPath]) return String(fb[rawPath]);
+      const leaf = parts[parts.length - 1];
+      if (leaf && fb[leaf]) return String(fb[leaf]);
       return '';
     }
     return String(cursor);

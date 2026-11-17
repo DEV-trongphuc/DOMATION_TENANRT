@@ -722,6 +722,20 @@ approvalsRouter.get('/requests', requirePermission('approvals', 'view'), async (
         const canCurrentUserAct = logs.some(
           (l) => String(l.assigned_user_id) === ctx.userId && l.status === 'pending' && row.status === 'pending'
         );
+        const activePendingLog = logs.find((l) => l.status === 'pending') || null;
+        const dueAtStr = activePendingLog?.due_at ? String(activePendingLog.due_at) : null;
+        const remainingHours = dueAtStr
+          ? Math.round(((new Date(dueAtStr).getTime() - Date.now()) / 3_600_000) * 10) / 10
+          : null;
+        const slaState =
+          row.status !== 'pending' || remainingHours === null
+            ? 'completed'
+            : remainingHours < 0
+              ? 'overdue_escalated'
+              : remainingHours <= 4
+                ? 'due_soon'
+                : 'on_track';
+
         return {
           ...row,
           amount_vnd: toNum(row.amount_vnd, 0),
@@ -730,6 +744,12 @@ approvalsRouter.get('/requests', requirePermission('approvals', 'view'), async (
           resolved_steps_snapshot: parseJsonSafe<any[]>(row.resolved_steps_snapshot, []),
           step_logs: logs,
           can_current_user_act: canCurrentUserAct,
+          sla_status: {
+            due_at: dueAtStr,
+            remaining_hours: remainingHours,
+            is_overdue: remainingHours !== null && remainingHours < 0 && row.status === 'pending',
+            escalation_state: slaState,
+          },
         };
       });
     });
@@ -737,6 +757,203 @@ approvalsRouter.get('/requests', requirePermission('approvals', 'view'), async (
     res.json({ success: true, data: items });
   } catch (err: any) {
     sendApiError(res, 500, 'LIST_REQUESTS_FAILED', err?.message || 'Không thể tải danh sách tờ trình phê duyệt.');
+  }
+});
+
+async function safeOptionalQueryInTx(client: any, sql: string, params: unknown[]): Promise<any[]> {
+  const sp = `sp_appr_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  try {
+    await client.query(`SAVEPOINT ${sp}`);
+    const r = await client.query(sql, params);
+    await client.query(`RELEASE SAVEPOINT ${sp}`);
+    return r.rows || [];
+  } catch {
+    try {
+      await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+    } catch {
+      // ignore rollback failure
+    }
+    return [];
+  }
+}
+
+async function resolveLinkedEntityPreviewInTx(
+  client: any,
+  tenantId: string,
+  row: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const category = String(row.category || '').toLowerCase();
+  const linkedType = String(row.linked_entity_type || category).toLowerCase();
+  const linkedId = row.linked_entity_id ? String(row.linked_entity_id) : null;
+  const formData = parseJsonSafe<Record<string, unknown>>(row.form_data, {});
+
+  const branchRows = await safeOptionalQueryInTx(
+    client,
+    'SELECT name, legal_entity_name, tax_code, address FROM tenant_branches WHERE tenant_id = $1 AND is_active = true ORDER BY is_headquarters DESC LIMIT 1',
+    [tenantId]
+  );
+  const hq = branchRows[0] || {};
+
+  // 1. Leave / Overtime / Attendance Explanation -> Employee Leave Balance & Dept Overlap
+  if (category === 'leave' || category === 'overtime' || category === 'attendance_explanation') {
+    const empRows = await safeOptionalQueryInTx(
+      client,
+      `SELECT e.employee_code, e.full_name, e.annual_leave_quota, e.annual_leave_used, e.compensatory_leave_balance,
+              e.department_id, d.name AS department_name
+       FROM tenant_hr_employees e
+       LEFT JOIN tenant_departments d ON d.tenant_id = e.tenant_id AND d.id = e.department_id
+       WHERE e.tenant_id = $1 AND e.user_id = $2
+       LIMIT 1`,
+      [tenantId, row.requester_user_id]
+    );
+    const emp = empRows[0] || null;
+    const quota = emp ? toNum(emp.annual_leave_quota, 12) : 12;
+    const used = emp ? toNum(emp.annual_leave_used, 0) : 0;
+
+    let overlappingDeptLeaves: any[] = [];
+    if (emp?.department_id && row.start_date) {
+      overlappingDeptLeaves = await safeOptionalQueryInTx(
+        client,
+        `SELECT r.id, r.request_code, r.title, r.start_date, r.end_date, r.status, u.full_name AS requester_name
+         FROM tenant_approval_requests r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id AND u.id = r.requester_user_id
+         WHERE r.tenant_id = $1
+           AND r.category = 'leave'
+           AND r.status IN ('pending', 'approved')
+           AND r.id <> $2
+           AND u.department_id = $3
+         ORDER BY r.created_at DESC LIMIT 5`,
+        [tenantId, row.id, emp.department_id]
+      );
+    }
+
+    return {
+      preview_type: 'leave_balance',
+      employee: emp
+        ? {
+            employee_code: emp.employee_code,
+            full_name: emp.full_name,
+            department_name: emp.department_name || null,
+            annual_leave_quota: quota,
+            annual_leave_used: used,
+            annual_leave_remaining: Math.max(0, quota - used),
+            compensatory_leave_balance: toNum(emp.compensatory_leave_balance, 0),
+          }
+        : {
+            annual_leave_quota: 12,
+            annual_leave_used: 0,
+            annual_leave_remaining: 12,
+          },
+      requested_days: toNum(formData.total_days ?? formData.days, 1),
+      leave_type: formData.leave_type || null,
+      overlapping_department_leaves: overlappingDeptLeaves,
+    };
+  }
+
+  // 2. Purchase Order / Sales Order -> Vendor/Customer & Line Items Preview
+  if (category === 'purchase_order' || category === 'sales_order' || linkedType === 'purchase_order' || linkedType === 'sales_order') {
+    const isPo = category === 'purchase_order' || linkedType === 'purchase_order';
+    let orderDoc: any = null;
+    let lineItems: any[] = Array.isArray(formData.items) ? (formData.items as any[]) : [];
+
+    if (linkedId) {
+      const orderTable = isPo ? 'tenant_purchase_orders' : 'tenant_sales_orders';
+      const itemTable = isPo ? 'tenant_purchase_order_items' : 'tenant_sales_order_items';
+      const fkCol = isPo ? 'purchase_order_id' : 'sales_order_id';
+      const oRows = await safeOptionalQueryInTx(
+        client,
+        `SELECT * FROM ${orderTable} WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+        [tenantId, linkedId]
+      );
+      orderDoc = oRows[0] || null;
+      const iRows = await safeOptionalQueryInTx(
+        client,
+        `SELECT * FROM ${itemTable} WHERE tenant_id = $1 AND ${fkCol} = $2 ORDER BY created_at ASC`,
+        [tenantId, linkedId]
+      );
+      if (iRows.length > 0) lineItems = iRows;
+      else if (orderDoc?.items_json) {
+        lineItems = parseJsonSafe<any[]>(orderDoc.items_json, lineItems);
+      }
+    }
+
+    return {
+      preview_type: isPo ? 'purchase_order' : 'sales_order',
+      legal_entity: hq,
+      partner_name: orderDoc?.supplier_name || orderDoc?.customer_name || formData.vendor_name || formData.customer_name || null,
+      order_code: orderDoc?.po_code || orderDoc?.so_code || row.request_code,
+      delivery_days: formData.delivery_days || null,
+      total_amount_vnd: toNum(orderDoc?.total_amount_vnd ?? row.amount_vnd, 0),
+      line_items: lineItems,
+    };
+  }
+
+  // 3. Deposit / Cash Advance -> Milestone Tranches & Dynamic VietQR Bank Info
+  if (category === 'cash_advance' || linkedType === 'deposit') {
+    let milestones: any[] = Array.isArray(formData.milestones) ? (formData.milestones as any[]) : [];
+    if (linkedId) {
+      const mRows = await safeOptionalQueryInTx(
+        client,
+        'SELECT * FROM tenant_deposit_milestones WHERE tenant_id = $1 AND (deposit_id = $2 OR id = $2) ORDER BY tranche_number ASC',
+        [tenantId, linkedId]
+      );
+      if (mRows.length > 0) milestones = mRows;
+    }
+    return {
+      preview_type: 'deposit_milestone',
+      legal_entity: hq,
+      amount_vnd: toNum(row.amount_vnd, 0),
+      beneficiary_bank: formData.beneficiary_bank || null,
+      beneficiary_account: formData.beneficiary_account || null,
+      milestones,
+    };
+  }
+
+  // 4. Expense / Contract / Custom -> Voucher Receipt & VAT Preview
+  let expenseDoc: any = null;
+  if (linkedId) {
+    const eRows = await safeOptionalQueryInTx(
+      client,
+      'SELECT * FROM tenant_expenses WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+      [tenantId, linkedId]
+    );
+    expenseDoc = eRows[0] || null;
+  }
+
+  return {
+    preview_type: 'expense_receipt',
+    legal_entity: hq,
+    expense_category: expenseDoc?.category || formData.expense_category || category,
+    amount_vnd: toNum(expenseDoc?.amount_vnd ?? row.amount_vnd, 0),
+    vat_amount_vnd: toNum(expenseDoc?.vat_amount_vnd ?? formData.vat_amount_vnd, 0),
+    has_vat_invoice: Boolean(expenseDoc?.has_vat_invoice ?? formData.has_vat_invoice),
+    beneficiary_bank: formData.beneficiary_bank || null,
+    beneficiary_account: formData.beneficiary_account || null,
+    items: Array.isArray(formData.items) ? formData.items : [],
+  };
+}
+
+approvalsRouter.get('/requests/:id/linked-preview', requirePermission('approvals', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const id = String(req.params.id);
+
+    const preview = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM tenant_approval_requests WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, id]
+      );
+      if (!r.rows[0]) return null;
+      return resolveLinkedEntityPreviewInTx(client, ctx.tenantId, r.rows[0]);
+    });
+
+    if (!preview) {
+      sendApiError(res, 404, 'REQUEST_NOT_FOUND', 'Không tìm thấy tờ trình phê duyệt.');
+      return;
+    }
+    res.json({ success: true, data: preview });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_LINKED_PREVIEW_FAILED', err?.message || 'Không thể tải thông tin chứng từ gốc.');
   }
 });
 
@@ -766,12 +983,33 @@ approvalsRouter.get('/requests/:id', requirePermission('approvals', 'view'), asy
         [ctx.tenantId, id]
       );
       const row = r.rows[0];
+      const linkedPreview = await resolveLinkedEntityPreviewInTx(client, ctx.tenantId, row);
+      const activePendingLog = logs.rows.find((l) => l.status === 'pending') || null;
+      const dueAtStr = activePendingLog?.due_at ? String(activePendingLog.due_at) : null;
+      const remainingHours = dueAtStr
+        ? Math.round(((new Date(dueAtStr).getTime() - Date.now()) / 3_600_000) * 10) / 10
+        : null;
+
       return {
         ...row,
         amount_vnd: toNum(row.amount_vnd, 0),
         form_data: parseJsonSafe<Record<string, unknown>>(row.form_data, {}),
         attachments: parseJsonSafe<any[]>(row.attachments, []),
         step_logs: logs.rows,
+        linked_preview: linkedPreview,
+        sla_status: {
+          due_at: dueAtStr,
+          remaining_hours: remainingHours,
+          is_overdue: remainingHours !== null && remainingHours < 0 && row.status === 'pending',
+          escalation_state:
+            row.status !== 'pending' || remainingHours === null
+              ? 'completed'
+              : remainingHours < 0
+                ? 'overdue_escalated'
+                : remainingHours <= 4
+                  ? 'due_soon'
+                  : 'on_track',
+        },
       };
     });
 
@@ -1077,3 +1315,172 @@ const decideRequestHandler = async (req: any, res: any) => {
 
 approvalsRouter.post('/requests/:id/decide', requirePermission('approvals', 'approve'), decideRequestHandler);
 approvalsRouter.post('/requests/:id/action', requirePermission('approvals', 'approve'), decideRequestHandler);
+
+// Batch Approve / Batch Reject (`/requests/batch-decide`)
+approvalsRouter.post('/requests/batch-decide', requirePermission('approvals', 'approve'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const requestIds: string[] = Array.isArray(req.body?.request_ids)
+      ? req.body.request_ids.map((x: unknown) => String(x || '').trim()).filter(Boolean)
+      : [];
+    const decisionRaw = String(req.body?.decision || req.body?.action || '').trim().toLowerCase();
+    const comment = req.body?.comment ? String(req.body.comment).trim() : null;
+    const signatureDataUrl = req.body?.signature_data_url ? String(req.body.signature_data_url) : null;
+
+    if (requestIds.length === 0) {
+      sendApiError(res, 422, 'REQUEST_IDS_REQUIRED', 'Vui lòng chọn ít nhất 1 tờ trình để phê duyệt hàng loạt.');
+      return;
+    }
+    if (!['approve', 'approved', 'reject', 'rejected', 'return', 'returned'].includes(decisionRaw)) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Hành động hàng loạt không hợp lệ (approve | reject | return).');
+      return;
+    }
+
+    const normalizedDecision: 'approved' | 'rejected' | 'returned' = decisionRaw.startsWith('approv')
+      ? 'approved'
+      : decisionRaw.startsWith('reject')
+        ? 'rejected'
+        : 'returned';
+
+    const summary = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const rbac = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
+      const isOwner = Boolean(rbac.userOrg?.is_tenant_owner);
+      const succeededIds: string[] = [];
+      const skipped: Array<{ id: string; reason: string }> = [];
+
+      for (const reqId of requestIds.slice(0, 100)) {
+        const reqRes = await client.query(
+          'SELECT * FROM tenant_approval_requests WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, reqId]
+        );
+        const apprReq = reqRes.rows[0];
+        if (!apprReq) {
+          skipped.push({ id: reqId, reason: 'REQUEST_NOT_FOUND' });
+          continue;
+        }
+        if (apprReq.status !== 'pending') {
+          skipped.push({ id: reqId, reason: 'REQUEST_ALREADY_CLOSED' });
+          continue;
+        }
+
+        const curStepOrder = Number(apprReq.current_step_order || 1);
+        const pendingLogsRes = await client.query(
+          `SELECT * FROM tenant_approval_step_logs
+           WHERE tenant_id = $1 AND request_id = $2 AND step_order = $3 AND status = 'pending'`,
+          [ctx.tenantId, reqId, curStepOrder]
+        );
+        const myLog =
+          pendingLogsRes.rows.find((l) => String(l.assigned_user_id) === ctx.userId) ||
+          (isOwner ? pendingLogsRes.rows[0] : null);
+
+        if (!myLog) {
+          skipped.push({ id: reqId, reason: 'NOT_ASSIGNED_APPROVER' });
+          continue;
+        }
+
+        await client.query(
+          `UPDATE tenant_approval_step_logs
+           SET status = $3,
+               action_comment = $4,
+               signature_data_url = COALESCE($5, signature_data_url),
+               acted_at = clock_timestamp(),
+               updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, myLog.id, normalizedDecision, comment, signatureDataUrl]
+        );
+
+        let finalStatus = 'pending';
+        if (normalizedDecision === 'rejected' || normalizedDecision === 'returned') {
+          finalStatus = normalizedDecision;
+          await client.query(
+            `UPDATE tenant_approval_step_logs
+             SET status = 'skipped', updated_at = clock_timestamp()
+             WHERE tenant_id = $1 AND request_id = $2 AND status IN ('pending', 'waiting')`,
+            [ctx.tenantId, reqId]
+          );
+          await client.query(
+            `UPDATE tenant_approval_requests
+             SET status = $3, completed_at = clock_timestamp(), updated_at = clock_timestamp()
+             WHERE tenant_id = $1 AND id = $2`,
+            [ctx.tenantId, reqId, finalStatus]
+          );
+        } else {
+          if (String(myLog.approval_mode || 'any_one') === 'any_one') {
+            await client.query(
+              `UPDATE tenant_approval_step_logs
+               SET status = 'skipped', updated_at = clock_timestamp()
+               WHERE tenant_id = $1 AND request_id = $2 AND step_order = $3 AND status = 'pending'`,
+              [ctx.tenantId, reqId, curStepOrder]
+            );
+          }
+
+          const remRes = await client.query<{ cnt: number }>(
+            `SELECT COUNT(*)::int AS cnt
+             FROM tenant_approval_step_logs
+             WHERE tenant_id = $1 AND request_id = $2 AND step_order = $3 AND status = 'pending'`,
+            [ctx.tenantId, reqId, curStepOrder]
+          );
+          if (Number(remRes.rows[0]?.cnt || 0) === 0) {
+            const waitRes = await client.query<{ next_order: number | null }>(
+              `SELECT MIN(step_order) AS next_order
+               FROM tenant_approval_step_logs
+               WHERE tenant_id = $1 AND request_id = $2 AND status = 'waiting'`,
+              [ctx.tenantId, reqId]
+            );
+            const nextOrd = waitRes.rows[0]?.next_order ? Number(waitRes.rows[0].next_order) : null;
+            if (nextOrd !== null && nextOrd > curStepOrder) {
+              await client.query(
+                `UPDATE tenant_approval_step_logs
+                 SET status = 'pending', updated_at = clock_timestamp()
+                 WHERE tenant_id = $1 AND request_id = $2 AND step_order = $3 AND status = 'waiting'`,
+                [ctx.tenantId, reqId, nextOrd]
+              );
+              await client.query(
+                `UPDATE tenant_approval_requests
+                 SET current_step_order = $3, updated_at = clock_timestamp()
+                 WHERE tenant_id = $1 AND id = $2`,
+                [ctx.tenantId, reqId, nextOrd]
+              );
+            } else {
+              finalStatus = 'approved';
+              await client.query(
+                `UPDATE tenant_approval_requests
+                 SET status = 'approved', completed_at = clock_timestamp(), updated_at = clock_timestamp()
+                 WHERE tenant_id = $1 AND id = $2`,
+                [ctx.tenantId, reqId]
+              );
+            }
+          }
+        }
+
+        if (finalStatus === 'approved' && apprReq.category === 'leave') {
+          const fd = parseJsonSafe<Record<string, unknown>>(apprReq.form_data, {});
+          const days = Math.max(0, toNum(fd.total_days ?? fd.days, 1));
+          const leaveType = String(fd.leave_type || '').toLowerCase();
+          if (days > 0 && !leaveType.includes('không lương')) {
+            await client.query(
+              `UPDATE tenant_hr_employees
+               SET annual_leave_used = annual_leave_used + $3, updated_at = clock_timestamp()
+               WHERE tenant_id = $1 AND user_id = $2`,
+              [ctx.tenantId, apprReq.requester_user_id, days]
+            );
+          }
+        }
+
+        succeededIds.push(reqId);
+      }
+
+      return {
+        decision: normalizedDecision,
+        requested_count: requestIds.length,
+        processed_count: succeededIds.length,
+        succeeded_ids: succeededIds,
+        skipped,
+      };
+    });
+
+    res.json({ success: true, data: summary });
+  } catch (err: any) {
+    sendApiError(res, 500, 'BATCH_DECIDE_FAILED', err?.message || 'Không thể xử lý phê duyệt hàng loạt.');
+  }
+});

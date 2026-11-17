@@ -2,17 +2,22 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
 import { getTenantContext } from '../../core/context/tenant-context.ts';
+import { getTenantSettingsCached } from '../../core/settings/tenant-cache.ts';
 import {
   requireEntitlement,
   requirePermission,
   sendApiError,
 } from '../../core/security/rbac.ts';
+import { maskContactPiiIfDisallowed } from '../../core/security/pii-masker.ts';
 import { evaluateDynamicAudience } from '../audiences/audiences.service.ts';
 import {
+  analyzeEmailSpamScore,
+  canUserUnmaskMarketingPii,
   parseJsonCol,
   readTenantChannelVault,
   renderMergeTags,
   signUnsubscribeHmac,
+  type EmailBlockDto,
 } from './utils.ts';
 
 export const campaignsRouter = Router();
@@ -41,9 +46,14 @@ function mapCampaignRow(row: Record<string, unknown>) {
     subject_a: String(row.subject_a || ''),
     subject_b: String(row.subject_b || ''),
     ab_split_ratio: Number(row.ab_split_ratio ?? 100),
+    ab_winner_criteria: String(row.ab_winner_criteria || 'open_rate'),
+    ab_test_hours: Number(row.ab_test_hours ?? 4),
     zns_template_id: row.zns_template_id ? String(row.zns_template_id) : '',
     sender_name: row.sender_name ? String(row.sender_name) : '',
     sender_email: row.sender_email ? String(row.sender_email) : '',
+    fallback_vars: parseJsonCol<Record<string, string>>(row.fallback_vars_json, {}),
+    throttle_per_minute: Number(row.throttle_per_minute || 0),
+    pre_send_score: Number(row.pre_send_score ?? 100),
     reminder_config: parseJsonCol<Record<string, unknown>>(row.reminder_config, {}),
     scheduled_at: row.scheduled_at || null,
     sent_at: row.sent_at || null,
@@ -62,6 +72,276 @@ function mapCampaignRow(row: Record<string, unknown>) {
     updated_at: row.updated_at,
   };
 }
+
+// SesQuotaWidget: Real-time AWS SES / SMTP Vault Quota & Deliverability Health
+campaignsRouter.get('/ses-quota', requirePermission('mkt_campaigns', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [vault, claimStats, supCnt] = await Promise.all([
+        readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']),
+        client.query<{ sent_cnt: number; bounce_cnt: number; unsub_cnt: number }>(
+          `SELECT COALESCE(SUM(CASE WHEN status IN ('sent', 'delivered', 'opened', 'clicked', 'bounced', 'unsubscribed') THEN 1 ELSE 0 END), 0)::int AS sent_cnt,
+                  COALESCE(SUM(CASE WHEN status = 'bounced' THEN 1 ELSE 0 END), 0)::int AS bounce_cnt,
+                  COALESCE(SUM(CASE WHEN status = 'unsubscribed' THEN 1 ELSE 0 END), 0)::int AS unsub_cnt
+           FROM mkt_send_claims
+           WHERE tenant_id = $1`,
+          [ctx.tenantId]
+        ),
+        client.query<{ cnt: number }>(
+          'SELECT COUNT(*)::int AS cnt FROM mkt_suppression_list WHERE tenant_id = $1',
+          [ctx.tenantId]
+        ),
+      ]);
+
+      const max24hSend = Number(vault.config.max_24h_send || (vault.configured ? 50_000 : 200));
+      const maxSendRate = Number(vault.config.max_send_rate || (vault.configured ? 14 : 1));
+      const sentCnt = Number(claimStats.rows[0]?.sent_cnt || 0);
+      const bounceCnt = Number(claimStats.rows[0]?.bounce_cnt || 0);
+      const unsubCnt = Number(claimStats.rows[0]?.unsub_cnt || 0);
+      const bounceRatePct = sentCnt > 0 ? Number(((bounceCnt / sentCnt) * 100).toFixed(2)) : 0;
+      const complaintRatePct = sentCnt > 0 ? Number(((unsubCnt / sentCnt) * 100).toFixed(2)) : 0;
+
+      return {
+        configured: vault.configured,
+        provider: vault.integrationType || 'sandbox',
+        sandbox_mode: !vault.configured || Boolean(vault.config.sandbox_mode),
+        from_email: String(vault.config.from_email || vault.config.fromEmail || ''),
+        max_24h_send: max24hSend,
+        sent_last_24h: sentCnt,
+        remaining_24h: Math.max(0, max24hSend - sentCnt),
+        usage_pct: max24hSend > 0 ? Number(Math.min(100, (sentCnt / max24hSend) * 100).toFixed(1)) : 0,
+        max_send_rate_per_sec: maxSendRate,
+        bounce_rate_pct: bounceRatePct,
+        complaint_rate_pct: complaintRatePct,
+        reputation_status: bounceRatePct >= 5 ? 'at_risk' : bounceRatePct >= 2 ? 'warning' : 'healthy',
+        spf_verified: Boolean(vault.config.spf_verified ?? vault.configured),
+        dkim_verified: Boolean(vault.config.dkim_verified ?? vault.configured),
+        dmarc_verified: Boolean(vault.config.dmarc_verified ?? vault.configured),
+        suppression_count: Number(supCnt.rows[0]?.cnt || 0),
+      };
+    });
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SES_QUOTA_FAILED', err?.message || 'Không thể tải hạn mức gửi Email SES.');
+  }
+});
+
+// PreSendReviewModal: Pre-Flight SPF/DKIM, Audience Net Reachable, Spam & Fallback Check
+async function runPreSendReviewForPayload(tenantId: string, payload: Record<string, unknown>, campaignId?: string) {
+  return withTenantTransaction(tenantId, async (client) => {
+    let campRow: Record<string, unknown> | undefined;
+    if (campaignId) {
+      const r = await client.query('SELECT * FROM mkt_campaigns WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        tenantId,
+        campaignId,
+      ]);
+      campRow = r.rows[0];
+    }
+
+    const channel = String(payload.channel || campRow?.channel || 'email');
+    const audienceId = payload.audience_id !== undefined ? payload.audience_id : campRow?.audience_id;
+    const excludeAudIds: string[] = Array.isArray(payload.exclude_audience_ids)
+      ? payload.exclude_audience_ids.map(String)
+      : parseJsonCol<string[]>(campRow?.exclude_audience_ids, []);
+    const templateId = payload.template_id !== undefined ? payload.template_id : campRow?.template_id;
+    const subjectA = String(payload.subject_a || campRow?.subject_a || '');
+    const throttlePerMin = Number(payload.throttle_per_minute ?? campRow?.throttle_per_minute ?? 0);
+    const fallbackVars: Record<string, string> =
+      payload.fallback_vars && typeof payload.fallback_vars === 'object'
+        ? (payload.fallback_vars as Record<string, string>)
+        : parseJsonCol<Record<string, string>>(campRow?.fallback_vars_json, {});
+
+    const [emailVault, znsVault, supRes] = await Promise.all([
+      readTenantChannelVault(client, tenantId, ['aws_ses', 'smtp']),
+      readTenantChannelVault(client, tenantId, ['zalo_zns', 'zalo_oa']),
+      client.query<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM mkt_suppression_list WHERE tenant_id = $1',
+        [tenantId]
+      ),
+    ]);
+
+    let audienceCount = 0;
+    let excludedCount = 0;
+    if (audienceId) {
+      const aCnt = await client.query<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id = $2',
+        [tenantId, String(audienceId)]
+      );
+      audienceCount = Number(aCnt.rows[0]?.cnt || 0);
+      if (excludeAudIds.length > 0) {
+        const ph = excludeAudIds.map((_, idx) => `$${idx + 3}`).join(', ');
+        const exCnt = await client.query<{ cnt: number }>(
+          `SELECT COUNT(DISTINCT lead_id)::int AS cnt
+           FROM tenant_audience_members
+           WHERE tenant_id = $1 AND audience_id = $2
+             AND lead_id IN (SELECT lead_id FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id IN (${ph}))`,
+          [tenantId, String(audienceId), ...excludeAudIds]
+        );
+        excludedCount = Number(exCnt.rows[0]?.cnt || 0);
+      }
+    } else {
+      const allCnt = await client.query<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM leads WHERE tenant_id = $1 AND is_deleted = false',
+        [tenantId]
+      );
+      audienceCount = Number(allCnt.rows[0]?.cnt || 0);
+    }
+
+    let blocks: EmailBlockDto[] = [];
+    let compiledHtml = '';
+    if (templateId) {
+      const tRes = await client.query(
+        'SELECT blocks_json, compiled_html FROM mkt_email_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [tenantId, String(templateId)]
+      );
+      if (tRes.rows[0]) {
+        blocks = parseJsonCol<EmailBlockDto[]>(tRes.rows[0].blocks_json, []);
+        compiledHtml = String(tRes.rows[0].compiled_html || '');
+      }
+    }
+
+    const spam = analyzeEmailSpamScore(subjectA, blocks, compiledHtml || '{{unsubscribe_url}}');
+    const detectedMergeTags = Array.from(
+      new Set(
+        (`${subjectA} ${compiledHtml}`.match(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g) || []).map((t) =>
+          t.replace(/\s+/g, '')
+        )
+      )
+    ).filter((t) => t !== '{{unsubscribe_url}}' && t !== '{{tenant.name}}');
+
+    const missingFallbacks = detectedMergeTags.filter((tag) => {
+      const raw = tag.slice(2, -2);
+      const leaf = raw.split('.').pop() || raw;
+      return !fallbackVars[tag] && !fallbackVars[raw] && !fallbackVars[leaf];
+    });
+
+    const suppressionCount = Number(supRes.rows[0]?.cnt || 0);
+    const netReachable = Math.max(0, audienceCount - excludedCount);
+    const estMinutes =
+      throttlePerMin > 0 && netReachable > 0 ? Math.max(1, Math.ceil(netReachable / throttlePerMin)) : 1;
+    const readinessScore = Math.max(0, Math.min(100, 100 - spam.score - (missingFallbacks.length > 0 ? 5 : 0)));
+
+    return {
+      readiness_score: readinessScore,
+      ready_to_send: readinessScore >= 50,
+      channel,
+      vault_ready: channel === 'zns' ? znsVault.configured : emailVault.configured,
+      spf_dkim_verified: Boolean(emailVault.config.dkim_verified ?? emailVault.configured),
+      audience_total: audienceCount,
+      excluded_count: excludedCount,
+      suppression_list_count: suppressionCount,
+      net_reachable_estimate: netReachable,
+      throttle_per_minute: throttlePerMin,
+      estimated_duration_minutes: estMinutes,
+      spam_analysis: spam,
+      detected_merge_tags: detectedMergeTags,
+      missing_fallback_tags: missingFallbacks,
+    };
+  });
+}
+
+campaignsRouter.post('/pre-send-review', requirePermission('mkt_campaigns', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await runPreSendReviewForPayload(ctx.tenantId, req.body || {});
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'PRE_SEND_REVIEW_FAILED', err?.message || 'Không thể kiểm tra chiến dịch trước khi gửi.');
+  }
+});
+
+// TestEmailModal: Preview & Test Dispatch to Sample Recipients
+async function runCampaignTestEmail(tenantId: string, userName: string | undefined, payload: Record<string, unknown>, campaignId?: string) {
+  const rawEmails: string[] = Array.isArray(payload.emails)
+    ? payload.emails.map((e) => String(e || '').trim()).filter((e) => e.includes('@'))
+    : String(payload.to_email || '')
+        .split(/[,;\s]+/)
+        .map((e) => e.trim())
+        .filter((e) => e.includes('@'));
+
+  if (rawEmails.length === 0) {
+    return { error: 'INVALID_TEST_EMAIL' as const };
+  }
+
+  return withTenantTransaction(tenantId, async (client) => {
+    let campRow: Record<string, unknown> | undefined;
+    if (campaignId) {
+      const cRes = await client.query('SELECT * FROM mkt_campaigns WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        tenantId,
+        campaignId,
+      ]);
+      campRow = cRes.rows[0];
+    }
+
+    const variant = payload.variant === 'B' ? 'B' : 'A';
+    const templateId = payload.template_id || campRow?.template_id;
+    let html = '';
+    if (templateId) {
+      const tRes = await client.query<{ compiled_html: string }>(
+        'SELECT compiled_html FROM mkt_email_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [tenantId, String(templateId)]
+      );
+      html = String(tRes.rows[0]?.compiled_html || '');
+    }
+
+    const [tenantRes, vault] = await Promise.all([
+      client.query<{ name: string }>('SELECT name FROM tenants WHERE id = $1 LIMIT 1', [tenantId]),
+      readTenantChannelVault(client, tenantId, ['aws_ses', 'smtp']),
+    ]);
+
+    const rawSubject =
+      variant === 'B'
+        ? String(payload.subject_b || campRow?.subject_b || payload.subject_a || campRow?.subject_a || 'Test Variant B')
+        : String(payload.subject_a || campRow?.subject_a || 'Test Variant A');
+
+    const fallbackVars: Record<string, string> =
+      payload.fallback_vars && typeof payload.fallback_vars === 'object'
+        ? (payload.fallback_vars as Record<string, string>)
+        : parseJsonCol<Record<string, string>>(campRow?.fallback_vars_json, {});
+
+    const sampleLead =
+      payload.sample_lead && typeof payload.sample_lead === 'object'
+        ? (payload.sample_lead as Record<string, unknown>)
+        : {
+            name: userName || 'Nguyễn Minh Anh',
+            phone: '0909123456',
+            email: rawEmails[0],
+            product_interest: 'Growth Suite',
+            voucher_code: 'DOM-TEST20',
+          };
+
+    const mergeCtx = {
+      lead: sampleLead,
+      tenant: { name: tenantRes.rows[0]?.name || 'DOMATION' },
+      unsubscribe_url: '#unsubscribe-test',
+    };
+
+    return {
+      error: null,
+      recipients: rawEmails.slice(0, 5),
+      variant,
+      provider: vault.integrationType || 'vault_sandbox_preview',
+      vault_configured: vault.configured,
+      rendered_subject: `[TEST ${variant}] ${renderMergeTags(rawSubject, mergeCtx, fallbackVars)}`,
+      rendered_html: renderMergeTags(html, mergeCtx, fallbackVars),
+    };
+  });
+}
+
+campaignsRouter.post('/test-email', requirePermission('mkt_campaigns', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const out = await runCampaignTestEmail(ctx.tenantId, ctx.userName, req.body || {});
+    if (out.error === 'INVALID_TEST_EMAIL') {
+      sendApiError(res, 422, 'INVALID_TEST_EMAIL', 'Vui lòng nhập ít nhất 1 địa chỉ Email nhận bản thử nghiệm.');
+      return;
+    }
+    res.json({ success: true, data: out });
+  } catch (err: any) {
+    sendApiError(res, 500, 'TEST_EMAIL_FAILED', err?.message || 'Không thể gửi Email thử nghiệm.');
+  }
+});
 
 // List Campaigns + Audiences + Templates + Vault Readiness + Suppression Summary
 campaignsRouter.get('/', requirePermission('mkt_campaigns', 'view'), async (_req, res) => {
@@ -162,20 +442,30 @@ campaignsRouter.post('/', requirePermission('mkt_campaigns', 'create'), async (r
       req.body?.reminder_config && typeof req.body.reminder_config === 'object'
         ? req.body.reminder_config
         : { enabled: false, trigger_condition: 'no_open', wait_hours: 24, reminder_subject: '' };
+    const fallbackVars =
+      req.body?.fallback_vars && typeof req.body.fallback_vars === 'object' ? req.body.fallback_vars : {};
+    const throttlePerMinute = Math.max(0, Math.round(Number(req.body?.throttle_per_minute || 0)));
+    const abWinnerCriteria = String(req.body?.ab_winner_criteria || 'open_rate');
+    const abTestHours = Math.max(1, Math.round(Number(req.body?.ab_test_hours ?? 4)));
     const costVnd = Math.max(0, Math.round(Number(req.body?.cost_vnd || 0)));
     const scheduledAt = req.body?.scheduled_at ? String(req.body.scheduled_at) : null;
+    const initialReminders: Array<Record<string, unknown>> = Array.isArray(req.body?.reminders)
+      ? req.body.reminders
+      : [];
 
     const id = crypto.randomUUID();
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
       await client.query(
         `INSERT INTO mkt_campaigns (
            id, tenant_id, name, channel, status, audience_id, exclude_audience_ids,
-           template_id, subject_a, subject_b, ab_split_ratio, zns_template_id,
-           sender_name, sender_email, reminder_config, scheduled_at, cost_vnd, created_by
+           template_id, subject_a, subject_b, ab_split_ratio, ab_winner_criteria, ab_test_hours,
+           zns_template_id, sender_name, sender_email, fallback_vars_json, throttle_per_minute,
+           reminder_config, scheduled_at, cost_vnd, created_by
          ) VALUES (
            $1, $2, $3, $4, $5, $6, $7::jsonb,
-           $8, $9, $10, $11, $12,
-           $13, $14, $15::jsonb, $16, $17, $18
+           $8, $9, $10, $11, $12, $13,
+           $14, $15, $16, $17::jsonb, $18,
+           $19::jsonb, $20, $21, $22
          )`,
         [
           id,
@@ -189,15 +479,41 @@ campaignsRouter.post('/', requirePermission('mkt_campaigns', 'create'), async (r
           subjectA,
           subjectB,
           abSplitRatio,
+          abWinnerCriteria,
+          abTestHours,
           znsTemplateId,
           senderName,
           senderEmail,
+          JSON.stringify(fallbackVars),
+          throttlePerMinute,
           JSON.stringify(reminderConfig),
           scheduledAt,
           costVnd,
           ctx.userId,
         ]
       );
+
+      for (let idx = 0; idx < initialReminders.length; idx++) {
+        const rm = initialReminders[idx];
+        await client.query(
+          `INSERT INTO mkt_campaign_reminders (
+             id, tenant_id, campaign_id, step_order, trigger_condition, wait_hours, subject, template_id, channel, is_active
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            crypto.randomUUID(),
+            ctx.tenantId,
+            id,
+            idx + 1,
+            String(rm.trigger_condition || 'no_open'),
+            Math.max(1, Math.round(Number(rm.wait_hours || 24))),
+            String(rm.subject || `Nhắc lại: ${subjectA}`),
+            rm.template_id ? String(rm.template_id) : templateId,
+            String(rm.channel || channel),
+            rm.is_active !== undefined ? Boolean(rm.is_active) : true,
+          ]
+        );
+      }
+
       const r = await client.query('SELECT * FROM mkt_campaigns WHERE tenant_id = $1 AND id = $2', [
         ctx.tenantId,
         id,
@@ -246,6 +562,25 @@ campaignsRouter.put('/:id', requirePermission('mkt_campaigns', 'edit'), async (r
         req.body?.reminder_config && typeof req.body.reminder_config === 'object'
           ? req.body.reminder_config
           : parseJsonCol(ex.reminder_config, {});
+      const fallbackVars =
+        req.body?.fallback_vars && typeof req.body.fallback_vars === 'object'
+          ? req.body.fallback_vars
+          : parseJsonCol(ex.fallback_vars_json, {});
+      const excludeAudienceIds = Array.isArray(req.body?.exclude_audience_ids)
+        ? req.body.exclude_audience_ids
+        : parseJsonCol(ex.exclude_audience_ids, []);
+      const throttlePerMinute =
+        req.body?.throttle_per_minute !== undefined
+          ? Math.max(0, Math.round(Number(req.body.throttle_per_minute)))
+          : Number(ex.throttle_per_minute || 0);
+      const abWinnerCriteria =
+        req.body?.ab_winner_criteria !== undefined
+          ? String(req.body.ab_winner_criteria)
+          : String(ex.ab_winner_criteria || 'open_rate');
+      const abTestHours =
+        req.body?.ab_test_hours !== undefined
+          ? Math.max(1, Math.round(Number(req.body.ab_test_hours)))
+          : Number(ex.ab_test_hours ?? 4);
       const costVnd =
         req.body?.cost_vnd !== undefined ? Math.max(0, Math.round(Number(req.body.cost_vnd))) : Number(ex.cost_vnd || 0);
       const attributedRev =
@@ -264,6 +599,11 @@ campaignsRouter.put('/:id', requirePermission('mkt_campaigns', 'edit'), async (r
              reminder_config = $9::jsonb,
              cost_vnd = $10,
              attributed_revenue_vnd = $11,
+             fallback_vars_json = $12::jsonb,
+             exclude_audience_ids = $13::jsonb,
+             throttle_per_minute = $14,
+             ab_winner_criteria = $15,
+             ab_test_hours = $16,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
         [
@@ -278,6 +618,11 @@ campaignsRouter.put('/:id', requirePermission('mkt_campaigns', 'edit'), async (r
           JSON.stringify(reminderConfig),
           costVnd,
           attributedRev,
+          JSON.stringify(fallbackVars),
+          JSON.stringify(excludeAudienceIds),
+          throttlePerMinute,
+          abWinnerCriteria,
+          abTestHours,
         ]
       );
 
@@ -471,14 +816,19 @@ campaignsRouter.post('/:id/send', requirePermission('mkt_campaigns', 'create'), 
           const unsubSig = signUnsubscribeHmac(ctx.tenantId, String(lead.id), ch);
           const unsubUrl = `/api/v1/public/marketing/unsubscribe?tenant_id=${ctx.tenantId}&lead_id=${lead.id}&channel=${ch}&sig=${unsubSig}`;
           const chosenSubject = variant === 'B' ? String(camp.subject_b) : String(camp.subject_a || camp.name);
-          const renderedSubject = renderMergeTags(chosenSubject, {
-            lead: {
-              ...lead,
-              custom_fields: parseJsonCol(lead.custom_fields, {}),
+          const campFallbacks = parseJsonCol<Record<string, string>>(camp.fallback_vars_json, {});
+          const renderedSubject = renderMergeTags(
+            chosenSubject,
+            {
+              lead: {
+                ...lead,
+                custom_fields: parseJsonCol(lead.custom_fields, {}),
+              },
+              tenant: { name: tenantName },
+              unsubscribe_url: unsubUrl,
             },
-            tenant: { name: tenantName },
-            unsubscribe_url: unsubUrl,
-          });
+            campFallbacks
+          );
 
           const providerUsed =
             ch === 'email'
@@ -753,5 +1103,227 @@ campaignsRouter.post('/suppression/list', requirePermission('mkt_campaigns', 'cr
     res.status(201).json({ success: true, data: { id, channel, recipient, reason } });
   } catch (err: any) {
     sendApiError(res, 500, 'ADD_SUPPRESSION_FAILED', err?.message || 'Không thể thêm vào danh sách chặn.');
+  }
+});
+
+// CampaignDetailDrawer: Full Delivery Funnel, A/B Comparison, Click Map, Claims & Reminders
+campaignsRouter.get('/:id/detail', requirePermission('mkt_campaigns', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const cfg = await getTenantSettingsCached(ctx.tenantId);
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const cRes = await client.query(
+        `SELECT c.*, a.name AS audience_name, a.audience_type AS audience_type, t.name AS template_name, t.compiled_html
+         FROM mkt_campaigns c
+         LEFT JOIN tenant_audiences a ON a.tenant_id = c.tenant_id AND a.id = c.audience_id
+         LEFT JOIN mkt_email_templates t ON t.tenant_id = c.tenant_id AND t.id = c.template_id
+         WHERE c.tenant_id = $1 AND c.id = $2
+         LIMIT 1`,
+        [ctx.tenantId, req.params.id]
+      );
+      const campRow = cRes.rows[0];
+      if (!campRow) return null;
+
+      const canUnmask = await canUserUnmaskMarketingPii(client, ctx.tenantId, ctx.userId);
+      const [claimsRes, remsRes, clickEventsRes] = await Promise.all([
+        client.query(
+          `SELECT sc.*, l.name, l.phone, l.email, l.total_revenue_vnd
+           FROM mkt_send_claims sc
+           LEFT JOIN leads l ON l.tenant_id = sc.tenant_id AND l.id = sc.lead_id
+           WHERE sc.tenant_id = $1 AND sc.campaign_id = $2
+           ORDER BY sc.claimed_at DESC
+           LIMIT 250`,
+          [ctx.tenantId, req.params.id]
+        ),
+        client.query(
+          `SELECT * FROM mkt_campaign_reminders
+           WHERE tenant_id = $1 AND campaign_id = $2
+           ORDER BY step_order ASC, created_at ASC`,
+          [ctx.tenantId, req.params.id]
+        ),
+        client.query<{ content: string; cnt: number }>(
+          `SELECT COALESCE(content, 'https://domation.net') AS content, COUNT(*)::int AS cnt
+           FROM lead_timeline_events
+           WHERE tenant_id = $1 AND event_type = 'email_clicked'
+             AND lead_id IN (SELECT lead_id FROM mkt_send_claims WHERE tenant_id = $1 AND campaign_id = $2)
+           GROUP BY content
+           ORDER BY cnt DESC
+           LIMIT 20`,
+          [ctx.tenantId, req.params.id]
+        ),
+      ]);
+
+      const abStats = {
+        A: { sent: 0, opened: 0, clicked: 0, bounced: 0 },
+        B: { sent: 0, opened: 0, clicked: 0, bounced: 0 },
+      };
+      const providers: Record<string, number> = {};
+
+      const claims = claimsRes.rows.map((row) => {
+        const v = String(row.variant || 'A') === 'B' ? 'B' : 'A';
+        abStats[v].sent++;
+        if (row.opened_at) abStats[v].opened++;
+        if (row.clicked_at) abStats[v].clicked++;
+        if (row.status === 'bounced') abStats[v].bounced++;
+
+        const meta = parseJsonCol<Record<string, unknown>>(row.metadata, {});
+        const prov = String(meta.provider || 'vault');
+        providers[prov] = (providers[prov] || 0) + 1;
+
+        const masked = maskContactPiiIfDisallowed(row, canUnmask, cfg);
+        return {
+          ...masked,
+          metadata: meta,
+        };
+      });
+
+      const mappedCamp = mapCampaignRow(campRow);
+      const totalClickEvents = clickEventsRes.rows.reduce((s, r) => s + Number(r.cnt || 0), 0);
+
+      return {
+        campaign: mappedCamp,
+        compiled_html: String(campRow.compiled_html || ''),
+        funnel: {
+          targeted: mappedCamp.total_targeted,
+          sent: mappedCamp.sent_count,
+          delivered: Math.max(0, mappedCamp.sent_count - mappedCamp.bounced_count),
+          opened: mappedCamp.opened_count,
+          clicked: mappedCamp.clicked_count,
+          bounced: mappedCamp.bounced_count,
+          unsubscribed: mappedCamp.unsubscribed_count,
+        },
+        ab_comparison: {
+          variant_a: {
+            ...abStats.A,
+            open_rate_pct: abStats.A.sent ? Number(((abStats.A.opened / abStats.A.sent) * 100).toFixed(1)) : 0,
+            click_rate_pct: abStats.A.sent ? Number(((abStats.A.clicked / abStats.A.sent) * 100).toFixed(1)) : 0,
+          },
+          variant_b: {
+            ...abStats.B,
+            open_rate_pct: abStats.B.sent ? Number(((abStats.B.opened / abStats.B.sent) * 100).toFixed(1)) : 0,
+            click_rate_pct: abStats.B.sent ? Number(((abStats.B.clicked / abStats.B.sent) * 100).toFixed(1)) : 0,
+          },
+        },
+        click_map: clickEventsRes.rows.map((r) => ({
+          url: String(r.content),
+          clicks: Number(r.cnt || 0),
+          share_pct: totalClickEvents > 0 ? Number(((Number(r.cnt || 0) / totalClickEvents) * 100).toFixed(1)) : 0,
+        })),
+        claims,
+        reminders: remsRes.rows,
+        tech_stats: {
+          providers,
+          throttle_per_minute: mappedCamp.throttle_per_minute,
+        },
+      };
+    });
+
+    if (!data) {
+      sendApiError(res, 404, 'CAMPAIGN_NOT_FOUND', 'Không tìm thấy Chiến dịch.');
+      return;
+    }
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CAMPAIGN_DETAIL_FAILED', err?.message || 'Không thể tải chi tiết Chiến dịch.');
+  }
+});
+
+campaignsRouter.post('/:id/pre-send-review', requirePermission('mkt_campaigns', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await runPreSendReviewForPayload(ctx.tenantId, req.body || {}, req.params.id);
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'PRE_SEND_REVIEW_FAILED', err?.message || 'Không thể kiểm tra Chiến dịch.');
+  }
+});
+
+campaignsRouter.post('/:id/test-email', requirePermission('mkt_campaigns', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const out = await runCampaignTestEmail(ctx.tenantId, ctx.userName, req.body || {}, req.params.id);
+    if (out.error === 'INVALID_TEST_EMAIL') {
+      sendApiError(res, 422, 'INVALID_TEST_EMAIL', 'Vui lòng nhập Email nhận bản thử nghiệm.');
+      return;
+    }
+    res.json({ success: true, data: out });
+  } catch (err: any) {
+    sendApiError(res, 500, 'TEST_EMAIL_FAILED', err?.message || 'Không thể gửi Email thử nghiệm.');
+  }
+});
+
+// ReminderManager CRUD (`mkt_campaign_reminders`)
+campaignsRouter.get('/:id/reminders', requirePermission('mkt_campaigns', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const items = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const r = await client.query(
+        'SELECT * FROM mkt_campaign_reminders WHERE tenant_id = $1 AND campaign_id = $2 ORDER BY step_order ASC',
+        [ctx.tenantId, req.params.id]
+      );
+      return r.rows;
+    });
+    res.json({ success: true, data: { items } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'LIST_REMINDERS_FAILED', err?.message || 'Không thể tải danh sách bước gửi nhắc.');
+  }
+});
+
+campaignsRouter.post('/:id/reminders', requirePermission('mkt_campaigns', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const remId = crypto.randomUUID();
+    const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const cCheck = await client.query('SELECT id, subject_a FROM mkt_campaigns WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
+        ctx.tenantId,
+        req.params.id,
+      ]);
+      if (!cCheck.rows[0]) return null;
+
+      const stepOrder = Math.max(1, Math.round(Number(req.body?.step_order || 1)));
+      const triggerCondition = ['no_open', 'no_click', 'clicked_no_convert'].includes(String(req.body?.trigger_condition || ''))
+        ? String(req.body.trigger_condition)
+        : 'no_open';
+      const waitHours = Math.max(1, Math.round(Number(req.body?.wait_hours || 24)));
+      const subject = String(req.body?.subject || `Nhắc lại: ${cCheck.rows[0].subject_a || ''}`).trim();
+      const templateId = req.body?.template_id ? String(req.body.template_id) : null;
+      const channel = req.body?.channel === 'zns' ? 'zns' : 'email';
+
+      await client.query(
+        `INSERT INTO mkt_campaign_reminders (
+           id, tenant_id, campaign_id, step_order, trigger_condition, wait_hours, subject, template_id, channel, is_active
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)`,
+        [remId, ctx.tenantId, req.params.id, stepOrder, triggerCondition, waitHours, subject, templateId, channel]
+      );
+      const r = await client.query('SELECT * FROM mkt_campaign_reminders WHERE tenant_id = $1 AND id = $2', [
+        ctx.tenantId,
+        remId,
+      ]);
+      return r.rows[0];
+    });
+
+    if (!created) {
+      sendApiError(res, 404, 'CAMPAIGN_NOT_FOUND', 'Không tìm thấy Chiến dịch.');
+      return;
+    }
+    res.status(201).json({ success: true, data: created });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CREATE_REMINDER_FAILED', err?.message || 'Không thể thêm bước gửi nhắc.');
+  }
+});
+
+campaignsRouter.delete('/:id/reminders/:remId', requirePermission('mkt_campaigns', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await withTenantTransaction(ctx.tenantId, async (client) => {
+      await client.query(
+        'DELETE FROM mkt_campaign_reminders WHERE tenant_id = $1 AND campaign_id = $2 AND id = $3',
+        [ctx.tenantId, req.params.id, req.params.remId]
+      );
+    });
+    res.json({ success: true, data: { deleted: true } });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DELETE_REMINDER_FAILED', err?.message || 'Không thể xóa bước gửi nhắc.');
   }
 });

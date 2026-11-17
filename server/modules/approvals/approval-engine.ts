@@ -413,28 +413,67 @@ export async function resolveDynamicApprovalStepsInTx(
 /**
  * Creates an approval request + all N-step log rows inside an active tenant transaction.
  */
-export async function createApprovalRequestInTx(
-  client: DbClient,
-  input: {
-    tenantId: string;
-    workflowId: string;
-    requesterUserId: string;
-    title: string;
-    description?: string | null;
-    amountVnd?: number;
-    currency?: string;
-    startDate?: string | null;
-    endDate?: string | null;
-    formData?: Record<string, unknown>;
-    attachments?: unknown[];
-    linkedEntityType?: string | null;
-    linkedEntityId?: string | null;
-  }
-): Promise<{
+export interface CreateApprovalRequestInput {
+  tenantId: string;
+  workflowId: string;
+  requesterUserId: string;
+  title: string;
+  description?: string | null;
+  amountVnd?: number;
+  currency?: string;
+  startDate?: string | null;
+  endDate?: string | null;
+  formData?: Record<string, unknown>;
+  attachments?: unknown[];
+  linkedEntityType?: string | null;
+  linkedEntityId?: string | null;
+}
+
+export interface CreateApprovalRequestResult {
+  id: string;
   request: Record<string, any>;
   step_logs: Array<Record<string, any>>;
   resolved_steps: ResolvedApprovalStepPlan[];
-}> {
+}
+
+export async function createApprovalRequestInTx(
+  client: DbClient,
+  input: CreateApprovalRequestInput
+): Promise<CreateApprovalRequestResult>;
+export async function createApprovalRequestInTx(
+  client: DbClient,
+  tenantId: string,
+  requesterUserId: string,
+  payload: Record<string, unknown>
+): Promise<CreateApprovalRequestResult>;
+export async function createApprovalRequestInTx(
+  client: DbClient,
+  inputOrTenantId: CreateApprovalRequestInput | string,
+  maybeRequesterUserId?: string,
+  maybePayload?: Record<string, unknown>
+): Promise<CreateApprovalRequestResult> {
+  const input: CreateApprovalRequestInput =
+    typeof inputOrTenantId === 'string'
+      ? {
+          tenantId: inputOrTenantId,
+          requesterUserId: String(maybeRequesterUserId || ''),
+          workflowId: String(maybePayload?.workflowId ?? maybePayload?.workflow_id ?? ''),
+          title: String(maybePayload?.title ?? ''),
+          description:
+            maybePayload?.description !== undefined && maybePayload?.description !== null
+              ? String(maybePayload.description)
+              : null,
+          amountVnd: toNum(maybePayload?.amountVnd ?? maybePayload?.amount_vnd, 0),
+          currency: maybePayload?.currency ? String(maybePayload.currency) : 'VND',
+          startDate: (maybePayload?.startDate ?? maybePayload?.start_date ?? null) as string | null,
+          endDate: (maybePayload?.endDate ?? maybePayload?.end_date ?? null) as string | null,
+          formData:
+            ((maybePayload?.formData ?? maybePayload?.form_data) as Record<string, unknown>) || {},
+          attachments: Array.isArray(maybePayload?.attachments) ? maybePayload.attachments : [],
+          linkedEntityType: (maybePayload?.linkedEntityType ?? maybePayload?.linked_entity_type ?? null) as string | null,
+          linkedEntityId: (maybePayload?.linkedEntityId ?? maybePayload?.linked_entity_id ?? null) as string | null,
+        }
+      : inputOrTenantId;
   const wfRes = await client.query(
     'SELECT * FROM tenant_approval_workflows WHERE tenant_id = $1 AND id = $2 LIMIT 1',
     [input.tenantId, input.workflowId]
@@ -540,6 +579,7 @@ export async function createApprovalRequestInTx(
   ]);
 
   return {
+    id: requestId,
     request: reqCreated.rows[0],
     step_logs: logsCreated.rows,
     resolved_steps: resolvedSteps,

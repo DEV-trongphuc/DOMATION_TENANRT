@@ -12,6 +12,7 @@ import {
   mapPgLeadRowToLegacy,
 } from './legacy-helpers.ts';
 import { maskPhoneString, shouldMaskPiiForActor } from '../../core/security/pii-masker.ts';
+import { getZonedDateParts, zonedWallClockToUtc } from '../workspace.routes.ts';
 import {
   getMetaAdsConfigSummary,
   getMetaCapiDashboardConfig,
@@ -44,18 +45,23 @@ function hmToMinutes(hm: string | undefined, fallback: number): number {
   return Number(m[1]) * 60 + Number(m[2]);
 }
 
-function buildDynamicInHoursFilterSql(colExpr: string, tz: string, cfg: TenantSettings): string {
+function isWithinWorkSchedule(createdAt: Date | string, tz: string, cfg: TenantSettings): boolean {
+  const zp = getZonedDateParts(createdAt, tz);
+  if (!zp) return false;
+  const mins = zp.hour * 60 + zp.minute;
   const startMin = hmToMinutes(cfg.work_schedule_start, 510);
   const endMin = hmToMinutes(cfg.work_schedule_end, 1080);
   const satEndMin = hmToMinutes(cfg.work_schedule_saturday_end, endMin);
-  const satCond =
-    satEndMin > startMin
-      ? `OR (EXTRACT(ISODOW FROM ${colExpr} AT TIME ZONE '${tz}')::int = 6 AND (EXTRACT(HOUR FROM ${colExpr} AT TIME ZONE '${tz}')::int * 60 + EXTRACT(MINUTE FROM ${colExpr} AT TIME ZONE '${tz}')::int) BETWEEN ${startMin} AND ${satEndMin})`
-      : '';
-  const sunCond = cfg.work_schedule_sunday_enabled
-    ? `OR (EXTRACT(ISODOW FROM ${colExpr} AT TIME ZONE '${tz}')::int = 7 AND (EXTRACT(HOUR FROM ${colExpr} AT TIME ZONE '${tz}')::int * 60 + EXTRACT(MINUTE FROM ${colExpr} AT TIME ZONE '${tz}')::int) BETWEEN ${startMin} AND ${endMin})`
-    : '';
-  return `((EXTRACT(ISODOW FROM ${colExpr} AT TIME ZONE '${tz}')::int BETWEEN 1 AND 5 AND (EXTRACT(HOUR FROM ${colExpr} AT TIME ZONE '${tz}')::int * 60 + EXTRACT(MINUTE FROM ${colExpr} AT TIME ZONE '${tz}')::int) BETWEEN ${startMin} AND ${endMin}) ${satCond} ${sunCond})`;
+  if (zp.isoDow >= 1 && zp.isoDow <= 5) {
+    return mins >= startMin && mins <= endMin;
+  }
+  if (zp.isoDow === 6 && satEndMin > startMin) {
+    return mins >= startMin && mins <= satEndMin;
+  }
+  if (zp.isoDow === 7 && cfg.work_schedule_sunday_enabled) {
+    return mins >= startMin && mins <= endMin;
+  }
+  return false;
 }
 
 export async function handleLegacyAnalytics(
@@ -89,43 +95,41 @@ export async function handleLegacyAnalytics(
       sourceRes,
       pipelineRes,
       errorStatsRes,
+      leadEventsRes,
     ] = await Promise.all([
       client.query(
         `SELECT
-           COUNT(*)::int AS total_leads,
-           COUNT(*) FILTER (WHERE l.status = 'assigned' AND COALESCE(l.custom_fields->>'original_status', '') NOT IN ('compensated', 'compensation'))::int AS distributed_assigned,
-           COUNT(*) FILTER (WHERE l.status = 'assigned' AND COALESCE(l.custom_fields->>'original_status', '') IN ('compensated', 'compensation'))::int AS distributed_compensation,
-           COUNT(*) FILTER (WHERE l.status = 'assigned')::int AS distributed_total,
-           COUNT(*) FILTER (WHERE l.is_duplicate_reminder = true OR l.is_duplicated = true)::int AS duplicates,
-           COUNT(*) FILTER (WHERE l.status = 'unassigned_pending')::int AS pending_work_hours_count,
-           COUNT(*) FILTER (WHERE l.status = 'rejected')::int AS under_standard,
-           COUNT(*) FILTER (WHERE l.status = 'blacklisted')::int AS blacklisted_leads,
-           COUNT(*) FILTER (WHERE l.ai_screener_status = 'passed')::int AS ai_passed_count,
-           COUNT(*) FILTER (WHERE l.ai_screener_status IN ('failed', 'rejected', 'held'))::int AS ai_failed_count,
-           COALESCE(SUM(l.ai_prompt_tokens), 0)::int AS total_prompt_tokens_used,
-           COALESCE(SUM(l.ai_completion_tokens), 0)::int AS total_completion_tokens_used,
-           COALESCE(SUM(l.ai_prompt_tokens + l.ai_completion_tokens), 0)::int AS total_tokens_used,
-           COUNT(*) FILTER (WHERE l.zalo_notify_status = 'sent')::int AS total_zalo_sent,
-          COUNT(*) FILTER (WHERE l.email_notify_status = 'sent')::int AS total_emails_sent,
-          COUNT(*) FILTER (
-            WHERE ${buildDynamicInHoursFilterSql('l.created_at', tenantTz, cfg)}
-          )::int AS in_hours_count
-        FROM leads l
+           COUNT(*) AS total_leads,
+           COALESCE(SUM(CASE WHEN l.status = 'assigned' AND COALESCE(l.custom_fields->>'original_status', '') NOT IN ('compensated', 'compensation') THEN 1 ELSE 0 END), 0) AS distributed_assigned,
+           COALESCE(SUM(CASE WHEN l.status = 'assigned' AND COALESCE(l.custom_fields->>'original_status', '') IN ('compensated', 'compensation') THEN 1 ELSE 0 END), 0) AS distributed_compensation,
+           COALESCE(SUM(CASE WHEN l.status = 'assigned' THEN 1 ELSE 0 END), 0) AS distributed_total,
+           COALESCE(SUM(CASE WHEN l.is_duplicate_reminder = true OR l.is_duplicated = true THEN 1 ELSE 0 END), 0) AS duplicates,
+           COALESCE(SUM(CASE WHEN l.status = 'unassigned_pending' THEN 1 ELSE 0 END), 0) AS pending_work_hours_count,
+           COALESCE(SUM(CASE WHEN l.status = 'rejected' THEN 1 ELSE 0 END), 0) AS under_standard,
+           COALESCE(SUM(CASE WHEN l.status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted_leads,
+           COALESCE(SUM(CASE WHEN l.ai_screener_status = 'passed' THEN 1 ELSE 0 END), 0) AS ai_passed_count,
+           COALESCE(SUM(CASE WHEN l.ai_screener_status IN ('failed', 'rejected', 'held') THEN 1 ELSE 0 END), 0) AS ai_failed_count,
+           COALESCE(SUM(l.ai_prompt_tokens), 0) AS total_prompt_tokens_used,
+           COALESCE(SUM(l.ai_completion_tokens), 0) AS total_completion_tokens_used,
+           COALESCE(SUM(l.ai_prompt_tokens + l.ai_completion_tokens), 0) AS total_tokens_used,
+           COALESCE(SUM(CASE WHEN l.zalo_notify_status = 'sent' THEN 1 ELSE 0 END), 0) AS total_zalo_sent,
+           COALESCE(SUM(CASE WHEN l.email_notify_status = 'sent' THEN 1 ELSE 0 END), 0) AS total_emails_sent
+         FROM leads l
          WHERE ${baseWhere}`,
         leadParams
       ),
       client.query(
         `SELECT
-           COUNT(*) FILTER (WHERE status = 'held')::int AS held_cnt,
-           COUNT(*) FILTER (WHERE status = 'blacklisted')::int AS blacklisted_cnt
+           COALESCE(SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END), 0) AS held_cnt,
+           COALESCE(SUM(CASE WHEN status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted_cnt
          FROM held_leads
          WHERE tenant_id = $1`,
         [ctx.tenantId]
       ),
       client.query(
         `SELECT
-           COUNT(*)::int AS total_tickets,
-           COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_tickets
+           COUNT(*) AS total_tickets,
+           COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_tickets
          FROM data_reports
          WHERE tenant_id = $1`,
         [ctx.tenantId]
@@ -184,7 +188,7 @@ export async function handleLegacyAnalytics(
         leadParams
       ),
       client.query(
-        `SELECT u.full_name AS name, COUNT(dr.id)::int AS errors
+        `SELECT u.full_name AS name, COUNT(dr.id) AS errors
          FROM data_reports dr
          LEFT JOIN users u ON u.tenant_id = dr.tenant_id AND u.id = dr.reporter_id
          WHERE dr.tenant_id = $1
@@ -192,6 +196,18 @@ export async function handleLegacyAnalytics(
          ORDER BY errors DESC
          LIMIT 10`,
         [ctx.tenantId]
+      ),
+      client.query<{
+        created_at: Date | string;
+        zalo_notify_status: string | null;
+        email_notify_status: string | null;
+        ai_prompt_tokens: number | null;
+        ai_completion_tokens: number | null;
+      }>(
+        `SELECT l.created_at, l.zalo_notify_status, l.email_notify_status, l.ai_prompt_tokens, l.ai_completion_tokens
+         FROM leads l
+         WHERE ${baseWhere}`,
+        leadParams
       ),
     ]);
 
@@ -203,9 +219,9 @@ export async function handleLegacyAnalytics(
     if (prevDateCond) {
       const pRes = await client.query(
         `SELECT
-           COUNT(*)::int AS total_leads,
-           COUNT(*) FILTER (WHERE l.status = 'assigned')::int AS dist_leads,
-           COUNT(*) FILTER (WHERE l.is_duplicate_reminder = true OR l.is_duplicated = true)::int AS dup_leads
+           COUNT(*) AS total_leads,
+           COALESCE(SUM(CASE WHEN l.status = 'assigned' THEN 1 ELSE 0 END), 0) AS dist_leads,
+           COALESCE(SUM(CASE WHEN l.is_duplicate_reminder = true OR l.is_duplicated = true THEN 1 ELSE 0 END), 0) AS dup_leads
          FROM leads l
          WHERE l.tenant_id = $1 AND l.is_deleted = false AND l.status != 'archived' AND (${prevDateCond})`,
         prevParams
@@ -215,64 +231,52 @@ export async function handleLegacyAnalytics(
       prevDup = Number(pRes.rows[0]?.dup_leads || 0);
     }
 
+    let inHoursCount = 0;
+    const eventMetricValue = (row: (typeof leadEventsRes.rows)[number]): number => {
+      if (chartMetric === 'zalo') return row.zalo_notify_status === 'sent' ? 1 : 0;
+      if (chartMetric === 'email') return row.email_notify_status === 'sent' ? 1 : 0;
+      if (chartMetric === 'token') return Number(row.ai_prompt_tokens || 0) + Number(row.ai_completion_tokens || 0);
+      return 1;
+    };
+
     let chartData: Array<Record<string, any>> = [];
-    const metricSql =
-      chartMetric === 'zalo'
-        ? `COUNT(*) FILTER (WHERE l.zalo_notify_status = 'sent')::int`
-        : chartMetric === 'email'
-          ? `COUNT(*) FILTER (WHERE l.email_notify_status = 'sent')::int`
-          : chartMetric === 'token'
-            ? `COALESCE(SUM(l.ai_prompt_tokens + l.ai_completion_tokens), 0)::int`
-            : `COUNT(*)::int`;
+    const hmMap = new Map<string, { wday: number; hour: number; volume: number }>();
+    const hrMap = new Map<number, number>();
+    const dayMap = new Map<string, { time: string; date: string; volume: number }>();
+
+    for (const row of leadEventsRes.rows) {
+      if (isWithinWorkSchedule(row.created_at, tenantTz, cfg)) {
+        inHoursCount++;
+      }
+      const zp = getZonedDateParts(row.created_at, tenantTz);
+      if (!zp) continue;
+      const val = eventMetricValue(row);
+      if (chartMode === 'heatmap') {
+        const wday = zp.isoDow - 1;
+        const key = `${wday}:${zp.hour}`;
+        const cur = hmMap.get(key) || { wday, hour: zp.hour, volume: 0 };
+        cur.volume += val;
+        hmMap.set(key, cur);
+      } else if (chartMode === 'hour' || dateFilter.isSingleDay) {
+        hrMap.set(zp.hour, (hrMap.get(zp.hour) || 0) + val);
+      } else {
+        const cur = dayMap.get(zp.ymd) || { time: zp.ddmm, date: zp.ymd, volume: 0 };
+        cur.volume += val;
+        dayMap.set(zp.ymd, cur);
+      }
+    }
 
     if (chartMode === 'heatmap') {
-      const hm = await client.query(
-        `SELECT (EXTRACT(ISODOW FROM l.created_at AT TIME ZONE '${tenantTz}')::int - 1) AS wday,
-                EXTRACT(HOUR FROM l.created_at AT TIME ZONE '${tenantTz}')::int AS hour,
-                ${metricSql} AS volume
-         FROM leads l
-         WHERE ${baseWhere}
-         GROUP BY wday, hour`,
-        leadParams
-      );
-      chartData = hm.rows.map((r) => ({
-        wday: Number(r.wday),
-        hour: Number(r.hour),
-        volume: Number(r.volume || 0),
-      }));
+      chartData = [...hmMap.values()];
     } else if (chartMode === 'hour' || dateFilter.isSingleDay) {
-      const hr = await client.query(
-        `SELECT EXTRACT(HOUR FROM l.created_at AT TIME ZONE '${tenantTz}')::int AS hr,
-                ${metricSql} AS volume
-         FROM leads l
-         WHERE ${baseWhere}
-         GROUP BY hr
-         ORDER BY hr ASC`,
-        leadParams
-      );
-      const hrMap = new Map<number, number>();
-      for (const r of hr.rows) hrMap.set(Number(r.hr), Number(r.volume || 0));
       chartData = Array.from({ length: 24 }, (_, h) => ({
         time: `${String(h).padStart(2, '0')}h`,
         volume: hrMap.get(h) || 0,
       }));
     } else {
-      const dr = await client.query(
-        `SELECT to_char(l.created_at AT TIME ZONE '${tenantTz}', 'DD/MM') AS label,
-                to_char(l.created_at AT TIME ZONE '${tenantTz}', 'YYYY-MM-DD') AS day_key,
-                ${metricSql} AS volume
-         FROM leads l
-         WHERE ${baseWhere}
-         GROUP BY label, day_key
-         ORDER BY day_key ASC
-         LIMIT 31`,
-        leadParams
-      );
-      chartData = dr.rows.map((r) => ({
-        time: r.label,
-        date: r.day_key,
-        volume: Number(r.volume || 0),
-      }));
+      chartData = [...dayMap.values()]
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .slice(0, 31);
     }
 
     const k = kpiRes.rows[0] || {};
@@ -374,7 +378,7 @@ export async function handleLegacyAnalytics(
         ? countsArr.reduce((acc, v) => acc + Math.pow(v - meanCons, 2), 0) / countsArr.length
         : 0;
     const sd = Number(Math.sqrt(variance).toFixed(1));
-    const inHours = Number(k.in_hours_count || 0);
+    const inHours = inHoursCount;
     const outHoursRatio = total > 0 ? Math.round(((total - inHours) / total) * 100) : 0;
 
     return {
@@ -480,10 +484,10 @@ export async function handleLegacyAnalytics(
         `SELECT rc.user_id AS id, rc.round_id, dr.name AS round_name,
                 u.full_name AS name, u.email, u.avatar_url AS avatar, u.is_external_agency,
                 rc.receive_ratio, rc.data_per_turn, rc.compensation_count, rc.skip_count, rc.current_turn_remaining,
-                COUNT(l.id) FILTER (WHERE l.id IS NOT NULL AND (${dCond}))::int AS assigned_count,
-                COUNT(l.id) FILTER (WHERE l.is_duplicate_reminder = true AND (${dCond}))::int AS duplicate_count,
-                COUNT(l.id) FILTER (WHERE l.source ILIKE '%meta%' OR l.source ILIKE '%facebook%' AND (${dCond}))::int AS meta_count,
-                COUNT(l.id) FILTER (WHERE l.source NOT ILIKE '%meta%' AND l.source NOT ILIKE '%facebook%' AND (${dCond}))::int AS web_count
+                COALESCE(SUM(CASE WHEN l.id IS NOT NULL AND (${dCond}) THEN 1 ELSE 0 END), 0) AS assigned_count,
+                COALESCE(SUM(CASE WHEN l.is_duplicate_reminder = true AND (${dCond}) THEN 1 ELSE 0 END), 0) AS duplicate_count,
+                COALESCE(SUM(CASE WHEN l.id IS NOT NULL AND (${dCond}) AND (l.source ILIKE '%meta%' OR l.source ILIKE '%facebook%') THEN 1 ELSE 0 END), 0) AS meta_count,
+                COALESCE(SUM(CASE WHEN l.id IS NOT NULL AND (${dCond}) AND (l.source IS NULL OR (l.source NOT ILIKE '%meta%' AND l.source NOT ILIKE '%facebook%')) THEN 1 ELSE 0 END), 0) AS web_count
          FROM round_consultants rc
          INNER JOIN distribution_rounds dr ON dr.tenant_id = rc.tenant_id AND dr.id = rc.round_id
          INNER JOIN users u ON u.tenant_id = rc.tenant_id AND u.id = rc.user_id
@@ -497,8 +501,8 @@ export async function handleLegacyAnalytics(
       ),
       client.query(
         `SELECT reporter_id,
-                COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_cnt,
-                COUNT(*)::int AS total_cnt
+                COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_cnt,
+                COUNT(*) AS total_cnt
          FROM data_reports
          WHERE tenant_id = $1
          GROUP BY reporter_id`,
@@ -611,11 +615,11 @@ export async function handleLegacyAnalytics(
     const [heldStats, blacklistRes, roundsRes] = await Promise.all([
       client.query(
         `SELECT
-           COUNT(*)::int AS total,
-           COUNT(*) FILTER (WHERE status = 'held')::int AS held,
-           COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
-           COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected,
-           COUNT(*) FILTER (WHERE status = 'blacklisted')::int AS blacklisted
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END), 0) AS held,
+           COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
+           COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected,
+           COALESCE(SUM(CASE WHEN status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted
          FROM held_leads
          WHERE tenant_id = $1 AND (${cond})`,
         qParams
@@ -658,10 +662,10 @@ export async function handleLegacyAnalytics(
     const [sumRes, listRes] = await Promise.all([
       client.query(
         `SELECT
-           COALESCE(SUM(ai_prompt_tokens), 0)::int AS prompt_tokens,
-           COALESCE(SUM(ai_completion_tokens), 0)::int AS completion_tokens,
-           COALESCE(SUM(ai_prompt_tokens + ai_completion_tokens), 0)::int AS total_tokens,
-           COUNT(*) FILTER (WHERE ai_screener_status != 'not_screened')::int AS screened_count
+           COALESCE(SUM(ai_prompt_tokens), 0) AS prompt_tokens,
+           COALESCE(SUM(ai_completion_tokens), 0) AS completion_tokens,
+           COALESCE(SUM(ai_prompt_tokens + ai_completion_tokens), 0) AS total_tokens,
+           COALESCE(SUM(CASE WHEN ai_screener_status != 'not_screened' THEN 1 ELSE 0 END), 0) AS screened_count
          FROM leads
          WHERE tenant_id = $1`,
         [ctx.tenantId]
@@ -871,25 +875,33 @@ export async function handleLegacyAnalytics(
     };
 
     if (action === 'get_ads_analytics_breakdowns') {
-      const positiveKeysArr = Array.from(positiveKeySet);
-      const dailyRes = await client.query(
-        `SELECT to_char(created_at AT TIME ZONE '${tenantTz}', 'YYYY-MM-DD') AS date,
-                COUNT(*)::int AS total_leads,
-                COUNT(*) FILTER (WHERE LOWER(quality_status) = ANY($2::text[]))::int AS positive_leads
+      const leadRowsRes = await client.query<{ created_at: Date | string; quality_status: string | null }>(
+        `SELECT created_at, quality_status
          FROM leads
-         WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived'
-         GROUP BY date
-         ORDER BY date ASC
-         LIMIT 31`,
-        [ctx.tenantId, positiveKeysArr]
+         WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived'`,
+        [ctx.tenantId]
       );
+      const dailyMap = new Map<string, { date: string; total_leads: number; positive_leads: number }>();
+      for (const row of leadRowsRes.rows) {
+        const zp = getZonedDateParts(row.created_at, tenantTz);
+        if (!zp) continue;
+        const cur = dailyMap.get(zp.ymd) || { date: zp.ymd, total_leads: 0, positive_leads: 0 };
+        cur.total_leads++;
+        if (positiveKeySet.has(String(row.quality_status || '').toLowerCase())) {
+          cur.positive_leads++;
+        }
+        dailyMap.set(zp.ymd, cur);
+      }
+      const dailyTrend = [...dailyMap.values()]
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .slice(0, 31);
       return {
         success: true,
         summary,
         ads,
         meta_config: metaSummary,
         ads_benchmarks: adsBenchmarks,
-        daily_trend: dailyRes.rows,
+        daily_trend: dailyTrend,
         goal_breakdown: [],
       };
     }
@@ -939,7 +951,9 @@ export async function handleLegacyAnalytics(
     const year = Number(params.get('year') || new Date().getFullYear());
     const month = Number(params.get('month') || new Date().getMonth() + 1);
     const consultant = params.get('consultant') || 'all';
-    const qParams: unknown[] = [ctx.tenantId, year, month];
+    const monthStart = zonedWallClockToUtc(year, month, 1, 0, 0, 0, tenantTz);
+    const nextMonthStart = zonedWallClockToUtc(year, month + 1, 1, 0, 0, 0, tenantTz);
+    const qParams: unknown[] = [ctx.tenantId, monthStart, nextMonthStart];
     let cClause = '';
     if (consultant && consultant !== 'all') {
       qParams.push(consultant);
@@ -948,23 +962,22 @@ export async function handleLegacyAnalytics(
       qParams.push(ctx.userId);
       cClause = `AND assigned_to = $${qParams.length}`;
     }
-    const r = await client.query(
-      `SELECT to_char(created_at AT TIME ZONE '${tenantTz}', 'YYYY-MM-DD') AS day,
-              COUNT(*)::int AS total,
-              COUNT(*) FILTER (WHERE status = 'assigned')::int AS assigned,
-              COUNT(*) FILTER (WHERE quality_status = 'Booked')::int AS booked
+    const r = await client.query<{ created_at: Date | string; status: string | null; quality_status: string | null }>(
+      `SELECT created_at, status, quality_status
        FROM leads
        WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived'
-         AND EXTRACT(YEAR FROM created_at AT TIME ZONE '${tenantTz}') = $2
-         AND EXTRACT(MONTH FROM created_at AT TIME ZONE '${tenantTz}') = $3
-         ${cClause}
-       GROUP BY day
-       ORDER BY day ASC`,
+         AND created_at >= $2 AND created_at < $3
+         ${cClause}`,
       qParams
     );
-    const daysMap: Record<string, any> = {};
+    const daysMap: Record<string, { total: number; assigned: number; booked: number }> = {};
     for (const row of r.rows) {
-      daysMap[row.day] = { total: Number(row.total), assigned: Number(row.assigned), booked: Number(row.booked) };
+      const zp = getZonedDateParts(row.created_at, tenantTz);
+      if (!zp) continue;
+      if (!daysMap[zp.ymd]) daysMap[zp.ymd] = { total: 0, assigned: 0, booked: 0 };
+      daysMap[zp.ymd].total++;
+      if (row.status === 'assigned') daysMap[zp.ymd].assigned++;
+      if (row.quality_status === 'Booked') daysMap[zp.ymd].booked++;
     }
     return { success: true, data: daysMap, days: daysMap };
   }
@@ -972,7 +985,11 @@ export async function handleLegacyAnalytics(
   if (action === 'get_calendar_day_details') {
     const dateStr = params.get('date') || '';
     const consultant = params.get('consultant') || 'all';
-    const qParams: unknown[] = [ctx.tenantId, dateStr];
+    const dMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+    if (!dMatch) return { success: true, data: [] };
+    const dayStart = zonedWallClockToUtc(Number(dMatch[1]), Number(dMatch[2]), Number(dMatch[3]), 0, 0, 0, tenantTz);
+    const dayEnd = zonedWallClockToUtc(Number(dMatch[1]), Number(dMatch[2]), Number(dMatch[3]) + 1, 0, 0, 0, tenantTz);
+    const qParams: unknown[] = [ctx.tenantId, dayStart, dayEnd];
     let cClause = '';
     if (consultant && consultant !== 'all') {
       qParams.push(consultant);
@@ -988,7 +1005,7 @@ export async function handleLegacyAnalytics(
        LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
        LEFT JOIN distribution_rounds r ON r.tenant_id = l.tenant_id AND r.id = l.round_id
        WHERE l.tenant_id = $1 AND l.is_deleted = false AND l.status != 'archived'
-         AND to_char(l.created_at AT TIME ZONE '${tenantTz}', 'YYYY-MM-DD') = $2
+         AND l.created_at >= $2 AND l.created_at < $3
          ${cClause}
        ORDER BY l.created_at DESC
        LIMIT 100`,

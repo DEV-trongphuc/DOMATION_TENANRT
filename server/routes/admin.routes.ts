@@ -595,7 +595,7 @@ adminRouter.post('/billing/requests/:txId/resolve', requirePlatformSuperAdmin, a
          FROM tenant_billing_transactions b
          INNER JOIN tenants t ON t.id = b.tenant_id
          WHERE b.id = $1
-         FOR UPDATE OF b, t`,
+         FOR UPDATE`,
         [txId]
       );
       const tx = txLookup.rows[0];

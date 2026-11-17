@@ -1,17 +1,25 @@
+import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { once } from 'node:events';
-import { Router } from 'express';
-import { withTenantTransaction } from '../core/database/transaction.ts';
+import { Router, type Request, type Response, type NextFunction } from 'express';
+import { getDatabasePool, type DbClient } from '../core/database/db-adapter.ts';
+import { withSystemPrivilege, withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
 import {
+  buildGranularScopeWhereClause,
+  checkEffectivePermission,
+  getResolvedUserRbac,
+  requirePermission,
   requireTenantAuth,
-  requireRoles,
+  resolveDescendantDepartmentIds,
   resolveUserEffectivePermissions,
   sendApiError,
+  type GranularAction,
+  type ResolvedUserRbacResult,
 } from '../core/security/rbac.ts';
 import { acceptsGzipEncoding } from '../core/http/encoding.ts';
-import { buildScopedLeadWhereClause } from '../core/repository/tenant-query-decorator.ts';
 import {
+  derivePiiActorFlagsFromRbac,
   transformLeadForActor,
   shouldMaskPiiForActor,
   shouldHideInternalNotesForActor,
@@ -43,7 +51,621 @@ leadsRouter.get('/personal', listPersonalLeadsHandler);
 leadsRouter.post('/personal', createPersonalLeadHandler);
 leadsRouter.delete('/personal/:id', deletePersonalLeadHandler);
 
-leadsRouter.post('/quick-test', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+// ============================================================================
+// Self-Initializing Wave A Public Databank Schema (`crm_public_leads_pool`)
+// ============================================================================
+const databankPoolsInit = new WeakSet<object>();
+const databankPoolsPending = new WeakMap<object, Promise<void>>();
+
+async function ensureDatabankSchema(): Promise<void> {
+  const pool = getDatabasePool();
+  if (databankPoolsInit.has(pool)) return;
+  let running = databankPoolsPending.get(pool);
+  if (!running) {
+    running = (async () => {
+      await withSystemPrivilege(async (client) => {
+        if (client.dialect === 'mariadb' || pool.dialect === 'mariadb') {
+          await client.query(`
+            CREATE TABLE IF NOT EXISTS crm_public_leads_pool (
+              id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
+              tenant_id VARCHAR(36) NOT NULL,
+              lead_id VARCHAR(36) NOT NULL,
+              branch_id VARCHAR(36) NULL,
+              released_by VARCHAR(36) NULL,
+              release_reason TEXT NULL,
+              pool_status VARCHAR(30) NOT NULL DEFAULT 'available',
+              claimed_by VARCHAR(36) NULL,
+              claimed_at DATETIME(6) NULL,
+              expires_at DATETIME(6) NULL,
+              metadata_json JSON NULL,
+              created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+              updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+              CONSTRAINT uk_public_pool_lead UNIQUE (tenant_id, lead_id),
+              INDEX idx_public_pool_status (tenant_id, pool_status, created_at DESC)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+          `);
+        } else {
+          const pgStmts = [
+            `CREATE TABLE IF NOT EXISTS crm_public_leads_pool (
+              id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+              tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+              lead_id UUID NOT NULL,
+              branch_id UUID,
+              released_by UUID,
+              release_reason TEXT,
+              pool_status VARCHAR(30) NOT NULL DEFAULT 'available',
+              claimed_by UUID,
+              claimed_at TIMESTAMPTZ,
+              expires_at TIMESTAMPTZ,
+              metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+              CONSTRAINT uk_public_pool_lead UNIQUE (tenant_id, lead_id)
+            )`,
+            `CREATE INDEX IF NOT EXISTS idx_public_pool_status
+              ON crm_public_leads_pool (tenant_id, pool_status, created_at DESC)`,
+            `ALTER TABLE crm_public_leads_pool ENABLE ROW LEVEL SECURITY`,
+            `ALTER TABLE crm_public_leads_pool FORCE ROW LEVEL SECURITY`,
+            `DROP POLICY IF EXISTS tenant_isolation_crm_public_leads_pool ON crm_public_leads_pool`,
+            `CREATE POLICY tenant_isolation_crm_public_leads_pool ON crm_public_leads_pool
+              USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+              WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)`,
+            `GRANT SELECT, INSERT, UPDATE, DELETE ON crm_public_leads_pool TO autodata_app`,
+          ];
+          for (const stmt of pgStmts) {
+            await client.query(stmt);
+          }
+        }
+      });
+      databankPoolsInit.add(pool);
+    })().finally(() => {
+      databankPoolsPending.delete(pool);
+    });
+    databankPoolsPending.set(pool, running);
+  }
+  await running;
+}
+
+async function ensureDatabankMiddleware(_req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    await ensureDatabankSchema();
+    next();
+  } catch (err: any) {
+    sendApiError(res, 500, 'DATABANK_SCHEMA_FAILED', err?.message || 'Không thể khởi tạo kho số Public Databank.');
+  }
+}
+
+// ============================================================================
+// Granular RBAC Scope Helpers for Leads (Zero Role-String Short-Circuits)
+// ============================================================================
+async function buildRbacLeadScopeInTx(
+  client: DbClient,
+  tenantId: string,
+  resolved: ResolvedUserRbacResult,
+  startParamIndex = 1,
+  action: GranularAction = 'view',
+  aliases?: { tenantColumn?: string; ownerColumn?: string }
+): Promise<{ clause: string; values: unknown[]; nextIndex: number }> {
+  const tenantCol = aliases?.tenantColumn || 'leads.tenant_id';
+  const ownerCol = aliases?.ownerColumn || 'leads.assigned_to';
+  const check = checkEffectivePermission(resolved, 'leads', action);
+  if (!check.allowed || !resolved.userOrg) {
+    return { clause: `${tenantCol} = $${startParamIndex} AND 1 = 0`, values: [tenantId], nextIndex: startParamIndex + 1 };
+  }
+  if (resolved.userOrg.is_tenant_owner || check.scope === 'company') {
+    return { clause: `${tenantCol} = $${startParamIndex}`, values: [tenantId], nextIndex: startParamIndex + 1 };
+  }
+  if (
+    check.scope === 'department' &&
+    !resolved.userOrg.department_id &&
+    (resolved.userOrg.role || '').toLowerCase() === 'manager'
+  ) {
+    const deptCnt = await client.query<{ cnt: number }>(
+      'SELECT COUNT(*) AS cnt FROM tenant_departments WHERE tenant_id = $1',
+      [tenantId]
+    );
+    if (Number(deptCnt.rows[0]?.cnt || 0) === 0) {
+      return { clause: `${tenantCol} = $${startParamIndex}`, values: [tenantId], nextIndex: startParamIndex + 1 };
+    }
+  }
+  return buildGranularScopeWhereClause(client, tenantId, resolved.userOrg, check.scope, {
+    tenantColumn: tenantCol,
+    ownerColumn: ownerCol,
+    startParamIndex,
+    allowUnassignedForManagers: check.scope !== 'own',
+  });
+}
+
+async function canActorAccessLeadInTx(
+  client: DbClient,
+  tenantId: string,
+  resolved: ResolvedUserRbacResult,
+  leadAssignedTo: string | null,
+  action: GranularAction = 'edit'
+): Promise<boolean> {
+  const check = checkEffectivePermission(resolved, 'leads', action);
+  if (!check.allowed || !resolved.userOrg) return false;
+  if (resolved.userOrg.is_tenant_owner || check.scope === 'company') return true;
+  if (leadAssignedTo && leadAssignedTo === resolved.userOrg.user_id) return true;
+  if (!leadAssignedTo) {
+    return check.scope !== 'own' && check.scope !== 'none';
+  }
+  if (check.scope === 'own') return false;
+
+  if (
+    check.scope === 'department' &&
+    !resolved.userOrg.department_id &&
+    (resolved.userOrg.role || '').toLowerCase() === 'manager'
+  ) {
+    const deptCnt = await client.query<{ cnt: number }>(
+      'SELECT COUNT(*) AS cnt FROM tenant_departments WHERE tenant_id = $1',
+      [tenantId]
+    );
+    if (Number(deptCnt.rows[0]?.cnt || 0) === 0) return true;
+  }
+
+  const targetRes = await client.query<{
+    branch_id: string | null;
+    department_id: string | null;
+    team_id: string | null;
+  }>(
+    'SELECT branch_id, department_id, team_id FROM users WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+    [tenantId, leadAssignedTo]
+  );
+  const tUser = targetRes.rows[0];
+  if (!tUser) return false;
+
+  if (check.scope === 'team') {
+    return Boolean(resolved.userOrg.team_id && tUser.team_id === resolved.userOrg.team_id);
+  }
+  if (check.scope === 'department') {
+    return Boolean(resolved.userOrg.department_id && tUser.department_id === resolved.userOrg.department_id);
+  }
+  if (check.scope === 'sub_departments') {
+    if (!resolved.userOrg.department_id || !tUser.department_id) return false;
+    const allDepts = await client.query<{ id: string; parent_department_id: string | null }>(
+      'SELECT id, parent_department_id FROM tenant_departments WHERE tenant_id = $1',
+      [tenantId]
+    );
+    const descendants = resolveDescendantDepartmentIds(allDepts.rows, resolved.userOrg.department_id);
+    return descendants.includes(String(tUser.department_id));
+  }
+  if (check.scope === 'branch') {
+    return Boolean(resolved.userOrg.branch_id && tUser.branch_id === resolved.userOrg.branch_id);
+  }
+  return false;
+}
+
+// ============================================================================
+// Public Databank Pool (`/api/v1/leads/databank`) — BEFORE `/:id` routes
+// ============================================================================
+leadsRouter.use('/databank', ensureDatabankMiddleware);
+
+leadsRouter.get('/databank', requirePermission('leads', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
+    const statusFilter = req.query.status ? String(req.query.status).trim().toLowerCase() : 'available';
+    const search = req.query.search ? String(req.query.search).trim() : '';
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+    const offset = (page - 1) * limit;
+
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const cfg = await getTenantSettingsCached(ctx.tenantId, client);
+      const params: unknown[] = [ctx.tenantId];
+      let where = 'p.tenant_id = $1';
+      if (statusFilter && statusFilter !== 'all') {
+        params.push(statusFilter);
+        where += ` AND p.pool_status = $${params.length}`;
+      }
+      if (search) {
+        params.push(`%${search}%`);
+        const pIdx = `$${params.length}`;
+        where += ` AND (COALESCE(l.name, '') ILIKE ${pIdx} OR COALESCE(l.phone, '') ILIKE ${pIdx} OR COALESCE(l.email, '') ILIKE ${pIdx})`;
+      }
+
+      const [statsRes, cntRes, rowsRes] = await Promise.all([
+        client.query<{
+          available: number;
+          claimed: number;
+          blocked: number;
+          restored: number;
+          total: number;
+        }>(
+          `SELECT
+             COALESCE(SUM(CASE WHEN pool_status = 'available' THEN 1 ELSE 0 END), 0) AS available,
+             COALESCE(SUM(CASE WHEN pool_status = 'claimed' THEN 1 ELSE 0 END), 0) AS claimed,
+             COALESCE(SUM(CASE WHEN pool_status = 'blocked' THEN 1 ELSE 0 END), 0) AS blocked,
+             COALESCE(SUM(CASE WHEN pool_status = 'restored' THEN 1 ELSE 0 END), 0) AS restored,
+             COUNT(*) AS total
+           FROM crm_public_leads_pool
+           WHERE tenant_id = $1`,
+          [ctx.tenantId]
+        ),
+        client.query<{ total: number }>(
+          `SELECT COUNT(*) AS total
+           FROM crm_public_leads_pool p
+           LEFT JOIN leads l ON l.tenant_id = p.tenant_id AND l.id = p.lead_id
+           WHERE ${where}`,
+          params
+        ),
+        client.query(
+          `SELECT p.*, p.pool_status AS status, p.release_reason AS reason, p.created_at AS released_at,
+                  l.name, l.phone, l.email, l.source, l.campaign, l.product_interest, l.lead_score,
+                  l.is_accepted, rb.full_name AS released_by_name, cb.full_name AS claimed_by_name
+           FROM crm_public_leads_pool p
+           LEFT JOIN leads l ON l.tenant_id = p.tenant_id AND l.id = p.lead_id
+           LEFT JOIN users rb ON rb.tenant_id = p.tenant_id AND rb.id = p.released_by
+           LEFT JOIN users cb ON cb.tenant_id = p.tenant_id AND cb.id = p.claimed_by
+           WHERE ${where}
+           ORDER BY p.created_at DESC
+           LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          [...params, limit, offset]
+        ),
+      ]);
+
+      const items = rowsRes.rows.map((r) => {
+        const masked = transformLeadForActor(
+          {
+            phone: r.phone || '',
+            email: r.email || null,
+            is_accepted: r.pool_status === 'claimed' ? Boolean(r.is_accepted) : false,
+          },
+          ctx,
+          cfg,
+          actorFlags.canUnmaskPhone,
+          actorFlags
+        );
+        return {
+          ...r,
+          phone: masked.phone,
+          email: masked.email,
+          pii_masked: masked.pii_masked,
+        };
+      });
+
+      const st = statsRes.rows[0] || { available: 0, claimed: 0, blocked: 0, restored: 0, total: 0 };
+      const total = Number(cntRes.rows[0]?.total || 0);
+      return {
+        items,
+        stats: {
+          available: Number(st.available || 0),
+          claimed: Number(st.claimed || 0),
+          blocked: Number(st.blocked || 0),
+          restored: Number(st.restored || 0),
+          total: Number(st.total || 0),
+        },
+        pagination: { total, page, total_pages: Math.max(1, Math.ceil(total / limit)) },
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'DATABANK_LIST_FAILED', err?.message || 'Không thể tải danh sách Kho Số Chung.');
+  }
+});
+
+async function handleDatabankRelease(req: Request, res: Response) {
+  try {
+    const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const b = req.body || {};
+    const leadIdsRaw = Array.isArray(b.lead_ids)
+      ? b.lead_ids
+      : [req.params.id || b.lead_id || b.id].filter(Boolean);
+    const leadIds = Array.from(new Set(leadIdsRaw.map((x: unknown) => String(x || '').trim()).filter(Boolean)));
+    if (leadIds.length === 0) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Cần cung cấp ít nhất 1 lead_id để thả vào Kho Số.');
+      return;
+    }
+    const reason = String(b.reason || 'Thả số về Kho Số Chung (Public Databank)').trim();
+
+    const released = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const results: any[] = [];
+      for (const lid of leadIds) {
+        const lRes = await client.query<{
+          id: string;
+          stage_id: string;
+          phone: string;
+          assigned_to: string | null;
+        }>(
+          'SELECT id, stage_id, phone, assigned_to FROM leads WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+          [ctx.tenantId, lid]
+        );
+        const lead = lRes.rows[0];
+        if (!lead) continue;
+        const canAccess = await canActorAccessLeadInTx(client, ctx.tenantId, resolved, lead.assigned_to, 'edit');
+        if (!canAccess) {
+          throw new Error('FORBIDDEN_NOT_ASSIGNED');
+        }
+
+        const poolId = crypto.randomUUID();
+        await client.query(
+          `INSERT INTO crm_public_leads_pool (
+             id, tenant_id, lead_id, branch_id, released_by, release_reason,
+             pool_status, claimed_by, claimed_at, metadata_json
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'available', NULL, NULL, $7::jsonb)
+           ON CONFLICT (tenant_id, lead_id)
+           DO UPDATE SET
+             pool_status = 'available',
+             release_reason = EXCLUDED.release_reason,
+             released_by = EXCLUDED.released_by,
+             claimed_by = NULL,
+             claimed_at = NULL,
+             metadata_json = EXCLUDED.metadata_json,
+             updated_at = clock_timestamp()`,
+          [
+            poolId,
+            ctx.tenantId,
+            lid,
+            resolved.userOrg?.branch_id || null,
+            ctx.userId,
+            reason,
+            JSON.stringify({ previous_owner: lead.assigned_to }),
+          ]
+        );
+        await client.query(
+          `UPDATE leads
+           SET status = 'recalled', assigned_to = NULL, is_accepted = false, accepted_at = NULL, updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, lid]
+        );
+        await client.query(
+          `INSERT INTO lead_timeline_events (
+             tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+           ) VALUES ($1, $2, 'databank_release', 'system', $3, $4, $5, $6, $7, $8::jsonb)`,
+          [
+            ctx.tenantId,
+            lid,
+            ctx.userId,
+            String(resolved.userOrg?.role || ctx.userRole || 'staff').slice(0, 30),
+            ctx.userName || 'Staff',
+            'Thả khách hàng vào Kho Số Chung (Databank)',
+            reason,
+            JSON.stringify({ previous_owner: lead.assigned_to }),
+          ]
+        );
+        if (lead.stage_id) {
+          await tenantRedis.zrem('sla_queue', `${lid}:${lead.stage_id}`, ctx.tenantId);
+        }
+        const pRow = await client.query(
+          `SELECT *, pool_status AS status, release_reason AS reason, created_at AS released_at
+           FROM crm_public_leads_pool WHERE tenant_id = $1 AND lead_id = $2 LIMIT 1`,
+          [ctx.tenantId, lid]
+        );
+        results.push(pRow.rows[0]);
+      }
+      return results;
+    });
+
+    res.status(201).json({ success: true, data: released.length === 1 ? released[0] : released, items: released });
+  } catch (err: any) {
+    if (err?.message === 'FORBIDDEN_NOT_ASSIGNED') {
+      sendApiError(res, 403, 'FORBIDDEN_NOT_ASSIGNED', 'Bạn không có quyền thả lead này vào Kho Số Chung.');
+      return;
+    }
+    sendApiError(res, 500, 'DATABANK_RELEASE_FAILED', err?.message || 'Không thể thả số vào Kho Số Chung.');
+  }
+}
+
+async function handleDatabankClaim(req: Request, res: Response) {
+  try {
+    const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const targetId = String(req.params.id || req.body?.id || req.body?.lead_id || '').trim();
+    if (!targetId) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Cần cung cấp id hoặc lead_id để nhận số từ Kho Chung.');
+      return;
+    }
+
+    const claimed = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const pRes = await client.query<{ id: string; lead_id: string; pool_status: string }>(
+        `SELECT id, lead_id, pool_status
+         FROM crm_public_leads_pool
+         WHERE tenant_id = $1 AND (id = $2 OR lead_id = $2)
+         FOR UPDATE`,
+        [ctx.tenantId, targetId]
+      );
+      const poolRow = pRes.rows[0];
+      if (!poolRow) throw new Error('DATABANK_ENTRY_NOT_FOUND');
+      if (poolRow.pool_status !== 'available') throw new Error('DATABANK_ALREADY_CLAIMED');
+
+      await client.query(
+        `UPDATE crm_public_leads_pool
+         SET pool_status = 'claimed', claimed_by = $3, claimed_at = clock_timestamp(), updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, poolRow.id, ctx.userId]
+      );
+      await client.query(
+        `UPDATE leads
+         SET assigned_to = $3, status = 'assigned', is_accepted = true, accepted_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, poolRow.lead_id, ctx.userId]
+      );
+      await client.query(
+        `INSERT INTO lead_timeline_events (
+           tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+         ) VALUES ($1, $2, 'databank_claim', 'system', $3, $4, $5, $6, $7, $8::jsonb)`,
+        [
+          ctx.tenantId,
+          poolRow.lead_id,
+          ctx.userId,
+          String(resolved.userOrg?.role || ctx.userRole || 'staff').slice(0, 30),
+          ctx.userName || 'Sale',
+          'Nhận số trực tiếp từ Kho Số Chung (Public Databank)',
+          'Chủ động nhận chăm sóc từ Kho Số Chung',
+          JSON.stringify({ pool_id: poolRow.id }),
+        ]
+      );
+      const updatedRes = await client.query(
+        `SELECT p.*, p.pool_status AS status, p.release_reason AS reason, p.created_at AS released_at,
+                l.name, l.phone, l.email, l.assigned_to
+         FROM crm_public_leads_pool p
+         LEFT JOIN leads l ON l.tenant_id = p.tenant_id AND l.id = p.lead_id
+         WHERE p.tenant_id = $1 AND p.id = $2`,
+        [ctx.tenantId, poolRow.id]
+      );
+      return updatedRes.rows[0];
+    });
+
+    res.json({ success: true, data: claimed });
+  } catch (err: any) {
+    if (err?.message === 'DATABANK_ENTRY_NOT_FOUND') {
+      sendApiError(res, 404, 'DATABANK_ENTRY_NOT_FOUND', 'Không tìm thấy bản ghi trong Kho Số Chung.');
+      return;
+    }
+    if (err?.message === 'DATABANK_ALREADY_CLAIMED') {
+      sendApiError(res, 409, 'DATABANK_ALREADY_CLAIMED', 'Số này đã có người nhận hoặc đang bị khóa.');
+      return;
+    }
+    sendApiError(res, 500, 'DATABANK_CLAIM_FAILED', err?.message || 'Không thể nhận số từ Kho Chung.');
+  }
+}
+
+async function handleDatabankStatusAction(
+  req: Request,
+  res: Response,
+  mode: 'block' | 'unblock' | 'restore'
+) {
+  try {
+    const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const targetId = String(req.params.id || req.body?.id || req.body?.lead_id || '').trim();
+    if (!targetId) {
+      sendApiError(res, 422, 'VALIDATION_ERROR', 'Cần cung cấp id hoặc lead_id.');
+      return;
+    }
+
+    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const pRes = await client.query<{ id: string; lead_id: string; released_by: string | null }>(
+        `SELECT id, lead_id, released_by
+         FROM crm_public_leads_pool
+         WHERE tenant_id = $1 AND (id = $2 OR lead_id = $2)
+         FOR UPDATE`,
+        [ctx.tenantId, targetId]
+      );
+      const row = pRes.rows[0];
+      if (!row) throw new Error('DATABANK_ENTRY_NOT_FOUND');
+
+      if (mode === 'block') {
+        const blockReason = String(req.body?.reason || 'Chặn số rác / DNC trong Kho Số Chung').trim();
+        await client.query(
+          `UPDATE crm_public_leads_pool
+           SET pool_status = 'blocked', release_reason = $3, updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, row.id, blockReason]
+        );
+        await client.query(
+          `UPDATE leads SET quality_status = 'disqualified', status = 'blacklisted', updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, row.lead_id]
+        );
+      } else if (mode === 'unblock') {
+        await client.query(
+          `UPDATE crm_public_leads_pool
+           SET pool_status = 'available', updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, row.id]
+        );
+        await client.query(
+          `UPDATE leads SET quality_status = 'Pending', status = 'recalled', updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, row.lead_id]
+        );
+      } else {
+        const targetOwner = req.body?.target_user_id ? String(req.body.target_user_id) : row.released_by || ctx.userId;
+        await client.query(
+          `UPDATE crm_public_leads_pool
+           SET pool_status = 'restored', claimed_by = $3, updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, row.id, targetOwner]
+        );
+        await client.query(
+          `UPDATE leads
+           SET status = 'assigned', assigned_to = $3, quality_status = 'Pending', updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, row.lead_id, targetOwner]
+        );
+      }
+
+      await client.query(
+        `INSERT INTO lead_timeline_events (
+           tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+         ) VALUES ($1, $2, $3, 'system', $4, $5, $6, $7, $8, $9::jsonb)`,
+        [
+          ctx.tenantId,
+          row.lead_id,
+          `databank_${mode}`,
+          ctx.userId,
+          String(resolved.userOrg?.role || ctx.userRole || 'staff').slice(0, 30),
+          ctx.userName || 'Staff',
+          `Databank: ${mode.toUpperCase()}`,
+          req.body?.reason ? String(req.body.reason) : null,
+          JSON.stringify({ pool_id: row.id }),
+        ]
+      );
+      const out = await client.query(
+        `SELECT *, pool_status AS status, release_reason AS reason, created_at AS released_at
+         FROM crm_public_leads_pool WHERE tenant_id = $1 AND id = $2`,
+        [ctx.tenantId, row.id]
+      );
+      return out.rows[0];
+    });
+
+    res.json({ success: true, data: updated });
+  } catch (err: any) {
+    if (err?.message === 'DATABANK_ENTRY_NOT_FOUND') {
+      sendApiError(res, 404, 'DATABANK_ENTRY_NOT_FOUND', 'Không tìm thấy bản ghi trong Kho Số Chung.');
+      return;
+    }
+    sendApiError(res, 500, 'DATABANK_ACTION_FAILED', err?.message || 'Không thể xử lý thao tác Kho Số.');
+  }
+}
+
+leadsRouter.post('/databank/release', requirePermission('leads', 'edit'), handleDatabankRelease);
+leadsRouter.post('/databank/:id/release', requirePermission('leads', 'edit'), handleDatabankRelease);
+leadsRouter.post('/databank/claim', requirePermission('leads', 'view'), handleDatabankClaim);
+leadsRouter.post('/databank/:id/claim', requirePermission('leads', 'view'), handleDatabankClaim);
+leadsRouter.post('/databank/block', requirePermission('leads', 'edit'), (req, res) =>
+  handleDatabankStatusAction(req, res, 'block')
+);
+leadsRouter.post('/databank/:id/block', requirePermission('leads', 'edit'), (req, res) =>
+  handleDatabankStatusAction(req, res, 'block')
+);
+leadsRouter.post('/databank/unblock', requirePermission('leads', 'edit'), (req, res) =>
+  handleDatabankStatusAction(req, res, 'unblock')
+);
+leadsRouter.post('/databank/:id/unblock', requirePermission('leads', 'edit'), (req, res) =>
+  handleDatabankStatusAction(req, res, 'unblock')
+);
+leadsRouter.post('/databank/restore', requirePermission('leads', 'edit'), (req, res) =>
+  handleDatabankStatusAction(req, res, 'restore')
+);
+leadsRouter.post('/databank/:id/restore', requirePermission('leads', 'edit'), (req, res) =>
+  handleDatabankStatusAction(req, res, 'restore')
+);
+leadsRouter.post('/databank', requirePermission('leads', 'view'), async (req, res) => {
+  const action = String(req.body?.action || '').trim().toLowerCase();
+  const resolved = await getResolvedUserRbac(req);
+  if (action === 'claim') {
+    await handleDatabankClaim(req, res);
+    return;
+  }
+  if (!checkEffectivePermission(resolved, 'leads', 'edit').allowed) {
+    sendApiError(res, 403, 'FORBIDDEN_RBAC_PERMISSION', "Tài khoản không có quyền 'edit' trên phân hệ 'leads'.");
+    return;
+  }
+  if (action === 'release') {
+    await handleDatabankRelease(req, res);
+  } else if (action === 'block' || action === 'unblock' || action === 'restore') {
+    await handleDatabankStatusAction(req, res, action);
+  } else {
+    sendApiError(res, 422, 'INVALID_DATABANK_ACTION', 'action phải là release, claim, block, unblock hoặc restore.');
+  }
+});
+
+leadsRouter.post('/quick-test', requirePermission('leads', 'create'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const { name, phone, email, source, campaign, product_interest, note } = req.body || {};
@@ -67,16 +689,16 @@ leadsRouter.post('/quick-test', requireRoles('tenant_admin', 'manager'), async (
   }
 });
 
-// Real-Time Dashboard KPI Summary (Scoped by Role & Optional Pipeline)
-leadsRouter.get('/stats/summary', async (req, res) => {
+// Real-Time Dashboard KPI Summary (Granular RBAC Scope + Cross-Dialect PG/MariaDB SQL)
+leadsRouter.get('/stats/summary', requirePermission('leads', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
-    const pipelineId = req.query.pipeline_id ? String(req.query.pipeline_id).trim() : null;
-    const scoped = buildScopedLeadWhereClause(ctx, 1);
-
+    const resolved = await getResolvedUserRbac(req);
     const cfg = await getTenantSettingsCached(ctx.tenantId);
+    const pipelineId = req.query.pipeline_id ? String(req.query.pipeline_id).trim() : null;
 
     const summary = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const scoped = await buildRbacLeadScopeInTx(client, ctx.tenantId, resolved, 1, 'view');
       const kpiParams = [...scoped.values];
       let kpiWhere = scoped.clause;
       if (pipelineId) {
@@ -86,13 +708,13 @@ leadsRouter.get('/stats/summary', async (req, res) => {
 
       const kpiRes = await client.query(
         `SELECT
-           COUNT(*)::int AS total_leads,
-           COUNT(*) FILTER (WHERE leads.status = 'assigned')::int AS assigned_leads,
-           COUNT(*) FILTER (WHERE leads.status = 'unassigned_pending')::int AS unassigned_leads,
-           COUNT(*) FILTER (WHERE leads.is_accepted = true)::int AS accepted_leads,
-           COUNT(*) FILTER (WHERE leads.is_duplicate_reminder = true)::int AS duplicate_reminders,
-           COUNT(*) FILTER (WHERE leads.sla_breached = true)::int AS sla_breached_leads,
-           COUNT(*) FILTER (WHERE s.is_won_stage = true)::int AS won_leads
+           COUNT(*) AS total_leads,
+           COALESCE(SUM(CASE WHEN leads.status = 'assigned' THEN 1 ELSE 0 END), 0) AS assigned_leads,
+           COALESCE(SUM(CASE WHEN leads.status = 'unassigned_pending' THEN 1 ELSE 0 END), 0) AS unassigned_leads,
+           COALESCE(SUM(CASE WHEN leads.is_accepted = true THEN 1 ELSE 0 END), 0) AS accepted_leads,
+           COALESCE(SUM(CASE WHEN leads.is_duplicate_reminder = true THEN 1 ELSE 0 END), 0) AS duplicate_reminders,
+           COALESCE(SUM(CASE WHEN leads.sla_breached = true THEN 1 ELSE 0 END), 0) AS sla_breached_leads,
+           COALESCE(SUM(CASE WHEN s.is_won_stage = true THEN 1 ELSE 0 END), 0) AS won_leads
          FROM leads
          LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = leads.tenant_id AND s.id = leads.stage_id
          WHERE ${kpiWhere}`,
@@ -108,7 +730,7 @@ leadsRouter.get('/stats/summary', async (req, res) => {
 
       const byStageRes = await client.query(
         `SELECT s.id, s.pipeline_id, s.stage_name, s.color_hex, s.capi_event_mapping,
-                COUNT(leads.id)::int AS count
+                COUNT(leads.id) AS count
          FROM tenant_pipeline_stages s
          LEFT JOIN leads ON leads.tenant_id = s.tenant_id AND leads.stage_id = s.id AND (${scoped.clause})
          WHERE ${stageWhere}
@@ -118,7 +740,7 @@ leadsRouter.get('/stats/summary', async (req, res) => {
       );
 
       const bySourceRes = await client.query(
-        `SELECT leads.source, COUNT(*)::int AS count
+        `SELECT leads.source, COUNT(*) AS count
          FROM leads
          WHERE ${kpiWhere}
          GROUP BY leads.source
@@ -128,26 +750,39 @@ leadsRouter.get('/stats/summary', async (req, res) => {
       );
 
       const capiCountRes = await client.query<{ sent_ok: number }>(
-        `SELECT COUNT(*)::int AS sent_ok
+        `SELECT COUNT(*) AS sent_ok
          FROM capi_logs
          WHERE tenant_id = $1 AND response_status = 200`,
         [ctx.tenantId]
       );
 
-      const latencyRes = await client.query<{ avg_ms: string | null }>(
-        `SELECT AVG(lat)::text AS avg_ms
-         FROM (
-           SELECT (metadata->>'latency_ms')::numeric AS lat
-           FROM lead_timeline_events
-           WHERE tenant_id = $1
-             AND event_type IN ('lead_distributed', 'duplicate_reminder')
-             AND (metadata->>'latency_ms') ~ '^[0-9]+(\\.[0-9]+)?$'
-           ORDER BY created_at DESC
-           LIMIT 200
-         ) recent`,
+      const latencyRowsRes = await client.query<{ metadata: unknown }>(
+        `SELECT metadata
+         FROM lead_timeline_events
+         WHERE tenant_id = $1
+           AND event_type IN ('lead_distributed', 'duplicate_reminder')
+         ORDER BY created_at DESC
+         LIMIT 200`,
         [ctx.tenantId]
       );
-      const rawAvgMs = latencyRes.rows[0]?.avg_ms ? Number(latencyRes.rows[0].avg_ms) : null;
+      let latSum = 0;
+      let latCount = 0;
+      for (const rowMeta of latencyRowsRes.rows) {
+        let metaObj = rowMeta.metadata as any;
+        if (typeof metaObj === 'string') {
+          try {
+            metaObj = JSON.parse(metaObj);
+          } catch {
+            metaObj = null;
+          }
+        }
+        const latVal = metaObj && typeof metaObj === 'object' ? Number(metaObj.latency_ms) : NaN;
+        if (Number.isFinite(latVal) && latVal >= 0) {
+          latSum += latVal;
+          latCount++;
+        }
+      }
+      const rawAvgMs = latCount > 0 ? latSum / latCount : null;
       const avgDistSeconds =
         rawAvgMs !== null && Number.isFinite(rawAvgMs) && rawAvgMs > 0
           ? Math.max(0.05, Number((rawAvgMs / 1000).toFixed(2)))
@@ -181,10 +816,13 @@ leadsRouter.get('/stats/summary', async (req, res) => {
   }
 });
 
-// 5.1 List Leads (Scoped by Role Op 13/14/15 + Kernel RLS + Configurable PII Masking)
-leadsRouter.get('/', async (req, res) => {
+// 5.1 List Leads (Granular 7-Tier RBAC Scope + Kernel RLS + Configurable PII Masking)
+leadsRouter.get('/', requirePermission('leads', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const leadsView = checkEffectivePermission(resolved, 'leads', 'view');
+    const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
     const cfg = await getTenantSettingsCached(ctx.tenantId);
     const pipelineId = req.query.pipeline_id ? String(req.query.pipeline_id).trim() : null;
     const stageId = req.query.stage_id ? String(req.query.stage_id) : null;
@@ -195,60 +833,60 @@ leadsRouter.get('/', async (req, res) => {
     const page = Math.max(1, Number(req.query.page || 1));
     const limit = Math.min(cfg.max_page_size || 200, Math.max(1, Number(req.query.limit || 50)));
     const offset = (page - 1) * limit;
-
-    const scoped = buildScopedLeadWhereClause(ctx, 1);
-    const params = [...scoped.values];
-    let where = `${scoped.clause} AND leads.is_deleted = false`;
     const roundId = req.query.round_id ? String(req.query.round_id).trim() : null;
 
-    if (roundId) {
-      params.push(roundId);
-      where += ` AND leads.round_id = $${params.length}`;
-    }
-
-    if (pipelineId) {
-      params.push(pipelineId);
-      where += ` AND leads.pipeline_id = $${params.length}`;
-    }
-    if (stageId) {
-      params.push(stageId);
-      where += ` AND leads.stage_id = $${params.length}`;
-    }
-    if (statusFilter) {
-      params.push(statusFilter);
-      where += ` AND leads.status = $${params.length}`;
-    }
-    if (qualityFilter) {
-      params.push(qualityFilter);
-      where += ` AND leads.quality_status = $${params.length}`;
-    }
-    if (assignedFilter && ctx.userRole !== 'sale') {
-      params.push(assignedFilter);
-      where += ` AND leads.assigned_to = $${params.length}`;
-    }
-    if (search) {
-      params.push(`%${search}%`);
-      const pIdx = `$${params.length}`;
-      const digitsOnly = search.replace(/\D/g, '');
-      if (digitsOnly.length >= 6) {
-        const strippedZero = digitsOnly.replace(/^0+/, '');
-        params.push(`%${strippedZero || digitsOnly}%`);
-        const dIdx = `$${params.length}`;
-        where += ` AND (leads.name ILIKE ${pIdx} OR leads.phone ILIKE ${pIdx} OR leads.phone ILIKE ${dIdx} OR COALESCE(leads.email, '') ILIKE ${pIdx} OR COALESCE(leads.campaign, '') ILIKE ${pIdx})`;
-      } else {
-        where += ` AND (leads.name ILIKE ${pIdx} OR leads.phone ILIKE ${pIdx} OR COALESCE(leads.email, '') ILIKE ${pIdx} OR COALESCE(leads.campaign, '') ILIKE ${pIdx})`;
-      }
-    }
-
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const [countRes, rbac] = await Promise.all([
-        client.query<{ total: number }>(
-          `SELECT COUNT(*)::int AS total FROM leads WHERE ${where}`,
-          params
-        ),
-        resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId),
-      ]);
-      const canUnmaskPhone = rbac.effectivePermissions.leads?.actions.unmask_phone;
+      const scoped = await buildRbacLeadScopeInTx(client, ctx.tenantId, resolved, 1, 'view');
+      const params = [...scoped.values];
+      let where = `${scoped.clause} AND leads.is_deleted = false`;
+
+      if (roundId) {
+        params.push(roundId);
+        where += ` AND leads.round_id = $${params.length}`;
+      }
+
+      if (pipelineId) {
+        params.push(pipelineId);
+        where += ` AND leads.pipeline_id = $${params.length}`;
+      }
+      if (stageId) {
+        params.push(stageId);
+        where += ` AND leads.stage_id = $${params.length}`;
+      }
+      if (statusFilter) {
+        params.push(statusFilter);
+        where += ` AND leads.status = $${params.length}`;
+      }
+      if (qualityFilter) {
+        params.push(qualityFilter);
+        where += ` AND leads.quality_status = $${params.length}`;
+      }
+      if (
+        assignedFilter &&
+        (resolved.userOrg?.is_tenant_owner || (leadsView.scope !== 'own' && leadsView.scope !== 'none'))
+      ) {
+        params.push(assignedFilter);
+        where += ` AND leads.assigned_to = $${params.length}`;
+      }
+      if (search) {
+        params.push(`%${search}%`);
+        const pIdx = `$${params.length}`;
+        const digitsOnly = search.replace(/\D/g, '');
+        if (digitsOnly.length >= 6) {
+          const strippedZero = digitsOnly.replace(/^0+/, '');
+          params.push(`%${strippedZero || digitsOnly}%`);
+          const dIdx = `$${params.length}`;
+          where += ` AND (leads.name ILIKE ${pIdx} OR leads.phone ILIKE ${pIdx} OR leads.phone ILIKE ${dIdx} OR COALESCE(leads.email, '') ILIKE ${pIdx} OR COALESCE(leads.campaign, '') ILIKE ${pIdx})`;
+        } else {
+          where += ` AND (leads.name ILIKE ${pIdx} OR leads.phone ILIKE ${pIdx} OR COALESCE(leads.email, '') ILIKE ${pIdx} OR COALESCE(leads.campaign, '') ILIKE ${pIdx})`;
+        }
+      }
+
+      const countRes = await client.query<{ total: number }>(
+        `SELECT COUNT(*) AS total FROM leads WHERE ${where}`,
+        params
+      );
+      const canUnmaskPhone = actorFlags.canUnmaskPhone;
 
       const queryParams = [...params, limit, offset];
       const rowsRes = await client.query(
@@ -323,12 +961,13 @@ leadsRouter.get('/', async (req, res) => {
           },
           ctx,
           cfg,
-          canUnmaskPhone
+          canUnmaskPhone,
+          actorFlags
         );
         return transformed;
       });
 
-      const total = countRes.rows[0]?.total || 0;
+      const total = Number(countRes.rows[0]?.total || 0);
       return {
         items,
         pagination: {
@@ -358,27 +997,16 @@ function escapeCsvCell(val: unknown): string {
   return s;
 }
 
-// Op 18: Export Lead Data CSV (Tenant Admin by default; Manager if `allow_manager_export_csv` enabled)
-leadsRouter.get('/export', async (req, res) => {
+// Op 18: Export Lead Data CSV (Governed 100% by Granular RBAC `leads.export` & Data Scope)
+leadsRouter.get('/export', requirePermission('leads', 'export'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const pipelineId = req.query.pipeline_id ? String(req.query.pipeline_id).trim() : null;
 
     const cfg = await getTenantSettingsCached(ctx.tenantId);
-    const rbacExport = await withTenantTransaction(ctx.tenantId, (client) =>
-      resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId)
-    );
-    const leadPerm = rbacExport.effectivePermissions.leads;
-    const canExport =
-      Boolean(leadPerm?.actions.export) ||
-      ctx.userRole === 'tenant_admin' ||
-      (ctx.userRole === 'manager' && cfg.role_permissions.allow_manager_export_csv);
-    const canUnmaskExport = leadPerm ? Boolean(leadPerm.actions.unmask_phone) : true;
-
-    if (!canExport) {
-      sendApiError(res, 403, 'FORBIDDEN_ROLE', `Vai trò '${ctx.userRole}' không có quyền thực hiện tác vụ này.`);
-      return;
-    }
+    const rbacExport = await getResolvedUserRbac(req);
+    const actorFlags = derivePiiActorFlagsFromRbac(rbacExport, ctx);
+    const canUnmaskExport = actorFlags.canUnmaskPhone;
 
     const maxExportRows = Math.min(50_000, Math.max(10, cfg.max_export_rows || 5000));
     const EXPORT_BATCH_SIZE = 1000;
@@ -406,8 +1034,12 @@ leadsRouter.get('/export', async (req, res) => {
       includeCustomKeys = false
     ): Promise<{ rows: ExportLeadRow[]; customKeys: string[] }> =>
       withTenantTransaction(ctx.tenantId, async (client) => {
-        const params: unknown[] = [ctx.tenantId];
-        let where = 'l.tenant_id = $1 AND l.is_deleted = false';
+        const scoped = await buildRbacLeadScopeInTx(client, ctx.tenantId, rbacExport, 1, 'export', {
+          tenantColumn: 'l.tenant_id',
+          ownerColumn: 'l.assigned_to',
+        });
+        const params: unknown[] = [...scoped.values];
+        let where = `${scoped.clause} AND l.is_deleted = false`;
         if (pipelineId) {
           params.push(pipelineId);
           where += ` AND l.pipeline_id = $${params.length}`;
@@ -577,26 +1209,23 @@ leadsRouter.get('/export', async (req, res) => {
   }
 });
 
-// Op 12: Create or Bulk Import Leads (Tenant Admin & Manager; Sale if `allow_sale_create_lead` enabled)
-leadsRouter.post('/', async (req, res) => {
+// Create or Bulk Import Leads (Governed 100% by Granular RBAC `leads.create`)
+leadsRouter.post('/', requirePermission('leads', 'create'), async (req, res) => {
   try {
     const ctx = getTenantContext();
-
     const tenantCfg = await getTenantSettingsCached(ctx.tenantId);
-    const tenantRolePerms = tenantCfg.role_permissions;
-
-    if (ctx.userRole !== 'tenant_admin' && ctx.userRole !== 'manager' && !tenantRolePerms.allow_sale_create_lead) {
-      sendApiError(res, 403, 'FORBIDDEN_ROLE', `Vai trò '${ctx.userRole}' không có quyền thực hiện tác vụ này.`);
-      return;
-    }
+    const resolved = await getResolvedUserRbac(req);
+    const leadsView = checkEffectivePermission(resolved, 'leads', 'view');
+    const canAssignOther = Boolean(
+      resolved.userOrg?.is_tenant_owner ||
+        checkEffectivePermission(resolved, 'leads', 'assign').allowed ||
+        (leadsView.scope !== 'own' && leadsView.scope !== 'none')
+    );
 
     const resolveForcedAssignee = (rawItem: Record<string, unknown>): string | undefined => {
       const rawAssignee = rawItem.force_assigned_to || rawItem.assigned_to;
       const cleanAssignee = typeof rawAssignee === 'string' && rawAssignee.trim() ? rawAssignee.trim() : undefined;
-      if (ctx.userRole === 'sale') {
-        if (cleanAssignee && cleanAssignee !== ctx.userId && tenantRolePerms.allow_sale_reassign_lead) {
-          return cleanAssignee;
-        }
+      if (!canAssignOther) {
         return ctx.userId;
       }
       return cleanAssignee;
@@ -728,7 +1357,7 @@ leadsRouter.post('/', async (req, res) => {
 });
 
 // Update Lead Profile & Custom Fields (`PATCH /leads/:id`)
-leadsRouter.patch('/:id', async (req, res) => {
+leadsRouter.patch('/:id', requirePermission('leads', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const leadId = req.params.id;
@@ -746,6 +1375,8 @@ leadsRouter.patch('/:id', async (req, res) => {
       total_revenue_vnd,
     } = req.body || {};
 
+    const resolved = await getResolvedUserRbac(req);
+    const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
     const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
       const leadRes = await client.query<{
         id: string;
@@ -758,7 +1389,7 @@ leadsRouter.patch('/:id', async (req, res) => {
       );
       const lead = leadRes.rows[0];
       if (!lead) throw new Error('LEAD_NOT_FOUND');
-      if (ctx.userRole === 'sale' && lead.assigned_to !== ctx.userId) {
+      if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, lead.assigned_to, 'edit'))) {
         throw new Error('FORBIDDEN_NOT_ASSIGNED');
       }
 
@@ -876,9 +1507,10 @@ leadsRouter.patch('/:id', async (req, res) => {
 });
 
 // 5.2 Transition Lead Stage & Auto-Trigger Meta CAPI (Op 16)
-leadsRouter.patch('/:id/stage', async (req, res) => {
+leadsRouter.patch('/:id/stage', requirePermission('leads', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
     const leadId = req.params.id;
     const { stage_id, note, deal_value_vnd, deal_value } = req.body || {};
 
@@ -890,7 +1522,7 @@ leadsRouter.patch('/:id/stage', async (req, res) => {
     const txState = await withTenantTransaction(ctx.tenantId, async (client) => {
       const cfg = await getTenantSettingsCached(ctx.tenantId, client);
 
-      const leadRes = await client.query<{
+      const leadBaseRes = await client.query<{
         id: string;
         stage_id: string;
         assigned_to: string | null;
@@ -907,27 +1539,36 @@ leadsRouter.patch('/:id/stage', async (req, res) => {
         fbc: string | null;
         fbp: string | null;
         custom_fields: Record<string, unknown> | null;
-        old_stage_key: string;
-        old_stage_name: string;
       }>(
-        `SELECT l.id, l.stage_id, l.assigned_to, l.name, l.phone, l.email,
-                l.product_interest, l.budget_range, l.source, l.campaign, l.utm_source,
-                l.meta_lead_id, l.fbclid, l.fbc, l.fbp, l.custom_fields,
-                s.stage_key AS old_stage_key, s.stage_name AS old_stage_name
-         FROM leads l
-         LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
-         WHERE l.tenant_id = $1 AND l.id = $2
-         FOR UPDATE OF l`,
+        `SELECT id, stage_id, assigned_to, name, phone, email,
+                product_interest, budget_range, source, campaign, utm_source,
+                meta_lead_id, fbclid, fbc, fbp, custom_fields
+         FROM leads
+         WHERE tenant_id = $1 AND id = $2
+         FOR UPDATE`,
         [ctx.tenantId, leadId]
       );
-      const lead = leadRes.rows[0];
-      if (!lead) {
+      const leadBase = leadBaseRes.rows[0];
+      if (!leadBase) {
         throw new Error('LEAD_NOT_FOUND');
       }
 
-      if (ctx.userRole === 'sale' && lead.assigned_to !== ctx.userId) {
+      if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, leadBase.assigned_to, 'edit'))) {
         throw new Error('FORBIDDEN_NOT_ASSIGNED');
       }
+
+      const oldStageRes = leadBase.stage_id
+        ? await client.query<{ stage_key: string; stage_name: string }>(
+            'SELECT stage_key, stage_name FROM tenant_pipeline_stages WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+            [ctx.tenantId, leadBase.stage_id]
+          )
+        : { rows: [] as Array<{ stage_key: string; stage_name: string }> };
+
+      const lead = {
+        ...leadBase,
+        old_stage_key: oldStageRes.rows[0]?.stage_key || '',
+        old_stage_name: oldStageRes.rows[0]?.stage_name || '',
+      };
 
       const targetStageRes = await client.query<{
         id: string;
@@ -1007,7 +1648,10 @@ leadsRouter.patch('/:id/stage', async (req, res) => {
 
         const hasRoleIdGate = Array.isArray(rule.allowed_role_ids) && rule.allowed_role_ids.length > 0;
         const hasRoleKeyGate = Array.isArray(rule.allowed_roles) && rule.allowed_roles.length > 0;
-        if ((hasRoleIdGate || hasRoleKeyGate) && ctx.userRole !== 'tenant_admin') {
+        const canBypassStageRoleGate = Boolean(
+          resolved.userOrg?.is_tenant_owner || checkEffectivePermission(resolved, 'pipelines', 'manage_config').allowed
+        );
+        if ((hasRoleIdGate || hasRoleKeyGate) && !canBypassStageRoleGate) {
           if (!actorRoleResolved) {
             actorRoleResolved = true;
             const uRoleRes = await client.query<{ is_tenant_owner: boolean; role_id: string | null; role: string }>(
@@ -1027,7 +1671,8 @@ leadsRouter.patch('/:id/stage', async (req, res) => {
           }
           if (!actorIsTenantOwner) {
             const passById = hasRoleIdGate && actorEffectiveRoleId ? rule.allowed_role_ids.includes(actorEffectiveRoleId) : false;
-            const passByKey = hasRoleKeyGate ? rule.allowed_roles.includes(ctx.userRole) : false;
+            const actorRoleStr = resolved.userOrg?.role || ctx.userRole;
+            const passByKey = hasRoleKeyGate ? rule.allowed_roles.includes(actorRoleStr) : false;
             if (hasRoleIdGate && hasRoleKeyGate) {
               if (!passById && !passByKey) {
                 throw new Error('STAGE_RULE_ROLE_FORBIDDEN');
@@ -1248,11 +1893,12 @@ leadsRouter.patch('/:id/stage', async (req, res) => {
 });
 
 // 5.3 Accept Lead ("Tiếp Nhận Data")
-leadsRouter.post('/:id/accept', async (req, res) => {
+leadsRouter.post('/:id/accept', requirePermission('leads', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const leadId = req.params.id;
 
+    const resolved = await getResolvedUserRbac(req);
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       const leadRes = await client.query<{
         id: string;
@@ -1265,7 +1911,7 @@ leadsRouter.post('/:id/accept', async (req, res) => {
       );
       const lead = leadRes.rows[0];
       if (!lead) throw new Error('LEAD_NOT_FOUND');
-      if (ctx.userRole === 'sale' && lead.assigned_to !== ctx.userId) {
+      if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, lead.assigned_to, 'edit'))) {
         throw new Error('FORBIDDEN_NOT_ASSIGNED');
       }
 
@@ -1325,10 +1971,11 @@ leadsRouter.post('/:id/accept', async (req, res) => {
   }
 });
 
-// Op 17: Reassign Lead (Tenant Admin & Manager; Sale on own lead if `allow_sale_reassign_lead` enabled)
-leadsRouter.post('/:id/reassign', async (req, res) => {
+// Op 17: Reassign Lead (Governed 100% by Granular RBAC `leads.assign` & Data Scope)
+leadsRouter.post('/:id/reassign', requirePermission('leads', 'assign'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
     const leadId = req.params.id;
     const { target_user_id, reason } = req.body || {};
     if (!target_user_id) {
@@ -1338,16 +1985,22 @@ leadsRouter.post('/:id/reassign', async (req, res) => {
 
     const { data, slaMember, slaDeadlineMs } = await withTenantTransaction(ctx.tenantId, async (client) => {
       const cfg = await getTenantSettingsCached(ctx.tenantId, client);
-
-      if (ctx.userRole !== 'tenant_admin' && ctx.userRole !== 'manager') {
-        if (!cfg.role_permissions.allow_sale_reassign_lead) {
-          throw new Error('FORBIDDEN_ROLE');
-        }
+      const assignPerm = checkEffectivePermission(resolved, 'leads', 'assign');
+      if (!resolved.userOrg?.is_tenant_owner && assignPerm.scope === 'own') {
         const ownCheck = await client.query<{ assigned_to: string | null }>(
           'SELECT assigned_to FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
           [ctx.tenantId, leadId]
         );
         if (!ownCheck.rows[0] || ownCheck.rows[0].assigned_to !== ctx.userId) {
+          throw new Error('FORBIDDEN_ROLE');
+        }
+      } else if (!resolved.userOrg?.is_tenant_owner && assignPerm.scope !== 'company') {
+        const curCheck = await client.query<{ assigned_to: string | null }>(
+          'SELECT assigned_to FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, leadId]
+        );
+        if (!curCheck.rows[0]) throw new Error('LEAD_NOT_FOUND');
+        if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, curCheck.rows[0].assigned_to, 'assign'))) {
           throw new Error('FORBIDDEN_ROLE');
         }
       }
@@ -1433,9 +2086,11 @@ leadsRouter.post('/:id/reassign', async (req, res) => {
 });
 
 // 8.1 Query Lead Interaction Timeline Feed (Reverse-Chronological + Configurable Role/PII Masking)
-leadsRouter.get('/:id/timeline', async (req, res) => {
+leadsRouter.get('/:id/timeline', requirePermission('leads', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
     const leadId = req.params.id;
     const category = req.query.category ? String(req.query.category) : null;
     const beforeTs = req.query.before_ts ? String(req.query.before_ts) : null;
@@ -1449,14 +2104,14 @@ leadsRouter.get('/:id/timeline', async (req, res) => {
       if (!leadCheck.rows[0]) {
         throw new Error('LEAD_NOT_FOUND');
       }
-      if (ctx.userRole === 'sale' && leadCheck.rows[0].assigned_to !== ctx.userId) {
+      if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, leadCheck.rows[0].assigned_to, 'view'))) {
         throw new Error('FORBIDDEN_TIMELINE_ACCESS');
       }
 
       const cfg = await getTenantSettingsCached(ctx.tenantId, client);
       const limit = Math.min(cfg.max_page_size, Math.max(1, Number.isFinite(rawReqLimit) ? rawReqLimit : 30));
-      const maskActive = shouldMaskPiiForActor(ctx, cfg, leadCheck.rows[0]);
-      const hideInternal = shouldHideInternalNotesForActor(ctx, cfg);
+      const maskActive = shouldMaskPiiForActor(ctx, cfg, leadCheck.rows[0], actorFlags.canUnmaskPhone, actorFlags);
+      const hideInternal = shouldHideInternalNotesForActor(ctx, cfg, actorFlags);
 
       const internalOnlyValues = Array.from(
         new Set([
@@ -1525,7 +2180,7 @@ leadsRouter.get('/:id/timeline', async (req, res) => {
 });
 
 // 8.2 Append Sale Note to Timeline
-leadsRouter.post('/:id/timeline/notes', async (req, res) => {
+leadsRouter.post('/:id/timeline/notes', requirePermission('leads', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const leadId = req.params.id;
@@ -1544,13 +2199,15 @@ leadsRouter.post('/:id/timeline/notes', async (req, res) => {
         : rawCat
       : 'note';
 
+    const resolved = await getResolvedUserRbac(req);
+    const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
       const leadCheck = await client.query<{ assigned_to: string | null; is_accepted: boolean }>(
         'SELECT assigned_to, is_accepted FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
         [ctx.tenantId, leadId]
       );
       if (!leadCheck.rows[0]) throw new Error('LEAD_NOT_FOUND');
-      if (ctx.userRole === 'sale' && leadCheck.rows[0].assigned_to !== ctx.userId) {
+      if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, leadCheck.rows[0].assigned_to, 'edit'))) {
         throw new Error('FORBIDDEN_TIMELINE_WRITE');
       }
 
@@ -1558,7 +2215,7 @@ leadsRouter.post('/:id/timeline/notes', async (req, res) => {
       const matchedNoteCfg = cfg.note_types.find(
         (nt) => nt.value.toUpperCase() === String(note_type || '').trim().toUpperCase()
       );
-      if (matchedNoteCfg?.internal_only && shouldHideInternalNotesForActor(ctx, cfg)) {
+      if (matchedNoteCfg?.internal_only && shouldHideInternalNotesForActor(ctx, cfg, actorFlags)) {
         throw new Error('FORBIDDEN_INTERNAL_NOTE');
       }
 
@@ -1598,7 +2255,7 @@ leadsRouter.post('/:id/timeline/notes', async (req, res) => {
         ]
       );
       const row = r.rows[0];
-      if (shouldMaskPiiForActor(ctx, cfg, leadCheck.rows[0])) {
+      if (shouldMaskPiiForActor(ctx, cfg, leadCheck.rows[0], actorFlags.canUnmaskPhone, actorFlags)) {
         return {
           ...row,
           title: maskPiiInText(row.title, cfg),
@@ -1619,9 +2276,12 @@ leadsRouter.post('/:id/timeline/notes', async (req, res) => {
 });
 
 // Dispute / Error Tickets (`data_reports`) - Op 23 & Op 24
-leadsRouter.get('/tickets/list', async (req, res) => {
+leadsRouter.get('/tickets/list', requirePermission('tickets_data', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
+    const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
+    const ticketsPerm = checkEffectivePermission(resolved, 'tickets_data', 'view');
     const rawLimit = Number(req.query.limit || 0);
     const rawOffset = Math.max(0, Math.floor(Number(req.query.offset || 0) || 0));
 
@@ -1632,13 +2292,32 @@ leadsRouter.get('/tickets/list', async (req, res) => {
           ? Math.min(cfg.max_page_size, Math.max(1, Math.floor(rawLimit)))
           : cfg.max_page_size;
 
-      const params: unknown[] = [ctx.tenantId];
-      let where = 'dr.tenant_id = $1';
-      if (ctx.userRole === 'sale') {
-        params.push(ctx.userId);
-        where += ` AND dr.reporter_id = $2`;
+      let scopeRes = { clause: 'dr.tenant_id = $1', values: [ctx.tenantId] as unknown[], nextIndex: 2 };
+      if (!resolved.userOrg?.is_tenant_owner && ticketsPerm.scope !== 'company') {
+        const useDirectOwn =
+          ticketsPerm.scope === 'department' &&
+          !resolved.userOrg?.department_id &&
+          (resolved.userOrg?.role || '').toLowerCase() === 'manager';
+        if (useDirectOwn) {
+          const deptCnt = await client.query<{ cnt: number }>(
+            'SELECT COUNT(*) AS cnt FROM tenant_departments WHERE tenant_id = $1',
+            [ctx.tenantId]
+          );
+          if (Number(deptCnt.rows[0]?.cnt || 0) > 0 && resolved.userOrg) {
+            scopeRes = await buildGranularScopeWhereClause(client, ctx.tenantId, resolved.userOrg, ticketsPerm.scope, {
+              tenantColumn: 'dr.tenant_id',
+              ownerColumn: 'dr.reporter_id',
+            });
+          }
+        } else if (resolved.userOrg) {
+          scopeRes = await buildGranularScopeWhereClause(client, ctx.tenantId, resolved.userOrg, ticketsPerm.scope, {
+            tenantColumn: 'dr.tenant_id',
+            ownerColumn: 'dr.reporter_id',
+          });
+        }
       }
-      params.push(limit, rawOffset);
+
+      const params: unknown[] = [...scopeRes.values, limit, rawOffset];
       const limitIdx = params.length - 1;
       const offsetIdx = params.length;
 
@@ -1650,13 +2329,19 @@ leadsRouter.get('/tickets/list', async (req, res) => {
          FROM data_reports dr
          INNER JOIN leads l ON l.tenant_id = dr.tenant_id AND l.id = dr.lead_id
          INNER JOIN users u ON u.tenant_id = dr.tenant_id AND u.id = dr.reporter_id
-         WHERE ${where}
+         WHERE ${scopeRes.clause}
          ORDER BY dr.created_at DESC
          LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
         params
       );
       return r.rows.map((row) => {
-        const maskRow = shouldMaskPiiForActor(ctx, cfg, { is_accepted: row.is_accepted });
+        const maskRow = shouldMaskPiiForActor(
+          ctx,
+          cfg,
+          { is_accepted: row.is_accepted },
+          actorFlags.canUnmaskPhone,
+          actorFlags
+        );
         return {
           ...row,
           lead_phone: maskRow && row.lead_phone ? maskPhoneString(row.lead_phone, cfg) : row.lead_phone,
@@ -1670,9 +2355,10 @@ leadsRouter.get('/tickets/list', async (req, res) => {
   }
 });
 
-leadsRouter.post('/:id/tickets', async (req, res) => {
+leadsRouter.post('/:id/tickets', requirePermission('tickets_data', 'create'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const resolved = await getResolvedUserRbac(req);
     const leadId = req.params.id;
     const { reason = 'Sai số / Thuê bao', description = '' } = req.body || {};
 
@@ -1682,7 +2368,7 @@ leadsRouter.post('/:id/tickets', async (req, res) => {
         [ctx.tenantId, leadId]
       );
       if (!leadCheck.rows[0]) throw new Error('LEAD_NOT_FOUND');
-      if (ctx.userRole === 'sale' && leadCheck.rows[0].assigned_to !== ctx.userId) {
+      if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, leadCheck.rows[0].assigned_to, 'view'))) {
         throw new Error('FORBIDDEN_NOT_ASSIGNED');
       }
 
@@ -1734,7 +2420,7 @@ leadsRouter.post('/:id/tickets', async (req, res) => {
 });
 
 // Op 24: Approve / Reject Dispute Ticket (Triggers Configurable Compensation Quota)
-leadsRouter.post('/tickets/:ticketId/resolve', requireRoles('tenant_admin', 'manager'), async (req, res) => {
+leadsRouter.post('/tickets/:ticketId/resolve', requirePermission('tickets_data', 'approve'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const ticketId = req.params.ticketId;
