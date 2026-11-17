@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-server
+.env
+.env.local
+.env.*.local
+.autodata-pgdata
+.autodata-pgdata.bak
+test-results
+*.log

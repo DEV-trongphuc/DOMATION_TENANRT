@@ -1,0 +1,247 @@
+import { resolveDateBounds, bindDateParams } from '../workspace.routes.ts';
+import type { TenantContext } from '../../core/context/tenant-context.ts';
+import type { TenantSettings } from '../../core/settings/tenant-settings.ts';
+import { maskEmailString, maskPhoneString, shouldMaskPiiForActor } from '../../core/security/pii-masker.ts';
+
+export interface ParsedLegacyDateRange {
+  preset: string;
+  startDate?: string | null;
+  endDate?: string | null;
+  isSingleDay: boolean;
+  label: string;
+  bindSql: (col: string, params: unknown[]) => string;
+  bindPrevSql: (col: string, params: unknown[]) => string | null;
+}
+
+export function normalizeLegacyDatePreset(raw?: string | null): {
+  preset: string;
+  startDate?: string | null;
+  endDate?: string | null;
+  isSingleDay: boolean;
+} {
+  const trimmed = String(raw || 'Tháng này').trim();
+  const lower = trimmed.toLowerCase();
+
+  if (lower.includes('đến') || lower.includes(' - ')) {
+    const parts = trimmed.split(/\s*(?:đến| - )\s*/i).map((s) => s.trim());
+    if (parts.length === 2 && /^\d{4}-\d{2}-\d{2}$/.test(parts[0]) && /^\d{4}-\d{2}-\d{2}$/.test(parts[1])) {
+      return {
+        preset: 'custom',
+        startDate: parts[0],
+        endDate: parts[1],
+        isSingleDay: parts[0] === parts[1],
+      };
+    }
+  }
+
+  const map: Record<string, { p: string; single: boolean }> = {
+    'hôm nay': { p: 'today', single: true },
+    today: { p: 'today', single: true },
+    'hôm qua': { p: 'yesterday', single: true },
+    yesterday: { p: 'yesterday', single: true },
+    'tuần này': { p: 'this_week', single: false },
+    this_week: { p: 'this_week', single: false },
+    'tuần trước': { p: 'last_week', single: false },
+    last_week: { p: 'last_week', single: false },
+    'tuần trước nữa': { p: '7_days', single: false },
+    '7 ngày qua': { p: '7_days', single: false },
+    '7_days': { p: '7_days', single: false },
+    '7days': { p: '7_days', single: false },
+    '30 ngày qua': { p: '30_days', single: false },
+    '30_days': { p: '30_days', single: false },
+    '30days': { p: '30_days', single: false },
+    'tháng này': { p: 'this_month', single: false },
+    this_month: { p: 'this_month', single: false },
+    'tháng trước': { p: 'last_month', single: false },
+    last_month: { p: 'last_month', single: false },
+    'tất cả': { p: 'all', single: false },
+    'tất cả thời gian': { p: 'all', single: false },
+    'toàn bộ lịch sử': { p: 'all', single: false },
+    all: { p: 'all', single: false },
+  };
+
+  const hit = map[lower] || { p: 'this_month', single: false };
+  return {
+    preset: hit.p,
+    startDate: null,
+    endDate: null,
+    isSingleDay: hit.single,
+  };
+}
+
+export function buildLegacyDateFilter(raw?: string | null): ParsedLegacyDateRange {
+  const { preset, startDate, endDate, isSingleDay } = normalizeLegacyDatePreset(raw);
+  const resolved = resolveDateBounds(preset, startDate, endDate);
+
+  const prevPresetMap: Record<string, string | null> = {
+    today: 'yesterday',
+    yesterday: null,
+    this_week: 'last_week',
+    this_month: 'last_month',
+    last_month: null,
+    '7_days': null,
+    '30_days': null,
+    all: null,
+    custom: null,
+  };
+  const prevPreset = prevPresetMap[preset];
+  const prevResolved = prevPreset ? resolveDateBounds(prevPreset, null, null) : null;
+
+  return {
+    preset,
+    startDate,
+    endDate,
+    isSingleDay,
+    label: String(raw || 'Tháng này'),
+    bindSql: (col: string, params: unknown[]) =>
+      bindDateParams(resolved.clause, params, resolved).replace(/\bcreated_at\b/g, col),
+    bindPrevSql: (col: string, params: unknown[]) => {
+      if (!prevResolved) return null;
+      return bindDateParams(prevResolved.clause, params, prevResolved).replace(/\bcreated_at\b/g, col);
+    },
+  };
+}
+
+export function formatPctDelta(curr: number, prev: number): string {
+  if (prev === 0) return curr > 0 ? '+100%' : '+0%';
+  const pct = Math.round(((curr - prev) / prev) * 100);
+  return pct >= 0 ? `+${pct}%` : `${pct}%`;
+}
+
+export function formatDateTimeVnSql(isoOrDate?: string | Date | null): string {
+  if (!isoOrDate) return '';
+  const d = isoOrDate instanceof Date ? isoOrDate : new Date(isoOrDate);
+  if (Number.isNaN(d.getTime())) return String(isoOrDate);
+  const shifted = new Date(d.getTime() + 7 * 60 * 60 * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${shifted.getUTCFullYear()}-${p(shifted.getUTCMonth() + 1)}-${p(shifted.getUTCDate())} ${p(
+    shifted.getUTCHours()
+  )}:${p(shifted.getUTCMinutes())}:${p(shifted.getUTCSeconds())}`;
+}
+
+export function mapPgRoleToLegacy(role?: string | null): 'superadmin' | 'admin' | 'assistant' | 'viewer' | 'sale' {
+  if (role === 'tenant_admin' || role === 'superadmin') return 'superadmin';
+  if (role === 'manager' || role === 'admin') return 'admin';
+  if (role === 'assistant' || role === 'viewer') return role;
+  return 'sale';
+}
+
+export function mapPgLeadStatusToLegacy(row: {
+  status?: string | null;
+  is_duplicate_reminder?: boolean | null;
+  is_duplicated?: boolean | null;
+  custom_fields?: Record<string, any> | null;
+}): string {
+  const st = String(row.status || 'assigned');
+  const orig = String(row.custom_fields?.original_status || '').toLowerCase();
+  if (st === 'archived' || orig === 'silent') return 'silent';
+  if (st === 'blacklisted') return 'blacklisted';
+  if (st === 'pending_approval') return 'pending_approval';
+  if (st === 'rejected') return 'rejected';
+  if (row.is_duplicate_reminder || row.is_duplicated || orig === 'duplicate') return 'duplicate';
+  if (st === 'unassigned_pending') return orig === 'pending_work_hours' ? 'pending_work_hours' : 'pending';
+  if (orig === 'compensation' || orig === 'compensated' || row.custom_fields?.is_compensated === true) {
+    return 'compensation';
+  }
+  return 'assigned';
+}
+
+export function mapPgLeadRowToLegacy(
+  row: Record<string, any>,
+  ctx: TenantContext,
+  cfg: TenantSettings
+): Record<string, any> {
+  const cf: Record<string, any> =
+    row.custom_fields && typeof row.custom_fields === 'object' ? row.custom_fields : {};
+  const masked = shouldMaskPiiForActor(ctx, cfg, { is_accepted: Boolean(row.is_accepted) });
+  const phone = masked ? maskPhoneString(row.phone || '', cfg) : row.phone || '';
+  const email =
+    masked && cfg.pii_mask_email && row.email ? maskEmailString(row.email, cfg) : row.email || '';
+
+  const legacyStatus = mapPgLeadStatusToLegacy({
+    status: row.status,
+    is_duplicate_reminder: row.is_duplicate_reminder,
+    is_duplicated: row.is_duplicated,
+    custom_fields: cf,
+  });
+
+  // Deduplicate redundant ad & campaign metadata from custom_fields to minimize payload overhead
+  const prunedCf: Record<string, any> = { ...cf };
+  const redundantAdKeys = [
+    'ad_id', 'ad_name', 'adset_id', 'adset_name', 'campaign_id', 'campaign_name',
+    'ad_platform', 'ad_thumbnail_url', 'ad_image_url', 'ad_creative_title', 'ad_creative_body', 'ad_story_id'
+  ];
+  for (const k of redundantAdKeys) {
+    if (k in prunedCf) {
+      delete prunedCf[k];
+    }
+  }
+
+  const baseId = row.id;
+  return {
+    id: baseId,
+    lead_id: baseId,
+    lead_name: row.name || row.lead_name || 'Khách hàng',
+    name: row.name || row.lead_name || 'Khách hàng',
+    phone,
+    email,
+    source: row.source || 'Webhook',
+    type: cf.type || row.round_name || row.source || 'Manual',
+    note: cf.note || row.quality_note || '',
+    status: legacyStatus,
+    raw_status: row.status,
+    is_accepted: Boolean(row.is_accepted),
+    sla_breached: Boolean(row.sla_breached),
+    assigned_to_id: row.assigned_to || null,
+    assigned_to_name: row.assigned_to_name || row.assigned_sale_name || '-',
+    assigned_to_avatar: row.assigned_to_avatar || null,
+    round_id: row.round_id || null,
+    round_name: row.round_name || '-',
+    stage_id: row.stage_id || null,
+    stage_name: row.stage_name || null,
+    created_at: formatDateTimeVnSql(row.created_at),
+    report_status: row.report_status || null,
+    last_activity_at: formatDateTimeVnSql(row.updated_at || row.created_at),
+    ai_screener_status: row.ai_screener_status || 'not_screened',
+    ai_evaluation: row.ai_evaluation || null,
+    quality_status: row.quality_status || 'Pending',
+    quality_note: row.quality_note || null,
+    quality_updated_at: row.quality_updated_at ? formatDateTimeVnSql(row.quality_updated_at) : null,
+    ad_id: row.ad_id || cf.ad_id || null,
+    ad_name: row.ad_name || cf.ad_name || null,
+    adset_id: row.adset_id || cf.adset_id || null,
+    adset_name: row.adset_name || cf.adset_name || null,
+    campaign_id: row.campaign_id || cf.campaign_id || null,
+    campaign_name: row.campaign_name || row.campaign || cf.campaign_name || null,
+    ad_platform: cf.ad_platform || (row.fbclid || row.ad_id ? 'facebook' : 'web'),
+    ad_thumbnail_url: row.ad_thumbnail_url || cf.ad_thumbnail_url || null,
+    ad_image_url: row.ad_image_url || cf.ad_image_url || null,
+    ad_creative_title: row.ad_creative_title || cf.ad_creative_title || null,
+    ad_creative_body: row.ad_creative_body || cf.ad_creative_body || null,
+    ad_story_id: row.ad_story_id || cf.ad_story_id || null,
+    custom_fields: prunedCf,
+  };
+}
+
+export const DOMATION_PALETTE = [
+  '#1E40FF',
+  '#0284C7',
+  '#06B6D4',
+  '#3B82F6',
+  '#6366F1',
+  '#10B981',
+  '#8B5CF6',
+  '#F59E0B',
+];
+
+export function cleanQueryAction(rawAction: unknown): { action: string; inlineParams: URLSearchParams } {
+  const s = String(rawAction || '').trim();
+  const ampIdx = s.indexOf('&');
+  if (ampIdx === -1) {
+    return { action: s, inlineParams: new URLSearchParams() };
+  }
+  return {
+    action: s.slice(0, ampIdx),
+    inlineParams: new URLSearchParams(s.slice(ampIdx + 1)),
+  };
+}
