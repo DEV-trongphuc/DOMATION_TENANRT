@@ -8,6 +8,7 @@ import {
 } from '../../core/settings/tenant-settings.ts';
 import {
   buildLegacyDateFilter,
+  enrichLeadAssigneeAndRound,
   formatDateTimeVnSql,
   mapPgLeadRowToLegacy,
 } from './legacy-helpers.ts';
@@ -121,7 +122,7 @@ export async function handleLegacyCrm(
   ctx: TenantContext,
   cfg: TenantSettings
 ): Promise<Record<string, any> | null> {
-  if (action === 'get_logs') {
+  if (action === 'get_logs' || action === 'get_leads') {
     const page = Math.max(1, Number(params.get('page') || 1));
     const pageSize = Math.min(250, Math.max(1, Number(params.get('pageSize') || 50)));
     const offset = (page - 1) * pageSize;
@@ -226,6 +227,8 @@ export async function handleLegacyCrm(
         qParams
       ),
     ]);
+
+    await enrichLeadAssigneeAndRound(client, ctx.tenantId, rowsRes.rows);
 
     return {
       success: true,
@@ -733,6 +736,7 @@ export async function handleLegacyCrm(
       ),
     ]);
 
+    await enrichLeadAssigneeAndRound(client, ctx.tenantId, leadsRes.rows);
     const mappedLeads = leadsRes.rows.map((row) => mapPgLeadRowToLegacy(row, ctx, cfg));
     const roundStatsMap = new Map<string, number>();
     for (const l of mappedLeads) {

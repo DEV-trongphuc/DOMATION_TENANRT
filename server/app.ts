@@ -17,6 +17,7 @@ import { workspaceRouter, analyticsRouter } from './routes/workspace.routes.ts';
 import { operationsRouter } from './routes/operations.routes.ts';
 import { publicRouter } from './routes/public.routes.ts';
 import { legacyRouter } from './routes/legacy.routes.ts';
+import { myerpCompatRouter } from './routes/myerp-compat.routes.ts';
 import { mountEcosystemModules } from './modules/index.ts';
 import { ensureRbacScreenColumns, requireAnyPermission, requireTenantAuth, sendApiError } from './core/security/rbac.ts';
 import { getTenantContext } from './core/context/tenant-context.ts';
@@ -36,6 +37,9 @@ export function createApp(): Express {
         'X-Tenant-Slug',
         'X-Webhook-Signature',
         'X-Idempotency-Key',
+        'X-Auth-Token',
+        'X-HTTP-Method-Override',
+        'X-Bypass-Cache',
       ],
     })
   );
@@ -129,6 +133,9 @@ export function createApp(): Express {
   app.use('/api/v1/workspace', workspaceRouter);
   app.use('/api/v1/analytics', analyticsRouter);
   app.use('/api/v1/public', publicRouter);
+
+  // MYERP Compatibility API for the cloned MYERP frontend (bridges onto AutoData PG schema + Wave-2 modules)
+  app.use('/api/v1/myerp', myerpCompatRouter);
 
   // Pluggable Multi-Product SaaS Ecosystem Modules (Org-RBAC, Audiences, + Wave 2 Slots)
   mountEcosystemModules(app);

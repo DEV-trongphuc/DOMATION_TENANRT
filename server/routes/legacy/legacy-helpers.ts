@@ -193,10 +193,10 @@ export function mapPgLeadRowToLegacy(
     is_accepted: Boolean(row.is_accepted),
     sla_breached: Boolean(row.sla_breached),
     assigned_to_id: row.assigned_to || null,
-    assigned_to_name: row.assigned_to_name || row.assigned_sale_name || '-',
+    assigned_to_name: pickCleanName(row.assigned_to_name, row.assigned_sale_name, cf.assigned_to_name, cf.assigned_sale_name, cf.consultant_name, cf.sale_name) || '-',
     assigned_to_avatar: row.assigned_to_avatar || null,
     round_id: row.round_id || null,
-    round_name: row.round_name || '-',
+    round_name: pickCleanName(row.round_name, cf.round_name) || '',
     stage_id: row.stage_id || null,
     stage_name: row.stage_name || null,
     created_at: formatDateTimeVnSql(row.created_at),
@@ -244,4 +244,109 @@ export function cleanQueryAction(rawAction: unknown): { action: string; inlinePa
     action: s.slice(0, ampIdx),
     inlineParams: new URLSearchParams(s.slice(ampIdx + 1)),
   };
+}
+
+/** Returns the first non-empty display name that is not a placeholder (`-`, `—`, `N/A`). */
+export function pickCleanName(...candidates: unknown[]): string {
+  for (const c of candidates) {
+    if (c === null || c === undefined) continue;
+    const s = String(c).trim();
+    if (!s || s === '-' || s === '—' || s === '--' || s.toLowerCase() === 'n/a' || s.toLowerCase() === 'null') continue;
+    return s;
+  }
+  return '';
+}
+
+const LEGACY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolves `assigned_to_name` / `assigned_to_avatar` / `round_name` for raw lead rows whose SQL joins
+ * came back empty (orphaned round_id, round never stamped on the lead, renamed user, imported leads that only
+ * carry names inside `custom_fields`). Batch-loads in at most 3 tenant-scoped queries:
+ *   1. users by `assigned_to` (+ the user's avatar),
+ *   2. rounds by `round_id` / `custom_fields.round_id|preferred_round_id`,
+ *   3. the assignee's primary distribution round (`round_consultants`, active first, by round priority).
+ * Mutates and returns the same rows so callers can keep passing them to `mapPgLeadRowToLegacy`.
+ */
+import type { DbClient } from '../../core/database/db-adapter.ts';
+
+export async function enrichLeadAssigneeAndRound<T extends Record<string, any>>(
+  client: DbClient,
+  tenantId: string,
+  rows: T[]
+): Promise<T[]> {
+  if (!rows.length) return rows;
+  const cfOf = (r: Record<string, any>): Record<string, any> =>
+    r.custom_fields && typeof r.custom_fields === 'object' ? r.custom_fields : {};
+
+  const needUser = new Set<string>();
+  const needRoundById = new Set<string>();
+  const needRoundByUser = new Set<string>();
+
+  for (const r of rows) {
+    const cf = cfOf(r);
+    const assignee = LEGACY_UUID_RE.test(String(r.assigned_to || '')) ? String(r.assigned_to) : '';
+    if (assignee && (!pickCleanName(r.assigned_to_name) || !r.assigned_to_avatar)) needUser.add(assignee);
+    if (!pickCleanName(r.round_name)) {
+      const rid = [r.round_id, cf.round_id, cf.preferred_round_id].map((v) => String(v || '')).find((v) => LEGACY_UUID_RE.test(v));
+      if (rid) needRoundById.add(rid);
+      if (assignee) needRoundByUser.add(assignee);
+    }
+  }
+
+  const ph = (arr: string[], offset = 2) => arr.map((_, i) => `$${i + offset}`).join(', ');
+  const userMap = new Map<string, { full_name: string; email: string; avatar_url: string | null }>();
+  const roundMap = new Map<string, string>();
+  const userRoundMap = new Map<string, string>();
+
+  try {
+    if (needUser.size) {
+      const ids = [...needUser];
+      const res = await client.query<{ id: string; full_name: string; email: string; avatar_url: string | null }>(
+        `SELECT id, full_name, email, avatar_url FROM users WHERE tenant_id = $1 AND id IN (${ph(ids)})`,
+        [tenantId, ...ids]
+      );
+      for (const u of res.rows) userMap.set(String(u.id), u);
+    }
+    if (needRoundById.size) {
+      const ids = [...needRoundById];
+      const res = await client.query<{ id: string; name: string }>(
+        `SELECT id, name FROM distribution_rounds WHERE tenant_id = $1 AND id IN (${ph(ids)})`,
+        [tenantId, ...ids]
+      );
+      for (const rr of res.rows) roundMap.set(String(rr.id), String(rr.name || ''));
+    }
+    if (needRoundByUser.size) {
+      const ids = [...needRoundByUser];
+      const res = await client.query<{ user_id: string; name: string }>(
+        `SELECT rc.user_id, dr.name
+         FROM round_consultants rc
+         INNER JOIN distribution_rounds dr ON dr.tenant_id = rc.tenant_id AND dr.id = rc.round_id
+         WHERE rc.tenant_id = $1 AND rc.user_id IN (${ph(ids)})
+         ORDER BY rc.is_active DESC, dr.is_active DESC, dr.priority ASC, dr.created_at ASC`,
+        [tenantId, ...ids]
+      );
+      for (const rr of res.rows) {
+        const key = String(rr.user_id);
+        if (!userRoundMap.has(key) && pickCleanName(rr.name)) userRoundMap.set(key, String(rr.name));
+      }
+    }
+  } catch {
+    // Enrichment is best-effort telemetry polish; never fail the parent request.
+  }
+
+  for (const r of rows as Array<Record<string, any>>) {
+    const cf = cfOf(r);
+    const assignee = String(r.assigned_to || '');
+    const u = userMap.get(assignee);
+    r.assigned_to_name =
+      pickCleanName(r.assigned_to_name, u?.full_name, cf.assigned_to_name, cf.assigned_sale_name, cf.consultant_name, cf.sale_name, u?.email ? String(u.email).split('@')[0] : '') ||
+      null;
+    if (!r.assigned_to_avatar && u?.avatar_url) r.assigned_to_avatar = u.avatar_url;
+    if (!pickCleanName(r.round_name)) {
+      const rid = [r.round_id, cf.round_id, cf.preferred_round_id].map((v) => String(v || '')).find((v) => roundMap.has(v));
+      r.round_name = pickCleanName(rid ? roundMap.get(rid) : '', cf.round_name, userRoundMap.get(assignee)) || null;
+    }
+  }
+  return rows;
 }
