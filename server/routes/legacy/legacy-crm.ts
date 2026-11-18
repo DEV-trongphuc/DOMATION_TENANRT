@@ -680,14 +680,16 @@ export async function handleLegacyCrm(
   }
 
   if (action === 'get_sale_portal_data') {
+    const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     const search = String(params.get('search') || '').trim();
     const roundId = String(params.get('round_id') || '').trim();
     const saleIdParam = String(params.get('sale_id') || '').trim();
-    const targetUserId = ctx.userRole !== 'sale' && saleIdParam ? saleIdParam : ctx.userId;
+    const targetUserId =
+      ctx.userRole !== 'sale' && saleIdParam && isUuid(saleIdParam) ? saleIdParam : ctx.userId;
 
     const qParams: unknown[] = [ctx.tenantId, targetUserId];
     let extraWhere = '';
-    if (roundId && roundId !== 'all') {
+    if (roundId && roundId !== 'all' && isUuid(roundId)) {
       qParams.push(roundId);
       extraWhere += ` AND l.round_id = $${qParams.length}`;
     }
@@ -747,26 +749,40 @@ export async function handleLegacyCrm(
     const tMeta = await getTenantMetaCached(ctx.tenantId, client);
     const configuredBotLink = String(tMeta?.rawSettings?.zalo_bot_link || '').trim() || 'https://zalo.me/';
 
+    const hourlyCounts = Array(24).fill(0);
+    for (const l of mappedLeads) {
+      const hr = new Date(l.received_at || l.created_at || Date.now()).getHours();
+      if (hr >= 0 && hr < 24) hourlyCounts[hr]++;
+    }
+
+    const portalPayload = {
+      leads: mappedLeads,
+      consultant_profile: profRes.rows[0] || null,
+      consultant_managers: mgrsRes.rows,
+      rounds: roundsRes.rows,
+      consultants: consRes.rows,
+      is_allowed_to_report: true,
+      max_co_managers_per_consultant: cfg.max_co_managers_per_consultant,
+      duplicate_check_months: Math.max(1, Math.round((cfg.duplicate_threshold_days || 180) / 30)),
+      zalo_bot_link: configuredBotLink,
+      stats: {
+        total: mappedLeads.length,
+        total_received: mappedLeads.length,
+        accepted: mappedLeads.filter((l) => l.is_accepted).length,
+        pending: mappedLeads.filter((l) => !l.is_accepted).length,
+        tickets_total: 0,
+        tickets_approved: 0,
+        tickets_rejected: 0,
+        tickets_pending: 0,
+      },
+      by_round: Array.from(roundStatsMap.entries()).map(([round_name, count]) => ({ round_name, count })),
+      by_hour: hourlyCounts,
+    };
+
     return {
       success: true,
-      data: {
-        leads: mappedLeads,
-        consultant_profile: profRes.rows[0] || null,
-        consultant_managers: mgrsRes.rows,
-        rounds: roundsRes.rows,
-        consultants: consRes.rows,
-        is_allowed_to_report: true,
-        max_co_managers_per_consultant: cfg.max_co_managers_per_consultant,
-        duplicate_check_months: Math.max(1, Math.round((cfg.duplicate_threshold_days || 180) / 30)),
-        zalo_bot_link: configuredBotLink,
-        stats: {
-          total: mappedLeads.length,
-          accepted: mappedLeads.filter((l) => l.is_accepted).length,
-          pending: mappedLeads.filter((l) => !l.is_accepted).length,
-        },
-        by_round: Array.from(roundStatsMap.entries()).map(([round_name, count]) => ({ round_name, count })),
-        by_hour: [],
-      },
+      ...portalPayload,
+      data: portalPayload,
     };
   }
 

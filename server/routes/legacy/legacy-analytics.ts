@@ -948,15 +948,18 @@ export async function handleLegacyAnalytics(
   }
 
   if (action === 'get_calendar_stats') {
+    const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     const year = Number(params.get('year') || new Date().getFullYear());
     const month = Number(params.get('month') || new Date().getMonth() + 1);
-    const consultant = params.get('consultant') || 'all';
+    const consultant = String(params.get('consultant') || 'all').trim();
+    const userIdParam = String(params.get('user_id') || '').trim();
     const monthStart = zonedWallClockToUtc(year, month, 1, 0, 0, 0, tenantTz);
     const nextMonthStart = zonedWallClockToUtc(year, month + 1, 1, 0, 0, 0, tenantTz);
     const qParams: unknown[] = [ctx.tenantId, monthStart, nextMonthStart];
     let cClause = '';
-    if (consultant && consultant !== 'all') {
-      qParams.push(consultant);
+    const filterUid = isUuid(userIdParam) ? userIdParam : (isUuid(consultant) ? consultant : '');
+    if (filterUid && consultant !== 'all') {
+      qParams.push(filterUid);
       cClause = `AND assigned_to = $${qParams.length}`;
     } else if (ctx.userRole === 'sale') {
       qParams.push(ctx.userId);
@@ -970,12 +973,15 @@ export async function handleLegacyAnalytics(
          ${cClause}`,
       qParams
     );
-    const daysMap: Record<string, { total: number; assigned: number; booked: number }> = {};
+    const daysMap: Record<string, { total: number; distributed: number; blacklist: number; reminder: number; error: number; ticket_total: number; assigned: number; booked: number }> = {};
     for (const row of r.rows) {
       const zp = getZonedDateParts(row.created_at, tenantTz);
       if (!zp) continue;
-      if (!daysMap[zp.ymd]) daysMap[zp.ymd] = { total: 0, assigned: 0, booked: 0 };
+      if (!daysMap[zp.ymd]) {
+        daysMap[zp.ymd] = { total: 0, distributed: 0, blacklist: 0, reminder: 0, error: 0, ticket_total: 0, assigned: 0, booked: 0 };
+      }
       daysMap[zp.ymd].total++;
+      daysMap[zp.ymd].distributed++;
       if (row.status === 'assigned') daysMap[zp.ymd].assigned++;
       if (row.quality_status === 'Booked') daysMap[zp.ymd].booked++;
     }
@@ -983,16 +989,19 @@ export async function handleLegacyAnalytics(
   }
 
   if (action === 'get_calendar_day_details') {
+    const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     const dateStr = params.get('date') || '';
-    const consultant = params.get('consultant') || 'all';
+    const consultant = String(params.get('consultant') || 'all').trim();
+    const userIdParam = String(params.get('user_id') || '').trim();
     const dMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
-    if (!dMatch) return { success: true, data: [] };
+    if (!dMatch) return { success: true, data: { sales: [], tickets: [], items: [] } };
     const dayStart = zonedWallClockToUtc(Number(dMatch[1]), Number(dMatch[2]), Number(dMatch[3]), 0, 0, 0, tenantTz);
     const dayEnd = zonedWallClockToUtc(Number(dMatch[1]), Number(dMatch[2]), Number(dMatch[3]) + 1, 0, 0, 0, tenantTz);
     const qParams: unknown[] = [ctx.tenantId, dayStart, dayEnd];
     let cClause = '';
-    if (consultant && consultant !== 'all') {
-      qParams.push(consultant);
+    const filterUid = isUuid(userIdParam) ? userIdParam : (isUuid(consultant) ? consultant : '');
+    if (filterUid && consultant !== 'all') {
+      qParams.push(filterUid);
       cClause = `AND l.assigned_to = $${qParams.length}`;
     } else if (ctx.userRole === 'sale') {
       qParams.push(ctx.userId);
@@ -1011,9 +1020,14 @@ export async function handleLegacyAnalytics(
        LIMIT 100`,
       qParams
     );
+    const mapped = r.rows.map((row) => mapPgLeadRowToLegacy(row, ctx, cfg));
     return {
       success: true,
-      data: r.rows.map((row) => mapPgLeadRowToLegacy(row, ctx, cfg)),
+      data: {
+        sales: mapped,
+        tickets: [],
+        items: mapped,
+      },
     };
   }
 
