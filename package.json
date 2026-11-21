@@ -1,6 +1,7 @@
 {
   "name": "auto-data-multi-tenant",
   "private": true,
+  "license": "UNLICENSED",
   "version": "1.0.0",
   "description": "Auto Data Multi-Tenant (SaaS) Platform - Enterprise Lead Distribution, Dynamic CRM Pipeline, ZaloBot & Meta CAPI v21.0",
   "type": "module",
@@ -45,6 +46,8 @@
     "autoprefixer": "^10.4.21",
     "concurrently": "^9.1.2",
     "postcss": "^8.5.3",
+    "puppeteer": "^25.18.1",
+    "puppeteer-core": "^25.18.1",
     "tailwindcss": "^3.4.19",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"

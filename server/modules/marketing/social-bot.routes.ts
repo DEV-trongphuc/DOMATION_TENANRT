@@ -9,9 +9,17 @@ import {
   requirePermission,
   sendApiError,
 } from '../../core/security/rbac.ts';
-import { maskContactPiiIfDisallowed } from '../../core/security/pii-masker.ts';
+import { maskContactPiiIfDisallowed, sanitizeAvatarUrl } from '../../core/security/pii-masker.ts';
+import { decryptTenantSecret, encryptTenantSecret } from '../../core/crypto/vault.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import { emitDomainEvent } from '../../core/events/event-bus.ts';
 import { runUnassignedLeadDrainer } from '../../cron/subroutines/lead-drainer.ts';
+import { dispatchZnsNotification } from './dispatchers.ts';
+import { normalizePhoneE164 } from '../../services/phone.service.ts';
+import {
+  extractMetaPageConfigs,
+  sendMetaMessengerMessage,
+} from '../../services/meta-messenger.service.ts';
 import {
   promoteLeadsToSaleRoundInTx,
   refreshAudienceCachedCount,
@@ -19,13 +27,161 @@ import {
 } from '../audiences/audiences.service.ts';
 import {
   canUserUnmaskMarketingPii,
+  getSuppressionMatchKeys,
   parseJsonCol,
   readTenantChannelVault,
 } from './utils.ts';
 
 export const socialBotRouter = Router();
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 socialBotRouter.use(requireEntitlement('mkt_social_bot'));
+
+export interface ConversationHandoffState {
+  assigned_agent_id: string | null;
+  assigned_agent_name: string | null;
+  handoff_reason: string | null;
+  handoff_at: string | null;
+  channel?: string;
+}
+
+async function readHandoffStateMap(
+  client: DbClient,
+  tenantId: string
+): Promise<Record<string, ConversationHandoffState>> {
+  const r = await client.query<{ settings: Record<string, unknown> }>(
+    'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+    [tenantId]
+  );
+  const raw = r.rows[0]?.settings?.social_handoff_state;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return { ...(raw as Record<string, ConversationHandoffState>) };
+  }
+  return {};
+}
+
+async function writeConversationHandoffState(
+  client: DbClient,
+  tenantId: string,
+  conversationId: string,
+  state: ConversationHandoffState | null
+): Promise<ConversationHandoffState> {
+  const map = await readHandoffStateMap(client, tenantId);
+  if (state === null) {
+    delete map[conversationId];
+  } else {
+    map[conversationId] = state;
+    // Keep map bounded to latest 500 entries
+    const keys = Object.keys(map);
+    if (keys.length > 500) {
+      for (const k of keys.slice(0, keys.length - 500)) {
+        delete map[k];
+      }
+    }
+  }
+  await client.query(
+    `UPDATE tenants
+     SET settings = COALESCE(settings, '{}'::jsonb) || $2::jsonb,
+         updated_at = clock_timestamp()
+     WHERE id = $1`,
+    [tenantId, JSON.stringify({ social_handoff_state: map })]
+  );
+  return (
+    state || {
+      assigned_agent_id: null,
+      assigned_agent_name: null,
+      handoff_reason: null,
+      handoff_at: null,
+    }
+  );
+}
+
+function hydrateConversationHandoff<T extends Record<string, unknown>>(
+  row: T,
+  handoffMap: Record<string, ConversationHandoffState>
+): T & ConversationHandoffState {
+  const cid = String(row.id || '');
+  const st = handoffMap[cid];
+  const paused = Boolean(row.bot_paused);
+  return {
+    ...row,
+    bot_paused: paused,
+    assigned_agent_id: paused ? (st?.assigned_agent_id ?? null) : null,
+    assigned_agent_name: paused ? (st?.assigned_agent_name ?? null) : null,
+    handoff_reason: paused ? (st?.handoff_reason ?? null) : null,
+    handoff_at: paused ? (st?.handoff_at ?? null) : null,
+  };
+}
+
+// Track recently processed webhook event IDs per tenant+conversation to prevent duplicate auto-replies
+const RECENT_WEBHOOK_EVENTS = new Map<string, number>();
+function isDuplicateWebhookEvent(key: string): boolean {
+  const now = Date.now();
+  // Prune stale entries > 5 minutes
+  if (RECENT_WEBHOOK_EVENTS.size > 2000) {
+    for (const [k, ts] of RECENT_WEBHOOK_EVENTS.entries()) {
+      if (now - ts > 300_000) RECENT_WEBHOOK_EVENTS.delete(k);
+    }
+  }
+  const prev = RECENT_WEBHOOK_EVENTS.get(key);
+  if (prev && now - prev < 300_000) return true;
+  RECENT_WEBHOOK_EVENTS.set(key, now);
+  return false;
+}
+
+async function detectScenarioConflicts(
+  client: DbClient,
+  tenantId: string,
+  candidate: { id?: string; channel: string; triggerType: string; keywords: string[]; isActive: boolean }
+): Promise<Array<{ scenario_id: string; scenario_name: string; reason: string }>> {
+  if (!candidate.isActive) return [];
+  const res = await client.query<{
+    id: string;
+    name: string;
+    channel: string;
+    trigger_type: string;
+    keywords_json: unknown;
+  }>(
+    `SELECT id, name, channel, trigger_type, keywords_json
+     FROM mkt_automation_scenarios
+     WHERE tenant_id = $1 AND is_active = true`,
+    [tenantId]
+  );
+  const warnings: Array<{ scenario_id: string; scenario_name: string; reason: string }> = [];
+  const candKws = new Set(candidate.keywords.map((k) => k.trim().toLowerCase()).filter(Boolean));
+  const singletonTriggers = new Set(['welcome', 'ai_reply', 'holiday', 'after_hours', 'default_fallback']);
+
+  for (const row of res.rows) {
+    if (candidate.id && String(row.id) === String(candidate.id)) continue;
+    const channelOverlap =
+      row.channel === candidate.channel ||
+      row.channel === 'omnichannel' ||
+      candidate.channel === 'omnichannel';
+    if (!channelOverlap) continue;
+
+    if (singletonTriggers.has(candidate.triggerType) && row.trigger_type === candidate.triggerType) {
+      warnings.push({
+        scenario_id: String(row.id),
+        scenario_name: String(row.name),
+        reason: `Trùng loại kịch bản "${candidate.triggerType}" trên kênh ${row.channel}.`,
+      });
+    } else if (candidate.triggerType === 'keyword' && row.trigger_type === 'keyword' && candKws.size > 0) {
+      const existingKws = parseJsonCol<string[]>(row.keywords_json, [])
+        .map((k) => String(k || '').trim().toLowerCase())
+        .filter(Boolean);
+      const overlap = existingKws.filter((k) => candKws.has(k));
+      if (overlap.length > 0) {
+        warnings.push({
+          scenario_id: String(row.id),
+          scenario_name: String(row.name),
+          reason: `Trùng từ khóa (${overlap.join(', ')}) trên kênh ${row.channel}.`,
+        });
+      }
+    }
+  }
+  return warnings;
+}
 
 export interface FaqRuleItemDto {
   id: string;
@@ -68,23 +224,46 @@ export function generateBotReplyFromRag(
     }
   }
 
-  if (Array.isArray(trainingDocs)) {
-    const tokens = lower
-      .split(/\s+/)
-      .map((w) => w.replace(/[^a-zA-Z0-9à-ỹ]/gi, ''))
-      .filter((w) => w.length >= 4);
+  if (Array.isArray(trainingDocs) && trainingDocs.length > 0) {
+    const tokens = Array.from(
+      new Set(
+        lower
+          .split(/[\s,.;:!?()[\]{}"'\/\\]+/)
+          .map((w) => w.replace(/[^\p{L}\p{N}]/gu, ''))
+          .filter((w) => w.length >= 2)
+      )
+    );
+
+    let bestDoc: { title: string; bodyText: string; score: number } | null = null;
     for (const doc of trainingDocs) {
       const titleLower = String(doc.title || '').toLowerCase();
       const bodyText = String(doc.content_text || '').trim();
       if (!bodyText) continue;
       const bodyLower = bodyText.toLowerCase();
-      const matchedTokens = tokens.filter((tk) => titleLower.includes(tk) || bodyLower.includes(tk));
-      if (matchedTokens.length >= 2 || (titleLower && lower.includes(titleLower))) {
-        return {
-          reply: bodyText.slice(0, 420),
-          matchedQuestion: String(doc.title || 'Knowledge Doc'),
-        };
+
+      const titleHits = tokens.filter((tk) => titleLower.includes(tk)).length;
+      const bodyHits = tokens.filter((tk) => bodyLower.includes(tk)).length;
+      const combinedHits = tokens.filter((tk) => titleLower.includes(tk) || bodyLower.includes(tk)).length;
+      const fullTitleMatch = Boolean(titleLower && lower.includes(titleLower));
+
+      const threshold = tokens.length <= 3 || titleHits > 0 ? 1 : 2;
+      if (fullTitleMatch || combinedHits >= threshold) {
+        const score = (fullTitleMatch ? 10 : 0) + titleHits * 3 + bodyHits * 2 + combinedHits;
+        if (!bestDoc || score > bestDoc.score) {
+          bestDoc = {
+            title: String(doc.title || 'Knowledge Doc'),
+            bodyText,
+            score,
+          };
+        }
       }
+    }
+
+    if (bestDoc) {
+      return {
+        reply: bestDoc.bodyText.slice(0, 420),
+        matchedQuestion: bestDoc.title,
+      };
     }
   }
 
@@ -99,6 +278,101 @@ export function generateBotReplyFromRag(
   return {
     reply: `${personaPrefix}Xin chào! Mình là ${botName}. Bạn vui lòng cho mình biết nhu cầu chi tiết hoặc để lại Số điện thoại / Email để đội ngũ gửi báo giá & ưu đãi phù hợp nhất nhé!`,
     matchedQuestion: null,
+  };
+}
+
+export async function resolveBotReplyInTx(
+  client: DbClient,
+  tenantId: string,
+  channel: string,
+  messageText: string,
+  botCfg: {
+    bot_name: string;
+    brand_persona: string;
+    faq_rules: FaqRuleItemDto[];
+  },
+  extracted: { phone: string | null; email: string | null }
+): Promise<{ reply: string; matchedQuestion: string | null; scenarioId: string | null }> {
+  const lower = String(messageText || '').toLowerCase();
+
+  // 1. Evaluate active keyword scenarios (`mkt_automation_scenarios`) matching channel or omnichannel
+  const scenRes = await client.query<{
+    id: string;
+    name: string;
+    keywords_json: unknown;
+    nodes_json: unknown;
+  }>(
+    `SELECT id, name, keywords_json, nodes_json
+     FROM mkt_automation_scenarios
+     WHERE tenant_id = $1 AND is_active = true AND trigger_type = 'keyword'
+       AND channel IN ($2, 'omnichannel')
+     ORDER BY updated_at DESC
+     LIMIT 50`,
+    [tenantId, channel]
+  );
+
+  for (const scen of scenRes.rows) {
+    const kws = parseJsonCol<string[]>(scen.keywords_json, []);
+    const matched = kws.some((k) => {
+      const kw = String(k || '').trim().toLowerCase();
+      return kw.length > 0 && lower.includes(kw);
+    });
+    if (!matched) continue;
+
+    await client.query(
+      `UPDATE mkt_automation_scenarios
+       SET matched_count = matched_count + 1, updated_at = clock_timestamp()
+       WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, scen.id]
+    );
+
+    const nodes = parseJsonCol<Array<Record<string, unknown>>>(scen.nodes_json, []);
+    let scenarioReply = '';
+    for (const node of nodes) {
+      const cfg = (node.config && typeof node.config === 'object' ? node.config : node.data) as
+        | Record<string, unknown>
+        | undefined;
+      const candidate = String(
+        cfg?.message || cfg?.text || cfg?.reply || cfg?.content || node.content || node.message || ''
+      ).trim();
+      if (candidate) {
+        scenarioReply = candidate;
+        break;
+      }
+    }
+
+    if (scenarioReply) {
+      return {
+        reply: scenarioReply,
+        matchedQuestion: `scenario:${String(scen.name)}`,
+        scenarioId: String(scen.id),
+      };
+    }
+  }
+
+  // 2. Query indexed/trained RAG knowledge docs (`mkt_ai_training_docs`)
+  const docsRes = await client.query<{ title: string; content_text: string }>(
+    `SELECT title, content_text
+     FROM mkt_ai_training_docs
+     WHERE tenant_id = $1 AND status IN ('indexed', 'trained')
+     ORDER BY updated_at DESC
+     LIMIT 50`,
+    [tenantId]
+  );
+
+  const rag = generateBotReplyFromRag(
+    messageText,
+    botCfg.bot_name,
+    botCfg.brand_persona,
+    botCfg.faq_rules,
+    extracted,
+    docsRes.rows
+  );
+
+  return {
+    reply: rag.reply,
+    matchedQuestion: rag.matchedQuestion,
+    scenarioId: null,
   };
 }
 
@@ -179,7 +453,7 @@ socialBotRouter.get('/', requirePermission('mkt_social_bot', 'view'), async (req
       }
       convSql += ` ORDER BY c.last_message_at DESC LIMIT 100`;
 
-      const [convRes, audRes, roundsRes, zaloVault, metaVault] = await Promise.all([
+      const [convRes, audRes, roundsRes, zaloVault, metaVault, handoffMap] = await Promise.all([
         client.query(convSql, convParams),
         client.query(
           'SELECT id, name, audience_type FROM tenant_audiences WHERE tenant_id = $1 AND is_active = true ORDER BY name ASC',
@@ -190,7 +464,8 @@ socialBotRouter.get('/', requirePermission('mkt_social_bot', 'view'), async (req
           [ctx.tenantId]
         ),
         readTenantChannelVault(client, ctx.tenantId, ['zalo_oa', 'zalo_zns', 'zalo_bot']),
-        readTenantChannelVault(client, ctx.tenantId, ['facebook_ads', 'meta_capi']),
+        readTenantChannelVault(client, ctx.tenantId, ['meta_messenger', 'facebook_ads', 'meta_capi']),
+        readHandoffStateMap(client, ctx.tenantId),
       ]);
 
       const conversations = convRes.rows.map((row) => {
@@ -203,11 +478,15 @@ socialBotRouter.get('/', requirePermission('mkt_social_bot', 'view'), async (req
           canUnmask,
           cfg
         );
-        return {
-          ...row,
-          extracted_phone: masked.phone,
-          extracted_email: masked.email,
-        };
+        return hydrateConversationHandoff(
+          {
+            ...row,
+            customer_avatar: sanitizeAvatarUrl(row.customer_avatar),
+            extracted_phone: masked.phone,
+            extracted_email: masked.email,
+          },
+          handoffMap
+        );
       });
 
       return {
@@ -310,38 +589,201 @@ socialBotRouter.put('/bot-config', requirePermission('mkt_social_bot', 'edit'), 
   }
 });
 
+function maskSecretValue(val?: string | null): string {
+  const s = String(val || '').trim();
+  if (!s) return '';
+  if (s.length <= 8) return '••••••••';
+  return `${s.slice(0, 4)}••••${s.slice(-4)}`;
+}
+
+socialBotRouter.get('/messenger-config', requirePermission('mkt_social_bot', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const data = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const vault = await readTenantChannelVault(client, ctx.tenantId, ['meta_messenger', 'facebook_ads', 'meta_capi']);
+      const pages = extractMetaPageConfigs(vault.config).map((p) => ({
+        page_id: p.page_id,
+        page_name: p.page_name || '',
+        app_id: p.app_id || '',
+        page_access_token_masked: maskSecretValue(p.page_access_token),
+        has_page_access_token: Boolean(p.page_access_token),
+        app_secret_masked: maskSecretValue(p.app_secret),
+        has_app_secret: Boolean(p.app_secret),
+        verify_token_masked: maskSecretValue(p.verify_token),
+        has_verify_token: Boolean(p.verify_token),
+        status: p.status || 'active',
+        mode: p.mode || 'live',
+      }));
+      return {
+        configured: vault.configured,
+        provider: vault.integrationType || 'meta_messenger',
+        status: vault.status,
+        pages,
+      };
+    });
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'GET_MESSENGER_CONFIG_FAILED', err?.message || 'Không thể tải cấu hình Meta Messenger.');
+  }
+});
+
+socialBotRouter.put('/messenger-config', requirePermission('mkt_social_bot', 'edit'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const bodyObj = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const rawPages = Array.isArray(bodyObj.pages)
+      ? (bodyObj.pages as Array<Record<string, unknown>>)
+      : bodyObj.page_id
+        ? [bodyObj]
+        : [];
+
+    if (rawPages.length === 0) {
+      sendApiError(res, 422, 'MESSENGER_PAGES_REQUIRED', 'Vui lòng cung cấp ít nhất 1 Facebook Page để cấu hình.');
+      return;
+    }
+
+    const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const existingRow = await client.query<{
+        config_encrypted: string;
+        iv: string;
+        auth_tag: string;
+      }>(
+        `SELECT config_encrypted, iv, auth_tag
+         FROM tenant_integrations
+         WHERE tenant_id = $1 AND integration_type = 'meta_messenger'
+         LIMIT 1`,
+        [ctx.tenantId]
+      );
+      let prevDecrypted: Record<string, unknown> = {};
+      if (existingRow.rows[0]) {
+        try {
+          prevDecrypted = decryptTenantSecret<Record<string, unknown>>(
+            ctx.tenantId,
+            existingRow.rows[0].config_encrypted,
+            existingRow.rows[0].iv,
+            existingRow.rows[0].auth_tag
+          );
+        } catch {
+          prevDecrypted = {};
+        }
+      }
+      const prevPages = extractMetaPageConfigs(prevDecrypted);
+      const isPlaceholder = (v: unknown): boolean => {
+        if (typeof v !== 'string') return false;
+        const trimmed = v.trim();
+        return trimmed === '' || trimmed === '__KEEP_EXISTING__' || trimmed.includes('••••') || trimmed.includes('***');
+      };
+
+      const normalizedPages = rawPages
+        .map((raw) => {
+          const pageId = String(raw.page_id || raw.id || '').trim();
+          if (!pageId) return null;
+          const prev = prevPages.find((p) => p.page_id === pageId);
+          const nextToken = isPlaceholder(raw.page_access_token)
+            ? prev?.page_access_token || ''
+            : String(raw.page_access_token || '').trim();
+          const nextSecret = isPlaceholder(raw.app_secret)
+            ? prev?.app_secret || ''
+            : String(raw.app_secret || '').trim();
+          const nextVerify = isPlaceholder(raw.verify_token)
+            ? prev?.verify_token || ''
+            : String(raw.verify_token || '').trim();
+          return {
+            page_id: pageId,
+            page_name: String(raw.page_name || prev?.page_name || `Page ${pageId}`).trim(),
+            app_id: String(raw.app_id ?? prev?.app_id ?? '').trim(),
+            page_access_token: nextToken,
+            app_secret: nextSecret,
+            verify_token: nextVerify,
+            status: String(raw.status || prev?.status || 'active').trim(),
+            mode: String(raw.mode || prev?.mode || 'live').trim(),
+          };
+        })
+        .filter((p): p is NonNullable<typeof p> => Boolean(p));
+
+      if (normalizedPages.length === 0) {
+        return null;
+      }
+
+      const payload = {
+        pages: normalizedPages,
+        page_id: normalizedPages[0].page_id,
+        page_access_token: normalizedPages[0].page_access_token,
+        app_secret: normalizedPages[0].app_secret,
+        verify_token: normalizedPages[0].verify_token,
+      };
+      const encrypted = encryptTenantSecret(ctx.tenantId, payload);
+
+      await client.query(
+        `INSERT INTO tenant_integrations (
+           tenant_id, integration_type, config_encrypted, iv, auth_tag, status, last_synced_at
+         ) VALUES ($1, 'meta_messenger', $2, $3, $4, 'active', clock_timestamp())
+         ON CONFLICT (tenant_id, integration_type) DO UPDATE SET
+           config_encrypted = EXCLUDED.config_encrypted,
+           iv = EXCLUDED.iv,
+           auth_tag = EXCLUDED.auth_tag,
+           status = 'active',
+           last_synced_at = clock_timestamp()`,
+        [ctx.tenantId, encrypted.configEncrypted, encrypted.iv, encrypted.authTag]
+      );
+
+      return normalizedPages.map((p) => ({
+        page_id: p.page_id,
+        page_name: p.page_name,
+        app_id: p.app_id,
+        page_access_token_masked: maskSecretValue(p.page_access_token),
+        has_page_access_token: Boolean(p.page_access_token),
+        app_secret_masked: maskSecretValue(p.app_secret),
+        has_app_secret: Boolean(p.app_secret),
+        verify_token_masked: maskSecretValue(p.verify_token),
+        has_verify_token: Boolean(p.verify_token),
+        status: p.status,
+        mode: p.mode,
+      }));
+    });
+
+    if (!saved) {
+      sendApiError(res, 422, 'INVALID_MESSENGER_PAGES', 'Thiếu page_id hợp lệ trong cấu hình Meta Messenger.');
+      return;
+    }
+
+    tenantRedis.invalidateTenantIntegrations(ctx.tenantId, 'meta_messenger');
+    res.json({
+      success: true,
+      data: {
+        configured: true,
+        provider: 'meta_messenger',
+        pages: saved,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'SAVE_MESSENGER_CONFIG_FAILED', err?.message || 'Không thể lưu cấu hình Meta Messenger.');
+  }
+});
+
 // Test AI Bot Studio Reply & Phone/Email Extraction
 socialBotRouter.post('/bot-test', requirePermission('mkt_social_bot', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
     const message = String(req.body?.message || '').trim();
+    const channel = ['messenger', 'zalo_oa', 'web_chat'].includes(String(req.body?.channel || ''))
+      ? String(req.body.channel)
+      : 'web_chat';
     if (!message) {
       sendApiError(res, 422, 'MESSAGE_REQUIRED', 'Vui lòng nhập tin nhắn khách hàng để kiểm thử AI Bot.');
       return;
     }
 
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const [botRow, docsRes] = await Promise.all([
-        getOrCreateTenantBotConfig(client, ctx.tenantId),
-        client.query(
-          "SELECT title, content_text FROM mkt_ai_training_docs WHERE tenant_id = $1 AND status = 'indexed' ORDER BY updated_at DESC LIMIT 50",
-          [ctx.tenantId]
-        ),
-      ]);
+      const botRow = await getOrCreateTenantBotConfig(client, ctx.tenantId);
       const botCfg = mapBotConfig(botRow);
       const extracted = extractContactEntitiesFromText(message);
-      const rag = generateBotReplyFromRag(
-        message,
-        botCfg.bot_name,
-        botCfg.brand_persona,
-        botCfg.faq_rules,
-        extracted,
-        docsRes.rows
-      );
+      const rag = await resolveBotReplyInTx(client, ctx.tenantId, channel, message, botCfg, extracted);
       return {
         bot_name: botCfg.bot_name,
         extracted_entities: extracted,
         matched_question: rag.matchedQuestion,
+        scenario_id: rag.scenarioId,
         reply: rag.reply,
       };
     });
@@ -414,8 +856,9 @@ socialBotRouter.get('/conversations/:id', requirePermission('mkt_social_bot', 'v
         timeline = tlRes.rows;
       }
 
+      const handoffMap = await readHandoffStateMap(client, ctx.tenantId);
       return {
-        conversation: conv,
+        conversation: hydrateConversationHandoff(conv, handoffMap),
         messages: msgsRes.rows.map((m) => ({
           ...m,
           extracted_entities: parseJsonCol(m.extracted_entities, {}),
@@ -455,6 +898,7 @@ socialBotRouter.post('/conversations', requirePermission('mkt_social_bot', 'crea
     }
 
     let drainAfterCommit = false;
+    let enteredAudienceId: string | null = null;
     const out = await withTenantTransaction(ctx.tenantId, async (client) => {
       const botRow = await getOrCreateTenantBotConfig(client, ctx.tenantId);
       const botCfg = mapBotConfig(botRow);
@@ -490,6 +934,30 @@ socialBotRouter.post('/conversations', requirePermission('mkt_social_bot', 'crea
         [ctx.tenantId, channel, externalThreadId]
       );
       const conv = convRes.rows[0];
+      const webhookEventId = String(req.body?.webhook_event_id || req.body?.external_message_id || '').trim();
+      const duplicateWebhook =
+        webhookEventId !== '' &&
+        isDuplicateWebhookEvent(`${ctx.tenantId}:${channel}:${externalThreadId}:${webhookEventId}`);
+
+      if (duplicateWebhook) {
+        const handoffMap = await readHandoffStateMap(client, ctx.tenantId);
+        const hydratedConv = hydrateConversationHandoff(conv, handoffMap);
+        return {
+          conversation_id: String(conv.id),
+          channel,
+          lead_id: conv.lead_id ? String(conv.lead_id) : null,
+          extracted_entities: extracted,
+          bot_reply: null,
+          bot_paused: Boolean(conv.bot_paused),
+          bot_suppressed_reason: 'duplicate_webhook_event',
+          deduplicated: true,
+          matched_question: null,
+          scenario_id: null,
+          assigned_agent_id: hydratedConv.assigned_agent_id,
+          handoff_reason: hydratedConv.handoff_reason,
+          handoff_at: hydratedConv.handoff_at,
+        };
+      }
 
       // Save customer message
       await client.query(
@@ -529,12 +997,15 @@ socialBotRouter.post('/conversations', requirePermission('mkt_social_bot', 'crea
         );
 
         if (botCfg.target_audience_id) {
-          await client.query(
+          const insAud = await client.query(
             `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
              VALUES ($1, $2, $3, $4, 'social_bot', '{}'::jsonb)
              ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
             [crypto.randomUUID(), ctx.tenantId, botCfg.target_audience_id, leadId]
           );
+          if ((insAud.rowCount || 0) > 0) {
+            enteredAudienceId = String(botCfg.target_audience_id);
+          }
           await refreshAudienceCachedCount(client, ctx.tenantId, botCfg.target_audience_id);
         }
 
@@ -551,17 +1022,25 @@ socialBotRouter.post('/conversations', requirePermission('mkt_social_bot', 'crea
         }
       }
 
-      // Generate AI Bot reply if active and not paused
+      // Generate AI Bot reply ONLY when active, NOT paused by human takeover, and channel enabled!
       let botReply: string | null = null;
-      if (botCfg.is_active && !conv.bot_paused) {
-        const rag = generateBotReplyFromRag(
-          content,
-          botCfg.bot_name,
-          botCfg.brand_persona,
-          botCfg.faq_rules,
-          extracted
-        );
+      let matchedQuestion: string | null = null;
+      let scenarioId: string | null = null;
+      let botSuppressedReason: string | null = null;
+      const isConvPaused = Boolean(conv.bot_paused);
+      const channelEnabled = botCfg.channels.includes(channel);
+
+      if (isConvPaused) {
+        botSuppressedReason = 'human_takeover_paused';
+      } else if (!botCfg.is_active) {
+        botSuppressedReason = 'bot_globally_disabled';
+      } else if (!channelEnabled) {
+        botSuppressedReason = 'channel_disabled';
+      } else {
+        const rag = await resolveBotReplyInTx(client, ctx.tenantId, channel, content, botCfg, extracted);
         botReply = rag.reply;
+        matchedQuestion = rag.matchedQuestion;
+        scenarioId = rag.scenarioId;
         await client.query(
           `INSERT INTO mkt_social_messages (id, tenant_id, conversation_id, sender_type, sender_name, content, extracted_entities)
            VALUES ($1, $2, $3, 'bot', $4, $5, '{}'::jsonb)`,
@@ -569,16 +1048,36 @@ socialBotRouter.post('/conversations', requirePermission('mkt_social_bot', 'crea
         );
       }
 
+      const handoffMap = await readHandoffStateMap(client, ctx.tenantId);
+      const hydratedConv = hydrateConversationHandoff(conv, handoffMap);
+
       return {
         conversation_id: String(conv.id),
+        channel,
         lead_id: leadId,
         extracted_entities: extracted,
         bot_reply: botReply,
+        bot_paused: isConvPaused,
+        bot_suppressed_reason: botSuppressedReason,
+        matched_question: matchedQuestion,
+        scenario_id: scenarioId,
+        assigned_agent_id: hydratedConv.assigned_agent_id,
+        handoff_reason: hydratedConv.handoff_reason,
+        handoff_at: hydratedConv.handoff_at,
       };
     });
 
     if (drainAfterCommit) {
       await runUnassignedLeadDrainer(ctx.tenantId).catch(() => {});
+    }
+    if (enteredAudienceId && out.lead_id) {
+      await emitDomainEvent('audience.entered', {
+        tenantId: ctx.tenantId,
+        audienceId: enteredAudienceId,
+        audienceName: 'Social Inbox Audience',
+        audienceType: 'static_list',
+        leadId: out.lead_id,
+      });
     }
     if (out.lead_id) {
       await emitDomainEvent('marketing.engaged', {
@@ -612,7 +1111,27 @@ socialBotRouter.post('/conversations/:id/messages', requirePermission('mkt_socia
         'SELECT * FROM mkt_social_conversations WHERE tenant_id = $1 AND id = $2 LIMIT 1',
         [ctx.tenantId, req.params.id]
       );
-      if (!convRes.rows[0]) return null;
+      const conv = convRes.rows[0];
+      if (!conv) return null;
+
+      let delivery: Record<string, unknown> | null = null;
+      if (senderType === 'agent' && conv.channel === 'messenger' && conv.external_thread_id) {
+        const sendRes = await sendMetaMessengerMessage({
+          tenantId: ctx.tenantId,
+          client,
+          recipientPsid: String(conv.external_thread_id),
+          text: content,
+          messagingType: 'RESPONSE',
+        });
+        delivery = {
+          sent: sendRes.sent,
+          queued: Boolean(sendRes.queued),
+          silent: Boolean(sendRes.silent),
+          provider: sendRes.provider,
+          external_message_id: sendRes.messageId,
+          ...(sendRes.error ? { error: sendRes.error } : {}),
+        };
+      }
 
       const extracted = senderType === 'customer' ? extractContactEntitiesFromText(content) : { phone: null, email: null };
       const msgId = crypto.randomUUID();
@@ -624,28 +1143,82 @@ socialBotRouter.post('/conversations/:id/messages', requirePermission('mkt_socia
           ctx.tenantId,
           req.params.id,
           senderType,
-          senderType === 'agent' ? ctx.userName || 'Chuyên viên CSKH' : convRes.rows[0].customer_name,
+          senderType === 'agent' ? ctx.userName || 'Chuyên viên CSKH' : conv.customer_name,
           content,
           JSON.stringify(extracted),
         ]
       );
 
+      const shouldAutoPause = senderType === 'agent' && req.body?.auto_pause_bot !== false;
       await client.query(
         `UPDATE mkt_social_conversations
          SET last_message_preview = $3,
              extracted_phone = COALESCE($4, extracted_phone),
              extracted_email = COALESCE($5, extracted_email),
              unread_count = CASE WHEN $6 = 0 THEN 0 ELSE unread_count + 1 END,
+             bot_paused = CASE WHEN $7 = true THEN true ELSE bot_paused END,
              last_message_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
-        [ctx.tenantId, req.params.id, content.slice(0, 200), extracted.phone, extracted.email, senderType === 'agent' ? 0 : 1]
+        [
+          ctx.tenantId,
+          req.params.id,
+          content.slice(0, 200),
+          extracted.phone,
+          extracted.email,
+          senderType === 'agent' ? 0 : 1,
+          shouldAutoPause,
+        ]
       );
+
+      let handoffState: ConversationHandoffState | null = null;
+      if (shouldAutoPause) {
+        handoffState = await writeConversationHandoffState(client, ctx.tenantId, String(conv.id), {
+          assigned_agent_id: ctx.userId,
+          assigned_agent_name: ctx.userName || 'Chuyên viên CSKH',
+          handoff_reason: String(req.body?.handoff_reason || 'Human agent manual reply takeover'),
+          handoff_at: new Date().toISOString(),
+          channel: String(conv.channel),
+        });
+      }
+
+      // If a customer sends a follow-up message on an existing thread, evaluate AI/scenario auto-reply respecting bot_paused!
+      let botReply: string | null = null;
+      let botSuppressedReason: string | null = null;
+      let scenarioId: string | null = null;
+      if (senderType === 'customer') {
+        const botRow = await getOrCreateTenantBotConfig(client, ctx.tenantId);
+        const botCfg = mapBotConfig(botRow);
+        if (Boolean(conv.bot_paused)) {
+          botSuppressedReason = 'human_takeover_paused';
+        } else if (!botCfg.is_active) {
+          botSuppressedReason = 'bot_globally_disabled';
+        } else if (!botCfg.channels.includes(String(conv.channel))) {
+          botSuppressedReason = 'channel_disabled';
+        } else {
+          const rag = await resolveBotReplyInTx(client, ctx.tenantId, String(conv.channel), content, botCfg, extracted);
+          botReply = rag.reply;
+          scenarioId = rag.scenarioId;
+          await client.query(
+            `INSERT INTO mkt_social_messages (id, tenant_id, conversation_id, sender_type, sender_name, content, extracted_entities)
+             VALUES ($1, $2, $3, 'bot', $4, $5, '{}'::jsonb)`,
+            [crypto.randomUUID(), ctx.tenantId, conv.id, botCfg.bot_name, botReply]
+          );
+        }
+      }
 
       const r = await client.query('SELECT * FROM mkt_social_messages WHERE tenant_id = $1 AND id = $2', [
         ctx.tenantId,
         msgId,
       ]);
-      return r.rows[0];
+      return {
+        ...r.rows[0],
+        bot_paused: shouldAutoPause ? true : Boolean(conv.bot_paused),
+        bot_reply: botReply,
+        bot_suppressed_reason: botSuppressedReason,
+        scenario_id: scenarioId,
+        ...(handoffState ? { handoff: handoffState } : {}),
+        ...(delivery ? { delivery } : {}),
+      };
     });
 
     if (!msg) {
@@ -668,6 +1241,7 @@ socialBotRouter.post('/conversations/:id/push-lead', requirePermission('mkt_soci
     const roundId = req.body?.round_id ? String(req.body.round_id) : null;
 
     let drainAfterCommit = false;
+    let enteredAudienceId: string | null = null;
     const out = await withTenantTransaction(ctx.tenantId, async (client) => {
       const convRes = await client.query(
         'SELECT * FROM mkt_social_conversations WHERE tenant_id = $1 AND id = $2 LIMIT 1',
@@ -716,12 +1290,15 @@ socialBotRouter.post('/conversations/:id/push-lead', requirePermission('mkt_soci
       );
 
       if (audienceId) {
-        await client.query(
+        const insAud = await client.query(
           `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
            VALUES ($1, $2, $3, $4, 'social_inbox', '{}'::jsonb)
            ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
           [crypto.randomUUID(), ctx.tenantId, audienceId, upserted.leadId]
         );
+        if ((insAud.rowCount || 0) > 0) {
+          enteredAudienceId = audienceId;
+        }
         await refreshAudienceCachedCount(client, ctx.tenantId, audienceId);
       }
 
@@ -749,6 +1326,15 @@ socialBotRouter.post('/conversations/:id/push-lead', requirePermission('mkt_soci
 
     if (drainAfterCommit) {
       await runUnassignedLeadDrainer(ctx.tenantId).catch(() => {});
+    }
+    if (enteredAudienceId && out.lead_id) {
+      await emitDomainEvent('audience.entered', {
+        tenantId: ctx.tenantId,
+        audienceId: enteredAudienceId,
+        audienceName: 'Social Inbox Audience',
+        audienceType: 'static_list',
+        leadId: out.lead_id,
+      });
     }
 
     res.json({ success: true, data: out });
@@ -786,11 +1372,31 @@ socialBotRouter.patch('/conversations/:id', requirePermission('mkt_social_bot', 
          WHERE tenant_id = $1 AND id = $2`,
         [ctx.tenantId, req.params.id, botPaused, status, unreadCount]
       );
-      const r = await client.query('SELECT * FROM mkt_social_conversations WHERE tenant_id = $1 AND id = $2', [
-        ctx.tenantId,
-        req.params.id,
+
+      if (req.body?.bot_paused !== undefined) {
+        if (botPaused) {
+          await writeConversationHandoffState(client, ctx.tenantId, String(ex.id), {
+            assigned_agent_id: req.body?.assigned_agent_id ? String(req.body.assigned_agent_id) : ctx.userId,
+            assigned_agent_name: req.body?.assigned_agent_name
+              ? String(req.body.assigned_agent_name)
+              : ctx.userName || 'Chuyên viên CSKH',
+            handoff_reason: String(req.body?.handoff_reason || 'Human agent takeover').trim(),
+            handoff_at: new Date().toISOString(),
+            channel: String(ex.channel || 'messenger'),
+          });
+        } else {
+          await writeConversationHandoffState(client, ctx.tenantId, String(ex.id), null);
+        }
+      }
+
+      const [r, handoffMap] = await Promise.all([
+        client.query('SELECT * FROM mkt_social_conversations WHERE tenant_id = $1 AND id = $2', [
+          ctx.tenantId,
+          req.params.id,
+        ]),
+        readHandoffStateMap(client, ctx.tenantId),
       ]);
-      return r.rows[0];
+      return hydrateConversationHandoff(r.rows[0], handoffMap);
     });
 
     if (!updated) {
@@ -854,6 +1460,12 @@ socialBotRouter.post('/scenarios', requirePermission('mkt_social_bot', 'create')
     const id = crypto.randomUUID();
 
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const conflicts = await detectScenarioConflicts(client, ctx.tenantId, {
+        channel,
+        triggerType,
+        keywords,
+        isActive,
+      });
       await client.query(
         `INSERT INTO mkt_automation_scenarios (
            id, tenant_id, name, channel, trigger_type, keywords_json, nodes_json, edges_json, settings_json, is_active, created_by
@@ -876,7 +1488,7 @@ socialBotRouter.post('/scenarios', requirePermission('mkt_social_bot', 'create')
         ctx.tenantId,
         id,
       ]);
-      return mapScenarioRow(r.rows[0]);
+      return { ...mapScenarioRow(r.rows[0]), conflict_warnings: conflicts };
     });
 
     res.status(201).json({ success: true, data: created });
@@ -912,6 +1524,14 @@ socialBotRouter.put('/scenarios/:id', requirePermission('mkt_social_bot', 'edit'
       const isActive =
         req.body?.is_active !== undefined ? Boolean(req.body.is_active) : Boolean(ex.is_active);
 
+      const conflicts = await detectScenarioConflicts(client, ctx.tenantId, {
+        id: req.params.id,
+        channel,
+        triggerType,
+        keywords,
+        isActive,
+      });
+
       await client.query(
         `UPDATE mkt_automation_scenarios
          SET name = $3, channel = $4, trigger_type = $5,
@@ -935,7 +1555,7 @@ socialBotRouter.put('/scenarios/:id', requirePermission('mkt_social_bot', 'edit'
         ctx.tenantId,
         req.params.id,
       ]);
-      return mapScenarioRow(r.rows[0]);
+      return { ...mapScenarioRow(r.rows[0]), conflict_warnings: conflicts };
     });
 
     if (!updated) {
@@ -1203,51 +1823,167 @@ socialBotRouter.post('/zalo-broadcast', requirePermission('mkt_social_bot', 'cre
     const audienceId = req.body?.audience_id ? String(req.body.audience_id).trim() : null;
     const rawLeadIds: string[] = Array.isArray(req.body?.lead_ids) ? req.body.lead_ids.map(String) : [];
 
+    if (audienceId && !UUID_REGEX.test(audienceId)) {
+      sendApiError(res, 400, 'INVALID_AUDIENCE_ID', 'audience_id không hợp lệ.');
+      return;
+    }
+    const validLeadIds = rawLeadIds.map((x) => x.trim()).filter((x) => UUID_REGEX.test(x));
+    const rawRecipients: Array<{
+      phone?: string;
+      name?: string;
+      lead_id?: string;
+      template_data?: Record<string, unknown>;
+    }> = Array.isArray(req.body?.recipients) ? req.body.recipients : [];
+    if (rawLeadIds.length > 0 && validLeadIds.length === 0 && !audienceId && rawRecipients.length === 0) {
+      sendApiError(res, 400, 'INVALID_LEAD_IDS', 'Danh sách lead_ids không hợp lệ.');
+      return;
+    }
+
     const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const tplRes = templateId
-        ? await client.query('SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
-            ctx.tenantId,
-            templateId,
-          ])
-        : { rows: [] };
+      const [tplRes, supRes] = await Promise.all([
+        templateId
+          ? client.query(
+              'SELECT * FROM mkt_zalo_templates WHERE tenant_id = $1 AND (id::text = $2 OR template_code = $2) LIMIT 1',
+              [ctx.tenantId, templateId]
+            )
+          : Promise.resolve({ rows: [] as Array<Record<string, unknown>> }),
+        client.query<{ recipient: string }>(
+          "SELECT recipient FROM mkt_suppression_list WHERE tenant_id = $1 AND channel = 'zns'",
+          [ctx.tenantId]
+        ),
+      ]);
       const tpl = tplRes.rows[0];
+      const suppressedPhones = new Set<string>();
+      for (const s of supRes.rows) {
+        for (const k of getSuppressionMatchKeys('zns', String(s.recipient || ''))) {
+          suppressedPhones.add(k);
+        }
+      }
 
-      let sql = "SELECT id, name, phone, zns_consent FROM leads WHERE tenant_id = $1 AND is_deleted = false AND phone IS NOT NULL AND zns_consent != 'opted_out'";
-      const params: unknown[] = [ctx.tenantId];
-      if (audienceId) {
-        params.push(audienceId);
-        sql += ` AND id IN (SELECT lead_id FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id = $2)`;
-      } else if (rawLeadIds.length > 0) {
-        const ph = rawLeadIds.map((lid) => {
-          params.push(lid);
-          return `$${params.length}`;
+      type BroadcastTarget = {
+        id: string | null;
+        name: string | null;
+        phone: string;
+        extraTemplateData?: Record<string, unknown>;
+      };
+      const targets: BroadcastTarget[] = [];
+
+      let skippedSuppressed = 0;
+
+      if (rawRecipients.length > 0 && !audienceId && validLeadIds.length === 0) {
+        for (const rec of rawRecipients.slice(0, 200)) {
+          const recPhone = String(rec?.phone || '').trim();
+          if (!recPhone) continue;
+          const phoneVariants = Array.from(
+            new Set([recPhone, ...getSuppressionMatchKeys('zns', recPhone)].map((v) => v.toLowerCase()).filter(Boolean))
+          );
+          const ph = phoneVariants.map((_, idx) => `$${idx + 2}`).join(', ');
+          const matchedRes = await client.query<{
+            id: string;
+            name: string | null;
+            zns_consent: string | null;
+          }>(
+            `SELECT id, name, zns_consent FROM leads
+             WHERE tenant_id = $1 AND is_deleted = false AND LOWER(COALESCE(phone, '')) IN (${ph})
+             LIMIT 1`,
+            [ctx.tenantId, ...phoneVariants]
+          );
+          const matchedLead = matchedRes.rows[0];
+          if (matchedLead?.zns_consent === 'opted_out') {
+            skippedSuppressed++;
+            continue;
+          }
+          targets.push({
+            id: matchedLead?.id ? String(matchedLead.id) : rec?.lead_id ? String(rec.lead_id) : null,
+            name: rec?.name ? String(rec.name) : matchedLead?.name || null,
+            phone: recPhone,
+            extraTemplateData:
+              rec?.template_data && typeof rec.template_data === 'object' ? rec.template_data : undefined,
+          });
+        }
+      } else {
+        let sql =
+          "SELECT id, name, phone, zns_consent FROM leads WHERE tenant_id = $1 AND is_deleted = false AND phone IS NOT NULL AND zns_consent != 'opted_out'";
+        const params: unknown[] = [ctx.tenantId];
+        if (audienceId) {
+          params.push(audienceId);
+          sql += ` AND id IN (SELECT lead_id FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id = $2)`;
+        } else if (validLeadIds.length > 0) {
+          const ph = validLeadIds.map((lid) => {
+            params.push(lid);
+            return `$${params.length}`;
+          });
+          sql += ` AND id IN (${ph.join(', ')})`;
+        }
+        sql += ' LIMIT 200';
+
+        const leadsRes = await client.query<{ id: string; name: string | null; phone: string }>(sql, params);
+        for (const lead of leadsRes.rows) {
+          targets.push({ id: String(lead.id), name: lead.name, phone: String(lead.phone || '') });
+        }
+      }
+
+      let dispatchedCount = 0;
+      let uncountedSentCount = 0;
+      let failedCount = 0;
+      const broadcastText = String(tpl?.content_body || req.body?.message || '');
+
+      for (const lead of targets) {
+        const rawPhone = String(lead.phone || '').trim();
+        const phoneKeys = getSuppressionMatchKeys('zns', rawPhone);
+        if (!rawPhone || phoneKeys.some((k) => suppressedPhones.has(k))) {
+          skippedSuppressed++;
+          continue;
+        }
+
+        const znsRes = await dispatchZnsNotification({
+          tenantId: ctx.tenantId,
+          client,
+          phone: rawPhone,
+          templateId: tpl?.template_code ? String(tpl.template_code) : templateId || null,
+          templateData: {
+            customer_name: lead.name || '',
+            name: lead.name || '',
+            ...(req.body?.template_data && typeof req.body.template_data === 'object' ? req.body.template_data : {}),
+            ...(lead.extraTemplateData || {}),
+          },
+          message: broadcastText,
+          leadId: lead.id || undefined,
         });
-        sql += ` AND id IN (${ph.join(', ')})`;
+
+        if (!znsRes.sent) {
+          failedCount++;
+          continue;
+        }
+
+        dispatchedCount++;
+        if (znsRes.silent || znsRes.queued) {
+          uncountedSentCount++;
+        }
+        if (lead.id) {
+          await client.query(
+            `INSERT INTO lead_timeline_events (
+               id, tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+             ) VALUES ($1, $2, $3, 'zns_sent', 'communication', $4, 'tenant_admin', $5, $6, $7, $8::jsonb)`,
+            [
+              crypto.randomUUID(),
+              ctx.tenantId,
+              lead.id,
+              ctx.userId,
+              ctx.userName || 'Zalo Broadcast',
+              `Gửi Zalo Broadcast: ${tpl?.name || req.body?.campaign_name || 'Thông báo Zalo OA'}`,
+              broadcastText.slice(0, 240),
+              JSON.stringify({
+                template_id: templateId || null,
+                provider: znsRes.provider,
+                message_id: znsRes.messageId,
+              }),
+            ]
+          );
+        }
       }
-      sql += ' LIMIT 200';
 
-      const leadsRes = await client.query(sql, params);
-      const dispatchedCount = leadsRes.rows.length;
-
-      for (const lead of leadsRes.rows) {
-        await client.query(
-          `INSERT INTO lead_timeline_events (
-             id, tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-           ) VALUES ($1, $2, $3, 'zns_sent', 'communication', $4, 'tenant_admin', $5, $6, $7, $8::jsonb)`,
-          [
-            crypto.randomUUID(),
-            ctx.tenantId,
-            lead.id,
-            ctx.userId,
-            ctx.userName || 'Zalo Broadcast',
-            `Gửi Zalo Broadcast: ${tpl?.name || req.body?.campaign_name || 'Thông báo Zalo OA'}`,
-            String(tpl?.content_body || req.body?.message || '').slice(0, 240),
-            JSON.stringify({ template_id: templateId || null }),
-          ]
-        );
-      }
-
-      if (tpl) {
+      if (tpl && dispatchedCount > 0) {
         await client.query(
           `UPDATE mkt_zalo_templates
            SET sent_count = sent_count + $3, delivered_count = delivered_count + $3, updated_at = clock_timestamp()
@@ -1256,13 +1992,18 @@ socialBotRouter.post('/zalo-broadcast', requirePermission('mkt_social_bot', 'cre
         );
       }
 
-      await client.query(
-        'UPDATE mkt_zalo_oa_configs SET sent_today = sent_today + $2, updated_at = clock_timestamp() WHERE tenant_id = $1',
-        [ctx.tenantId, dispatchedCount]
-      );
+      if (uncountedSentCount > 0) {
+        await client.query(
+          'UPDATE mkt_zalo_oa_configs SET sent_today = sent_today + $2, updated_at = clock_timestamp() WHERE tenant_id = $1',
+          [ctx.tenantId, uncountedSentCount]
+        );
+      }
 
       return {
         sent_count: dispatchedCount,
+        skipped_suppressed: skippedSuppressed,
+        suppressed_count: skippedSuppressed,
+        failed_count: failedCount,
         estimated_cost_vnd: dispatchedCount * Number(tpl?.price_vnd || 250),
         template_name: tpl?.name || null,
       };
@@ -1275,18 +2016,74 @@ socialBotRouter.post('/zalo-broadcast', requirePermission('mkt_social_bot', 'cre
 });
 
 // AITraining: Customer Knowledge & Document RAG Studio (`mkt_ai_training_docs`)
-socialBotRouter.get('/training-docs', requirePermission('mkt_social_bot', 'view'), async (_req, res) => {
+socialBotRouter.get('/training-docs', requirePermission('mkt_social_bot', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const filterProp = typeof req.query?.property_id === 'string' ? req.query.property_id.trim().toLowerCase() : '';
+    const searchQ = typeof req.query?.search === 'string' ? req.query.search.trim().toLowerCase() : '';
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const r = await client.query(
-        'SELECT * FROM mkt_ai_training_docs WHERE tenant_id = $1 ORDER BY updated_at DESC',
-        [ctx.tenantId]
-      );
-      return r.rows.map((row) => ({
-        ...row,
-        metadata: parseJsonCol(row.metadata_json, {}),
-      }));
+      const [r, propsRes] = await Promise.all([
+        client.query(
+          'SELECT * FROM mkt_ai_training_docs WHERE tenant_id = $1 ORDER BY updated_at DESC',
+          [ctx.tenantId]
+        ),
+        filterProp && filterProp !== 'all'
+          ? client.query<{ id: string; name: string | null; domain: string | null; site_key: string | null }>(
+              'SELECT id, name, domain, site_key FROM mkt_web_properties WHERE tenant_id = $1 ORDER BY created_at ASC',
+              [ctx.tenantId]
+            )
+          : Promise.resolve({ rows: [] as Array<{ id: string; name: string | null; domain: string | null; site_key: string | null }> }),
+      ]);
+
+      const props = propsRes.rows || [];
+      const propUuids = new Set(props.map((p) => String(p.id).trim().toLowerCase()));
+      const legacyToUuid = new Map<string, string>();
+      const normDom = (d: unknown) =>
+        String(d || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      for (const p of props) {
+        const pId = String(p.id).trim().toLowerCase();
+        const sk = String(p.site_key || '').trim();
+        if (sk) {
+          legacyToUuid.set(sk.toLowerCase(), pId);
+          const stripped = sk.replace(/^wp_[a-z0-9-]+_/i, '').trim().toLowerCase();
+          if (stripped) legacyToUuid.set(stripped, pId);
+        }
+        const dom = normDom(p.domain);
+        if (dom) legacyToUuid.set(dom, pId);
+      }
+
+      const primaryProp =
+        props.find((p) => normDom(p.domain) === 'ideas.edu.vn') ||
+        props.find((p) => String(p.name || '').trim().toLowerCase() === 'ideas.edu.vn') ||
+        props.find((p) => normDom(p.domain).includes('ideas.edu.vn') && !normDom(p.domain).startsWith('ai.')) ||
+        props.find((p) => normDom(p.domain).includes('ideas.edu.vn')) ||
+        props[0];
+      const primaryPropId = primaryProp ? String(primaryProp.id).trim().toLowerCase() : '';
+      const resolvedFilterUuid = filterProp ? (propUuids.has(filterProp) ? filterProp : legacyToUuid.get(filterProp) || '') : '';
+
+      return r.rows
+        .map((row) => ({
+          ...row,
+          metadata: parseJsonCol(row.metadata_json, {}),
+        }))
+        .filter((row) => {
+          if (filterProp && filterProp !== 'all') {
+            const meta = (row.metadata || {}) as Record<string, unknown>;
+            const rawProp = String(meta.property_id ?? meta.propertyId ?? '').trim().toLowerCase();
+            if (rawProp !== filterProp) {
+              if (!resolvedFilterUuid) return false;
+              const mappedDocUuid =
+                (rawProp && (propUuids.has(rawProp) ? rawProp : legacyToUuid.get(rawProp))) ||
+                (rawProp.startsWith('chatbot_') || !rawProp || !propUuids.has(rawProp) ? primaryPropId : '');
+              if (mappedDocUuid !== resolvedFilterUuid) return false;
+            }
+          }
+          if (searchQ) {
+            const hay = `${row.title || ''} ${row.content_text || ''} ${row.doc_type || ''}`.toLowerCase();
+            if (!hay.includes(searchQ)) return false;
+          }
+          return true;
+        });
     });
     res.json({ success: true, data: { items } });
   } catch (err: any) {
@@ -1298,7 +2095,7 @@ socialBotRouter.post('/training-docs', requirePermission('mkt_social_bot', 'crea
   try {
     const ctx = getTenantContext();
     const title = String(req.body?.title || '').trim();
-    const contentText = String(req.body?.content_text || '').trim();
+    const contentText = String(req.body?.content_text ?? req.body?.content ?? '').trim();
     if (!title) {
       sendApiError(res, 422, 'DOC_TITLE_REQUIRED', 'Vui lòng nhập tiêu đề tài liệu tri thức.');
       return;

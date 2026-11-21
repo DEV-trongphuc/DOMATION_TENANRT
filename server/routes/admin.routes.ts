@@ -20,7 +20,14 @@ import {
   getPlatformBillingCatalog,
   invalidateBillingCatalogCache,
   computeSubscriptionSnapshot,
+  applySubscriptionActivationInTx,
+  generateBillingReferenceCode,
 } from '../services/billing.service.ts';
+import {
+  SAAS_PACKAGES_CATALOG,
+  buildModulesForPackage,
+  resolveCanonicalBillingIdentity,
+} from '../core/security/entitlements.ts';
 import {
   dispatchPlatformAppscriptEvent,
   fetchTenantPrimaryAdminContact,
@@ -252,9 +259,11 @@ adminRouter.get('/tenants', requirePlatformSuperAdmin, async (req, res) => {
       const tenantsRes = await client.query(
         `WITH page_tenants AS (
            SELECT
-             t.id, t.slug, t.name, t.domain, t.industry, t.plan_tier, t.status,
-             t.trial_ends_at, t.subscription_expires_at, t.subscription_plan_code,
-             t.billing_cycle, t.wallet_balance_vnd, t.crm_erp_upgrade_status,
+             t.id, t.slug, t.name, t.domain, t.industry, t.package_code, t.plan_tier, t.status,
+             t.trial_ends_at, t.subscription_expires_at, t.grace_ends_at,
+             t.auto_renew, t.cancel_at_period_end, t.cancelled_at,
+             t.scheduled_plan_code, t.scheduled_billing_cycle,
+             t.subscription_plan_code, t.billing_cycle, t.wallet_balance_vnd, t.crm_erp_upgrade_status,
              t.settings, t.created_at
            FROM tenants t
            WHERE ${where}
@@ -273,9 +282,11 @@ adminRouter.get('/tenants', requirePlatformSuperAdmin, async (req, res) => {
            GROUP BY l.tenant_id
          )
          SELECT
-           pt.id, pt.slug, pt.name, pt.domain, pt.industry, pt.plan_tier, pt.status,
-           pt.trial_ends_at, pt.subscription_expires_at, pt.subscription_plan_code,
-           pt.billing_cycle, pt.wallet_balance_vnd, pt.crm_erp_upgrade_status,
+           pt.id, pt.slug, pt.name, pt.domain, pt.industry, pt.package_code, pt.plan_tier, pt.status,
+           pt.trial_ends_at, pt.subscription_expires_at, pt.grace_ends_at,
+           pt.auto_renew, pt.cancel_at_period_end, pt.cancelled_at,
+           pt.scheduled_plan_code, pt.scheduled_billing_cycle,
+           pt.subscription_plan_code, pt.billing_cycle, pt.wallet_balance_vnd, pt.crm_erp_upgrade_status,
            pt.settings, pt.created_at,
            COALESCE(uc.cnt, 0) AS users_count,
            COALESCE(lc.cnt, 0) AS leads_count
@@ -323,17 +334,44 @@ adminRouter.patch('/tenants/:id', requirePlatformSuperAdmin, async (req, res) =>
 
     const updated = await withSystemPrivilege(async (client) => {
       let nextSettingsJson: string | null = null;
-      if (settings && typeof settings === 'object') {
-        const cur = await client.query<{ settings: Record<string, unknown> }>(
-          'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
-          [tenantId]
-        );
-        if (cur.rows[0]) {
+      let nextPackageCode: string | null = null;
+      let nextModulesJson: string | null = null;
+      let nextEntitlementsJson: string | null = null;
+
+      const cur = await client.query<{
+        settings: Record<string, unknown>;
+        entitlements: Record<string, unknown>;
+      }>('SELECT settings, entitlements FROM tenants WHERE id = $1 LIMIT 1', [tenantId]);
+
+      if (cur.rows[0]) {
+        if (settings && typeof settings === 'object') {
           const merged = normalizeTenantSettings({
             ...(cur.rows[0].settings || {}),
             ...(settings as Record<string, unknown>),
           });
           nextSettingsJson = JSON.stringify(merged);
+        }
+        if (plan_tier) {
+          const id = resolveCanonicalBillingIdentity(plan_tier);
+          if (id) {
+            const pkgDef = SAAS_PACKAGES_CATALOG[id.package_code];
+            const curEnt =
+              cur.rows[0].entitlements && typeof cur.rows[0].entitlements === 'object'
+                ? cur.rows[0].entitlements
+                : {};
+            const eduAddon = Boolean(curEnt.education_addon);
+            nextPackageCode = id.package_code;
+            nextModulesJson = JSON.stringify(buildModulesForPackage(id.package_code, { educationAddon: eduAddon }));
+            nextEntitlementsJson = JSON.stringify({
+              ...curEnt,
+              package_code: id.package_code,
+              package_name: pkgDef.name,
+              package_badge: pkgDef.badge,
+              tour_suite: pkgDef.tour_suite,
+              connect_wizard_suite: pkgDef.connect_wizard_suite,
+              ai_capabilities: pkgDef.ai_capabilities,
+            });
+          }
         }
       }
 
@@ -341,13 +379,16 @@ adminRouter.patch('/tenants/:id', requirePlatformSuperAdmin, async (req, res) =>
         `UPDATE tenants
          SET status = COALESCE($2, status),
              plan_tier = COALESCE($3, plan_tier),
+             package_code = COALESCE($9, package_code),
+             enabled_modules = COALESCE($10::jsonb, enabled_modules),
+             entitlements = COALESCE($11::jsonb, entitlements),
              name = COALESCE($4, name),
              domain = CASE WHEN $5::boolean THEN $6 ELSE domain END,
              industry = COALESCE($7, industry),
              settings = COALESCE($8::jsonb, settings),
              updated_at = clock_timestamp()
          WHERE id = $1
-         RETURNING id, slug, name, domain, industry, plan_tier, status, settings`,
+         RETURNING id, slug, name, domain, industry, package_code, plan_tier, status, settings`,
         [
           tenantId,
           status || null,
@@ -357,6 +398,9 @@ adminRouter.patch('/tenants/:id', requirePlatformSuperAdmin, async (req, res) =>
           domain ? String(domain).trim().toLowerCase() : null,
           industry ? String(industry).trim() : null,
           nextSettingsJson,
+          nextPackageCode,
+          nextModulesJson,
+          nextEntitlementsJson,
         ]
       );
       return r.rows[0] || null;
@@ -649,46 +693,39 @@ adminRouter.post('/billing/requests/:txId/resolve', requirePlatformSuperAdmin, a
         tx.tx_type === 'subscription_purchase' ||
         tx.tx_type === 'renewal' ||
         tx.tx_type === 'plan_upgrade' ||
+        tx.tx_type === 'plan_switch' ||
+        tx.tx_type === 'package_switch' ||
+        tx.tx_type === 'reactivation' ||
         tx.tx_type === 'crm_erp_upgrade'
       ) {
-        const matchedPlan = catalog.plans.find((p) => p.code === tx.plan_code);
-        const nextTier: 'starter' | 'growth' | 'enterprise' =
-          tx.tx_type === 'crm_erp_upgrade'
-            ? 'enterprise'
-            : matchedPlan?.plan_tier || (tx.plan_tier as 'starter' | 'growth' | 'enterprise') || 'starter';
-        const months = Math.max(1, Number(tx.months_added || 1));
-        const addedDays = tx.billing_cycle === 'annual' && months === 12 ? 365 : months * 30;
-        const nowMs = Date.now();
-        const trialMs = tx.trial_ends_at ? new Date(tx.trial_ends_at).getTime() : 0;
-        const paidMs = tx.subscription_expires_at ? new Date(tx.subscription_expires_at).getTime() : 0;
-        const baseMs = Math.max(nowMs, trialMs, paidMs);
-        const nextExpiresIso = new Date(baseMs + addedDays * 86_400_000).toISOString();
-        nextExpiresAt = nextExpiresIso;
-
+        const cycle: 'monthly' | 'annual' = tx.billing_cycle === 'annual' ? 'annual' : 'monthly';
+        const months = Math.max(1, Number(tx.months_added || (cycle === 'annual' ? 12 : 1)));
+        const txMeta = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : {};
         const nextUpgradeStatus =
           tx.tx_type === 'crm_erp_upgrade'
-            ? `active_${String(tx.metadata?.target_suite || 'crm_erp_bundle')}`
+            ? `active_${String(txMeta.target_suite || 'crm_erp_bundle')}`
             : undefined;
-
-        await client.query(
-          `UPDATE tenants
-           SET subscription_expires_at = $2::timestamptz,
-               subscription_plan_code = COALESCE($3, subscription_plan_code),
-               plan_tier = $4,
-               billing_cycle = COALESCE($5, billing_cycle),
-               crm_erp_upgrade_status = COALESCE($6, crm_erp_upgrade_status),
-               status = CASE WHEN status = 'trial' THEN 'active' ELSE status END,
-               updated_at = clock_timestamp()
-           WHERE id = $1`,
-          [tx.tenant_id, nextExpiresIso, tx.plan_code || 'autodata_standard', nextTier, tx.billing_cycle || 'monthly', nextUpgradeStatus || null]
-        );
+        const activatedTenant = await applySubscriptionActivationInTx(client, {
+          tenantId: tx.tenant_id,
+          planCode: String(tx.plan_code || (tx.tx_type === 'crm_erp_upgrade' ? 'domation_crm_erp' : 'autodata_standard')),
+          billingCycle: cycle,
+          monthsAdded: months,
+          useCurrentTimeBase: Boolean(txMeta.use_current_time_base),
+          targetUpgradeStatus: nextUpgradeStatus,
+          catalog,
+        });
+        nextExpiresAt = activatedTenant.subscription_expires_at
+          ? new Date(activatedTenant.subscription_expires_at).toISOString()
+          : undefined;
       }
 
+      const existingMeta = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : {};
+      const mergedTxMeta = { ...existingMeta, approved_bonus_vnd: bonusVnd };
       const appRes = await client.query(
         `UPDATE tenant_billing_transactions
          SET status = 'approved',
              note = CASE WHEN $2::text IS NOT NULL THEN COALESCE(note, '') || ' | ' || $2::text ELSE note END,
-             metadata = metadata || $3::jsonb,
+             metadata = $3::jsonb,
              processed_by = $4,
              processed_at = clock_timestamp()
          WHERE id = $1
@@ -696,7 +733,7 @@ adminRouter.post('/billing/requests/:txId/resolve', requirePlatformSuperAdmin, a
         [
           txId,
           resolution_note ? String(resolution_note).trim() : null,
-          JSON.stringify({ approved_bonus_vnd: bonusVnd }),
+          JSON.stringify(mergedTxMeta),
           platformAdmin.email,
         ]
       );
@@ -724,6 +761,7 @@ adminRouter.post('/billing/requests/:txId/resolve', requirePlatformSuperAdmin, a
     }
 
     tenantRedis.invalidateTenantCache(resolved.tenantId, resolved.tenantSlug);
+    await tenantRedis.del('meta:tenant_status', resolved.tenantId);
 
     let eventType: PlatformBillingEventType;
     if (resolved.decision === 'reject') {
@@ -797,18 +835,53 @@ adminRouter.post('/tenants/:id/billing-grant', requirePlatformSuperAdmin, async 
     const totalAddedDays = (cleanMonths === 12 ? 365 : cleanMonths * 30) + cleanDays;
 
     const updated = await withSystemPrivilege(async (client) => {
-      const curRes = await client.query(
-        `SELECT id, slug, plan_tier, created_at, trial_ends_at, subscription_expires_at,
-                subscription_plan_code, billing_cycle, wallet_balance_vnd, crm_erp_upgrade_status
-         FROM tenants WHERE id = $1 FOR UPDATE`,
+      const curRes = await client.query<Record<string, any>>(
+        'SELECT * FROM tenants WHERE id = $1 FOR UPDATE',
         [tenantId]
       );
       const cur = curRes.rows[0];
       if (!cur) return null;
 
-      const matchedPlan = plan_code ? catalog.plans.find((p) => p.code === String(plan_code)) : undefined;
-      const nextPlanCode = matchedPlan ? matchedPlan.code : plan_code ? String(plan_code) : cur.subscription_plan_code;
-      const nextPlanTier = matchedPlan ? matchedPlan.plan_tier : cur.plan_tier;
+      const resolvedPlanId = plan_code ? resolveCanonicalBillingIdentity(plan_code) : null;
+      const matchedPlan =
+        (plan_code ? catalog.plans.find((p) => p.code === String(plan_code)) : undefined) ||
+        (resolvedPlanId ? catalog.plans.find((p) => p.code === resolvedPlanId.plan_code) : undefined);
+
+      const nextPlanCode = matchedPlan
+        ? matchedPlan.code
+        : plan_code
+          ? String(plan_code)
+          : cur.subscription_plan_code;
+      const nextPlanTier = matchedPlan
+        ? matchedPlan.plan_tier
+        : resolvedPlanId
+          ? resolvedPlanId.legacy_tier
+          : cur.plan_tier;
+
+      let nextPackageCode = cur.package_code;
+      let nextModulesJson: string | null = null;
+      let nextEntitlementsJson: string | null = null;
+      const targetPkgId =
+        resolvedPlanId ||
+        (crm_erp_upgrade_status && String(crm_erp_upgrade_status).startsWith('active_erp')
+          ? resolveCanonicalBillingIdentity('domation_promax')
+          : null);
+      if (targetPkgId) {
+        const pkgDef = SAAS_PACKAGES_CATALOG[targetPkgId.package_code];
+        const curEnt = cur.entitlements && typeof cur.entitlements === 'object' ? cur.entitlements : {};
+        const eduAddon = Boolean(curEnt.education_addon);
+        nextPackageCode = targetPkgId.package_code;
+        nextModulesJson = JSON.stringify(buildModulesForPackage(targetPkgId.package_code, { educationAddon: eduAddon }));
+        nextEntitlementsJson = JSON.stringify({
+          ...curEnt,
+          package_code: targetPkgId.package_code,
+          package_name: pkgDef.name,
+          package_badge: pkgDef.badge,
+          tour_suite: pkgDef.tour_suite,
+          connect_wizard_suite: pkgDef.connect_wizard_suite,
+          ai_capabilities: pkgDef.ai_capabilities,
+        });
+      }
 
       let nextSubExpires = cur.subscription_expires_at;
       if (totalAddedDays > 0) {
@@ -822,6 +895,7 @@ adminRouter.post('/tenants/:id/billing-grant', requirePlatformSuperAdmin, async 
 
       const nextCycle =
         cleanMonths === 12 ? 'annual' : cleanMonths > 0 ? 'monthly' : cur.billing_cycle;
+      const shouldReactivate = Boolean(totalAddedDays > 0 || plan_code || crm_erp_upgrade_status);
 
       const updRes = await client.query(
         `UPDATE tenants
@@ -829,13 +903,18 @@ adminRouter.post('/tenants/:id/billing-grant', requirePlatformSuperAdmin, async 
              subscription_expires_at = $3::timestamptz,
              subscription_plan_code = $4,
              plan_tier = $5,
+             package_code = COALESCE($8, package_code),
+             enabled_modules = COALESCE($9::jsonb, enabled_modules),
+             entitlements = COALESCE($10::jsonb, entitlements),
              billing_cycle = $6,
              crm_erp_upgrade_status = COALESCE($7, crm_erp_upgrade_status),
+             status = CASE WHEN $11::boolean AND status IN ('trial', 'grace', 'suspended', 'cancelled') THEN 'active' ELSE status END,
+             grace_ends_at = CASE WHEN $11::boolean THEN NULL ELSE grace_ends_at END,
+             cancel_at_period_end = CASE WHEN $11::boolean THEN false ELSE cancel_at_period_end END,
+             cancelled_at = CASE WHEN $11::boolean THEN NULL ELSE cancelled_at END,
              updated_at = clock_timestamp()
          WHERE id = $1
-         RETURNING id, slug, name, domain, industry, plan_tier, status,
-                   trial_ends_at, subscription_expires_at, subscription_plan_code,
-                   billing_cycle, wallet_balance_vnd, crm_erp_upgrade_status, created_at`,
+         RETURNING *`,
         [
           tenantId,
           cleanTopup,
@@ -844,19 +923,23 @@ adminRouter.post('/tenants/:id/billing-grant', requirePlatformSuperAdmin, async 
           nextPlanTier,
           nextCycle,
           crm_erp_upgrade_status ? String(crm_erp_upgrade_status) : null,
+          nextPackageCode,
+          nextModulesJson,
+          nextEntitlementsJson,
+          shouldReactivate,
         ]
       );
 
-      const refCode = `GRANT-${Date.now().toString(36).toUpperCase()}`;
+      const refCode = generateBillingReferenceCode('DOMGRANT', 'ADMIN', cur.slug);
       const grantNote = note
         ? String(note).trim()
         : `Admin cấp phát trực tiếp (+${cleanTopup.toLocaleString('vi-VN')}₫ ví, +${totalAddedDays} ngày)`;
       await client.query(
         `INSERT INTO tenant_billing_transactions (
            tenant_id, tx_type, plan_code, billing_cycle, months_added,
-           amount_vnd, discount_pct, payment_method, status, reference_code,
+           amount_vnd, discount_pct, payment_method, provider, status, reference_code,
            note, metadata, processed_by, processed_at
-         ) VALUES ($1, 'admin_grant', $2, $3, $4, $5, 0, 'admin_grant', 'completed', $6, $7, $8::jsonb, $9, clock_timestamp())`,
+         ) VALUES ($1, 'admin_grant', $2, $3, $4, $5, 0, 'admin_grant', 'manual_bank_transfer', 'completed', $6, $7, $8::jsonb, $9, clock_timestamp())`,
         [
           tenantId,
           nextPlanCode,
@@ -880,6 +963,7 @@ adminRouter.post('/tenants/:id/billing-grant', requirePlatformSuperAdmin, async 
     }
 
     tenantRedis.invalidateTenantCache(tenantId, updated.row.slug);
+    await tenantRedis.del('meta:tenant_status', tenantId);
     const snap = computeSubscriptionSnapshot(updated.row, catalog);
 
     void notifyPlatformBillingEvent({

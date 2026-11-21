@@ -153,7 +153,13 @@ async function main(): Promise<void> {
     });
     assert.equal(goi1AudBlocked.status, 403, 'Gói 1 must reject /audiences with 403 MODULE_NOT_ENTITLED');
 
-    // Unlock Growth Suite on Alpha & Beta so Audience RLS isolation can be tested
+    // Fund Alpha & Beta wallets, then unlock Growth Suite so Audience RLS isolation can be tested
+    await withTenantTransaction(alphaId, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 20000000 WHERE id = $1', [alphaId]);
+    });
+    await withTenantTransaction(betaId, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [betaId]);
+    });
     await reqJson(baseUrl, '/api/v1/billing/switch-package', {
       method: 'POST',
       token: alphaToken,

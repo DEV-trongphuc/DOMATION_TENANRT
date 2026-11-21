@@ -120,10 +120,27 @@ export function signTenantRefreshToken(userId: string, tenantId: string, expires
   );
 }
 
+export interface TenantRefreshJwtClaims {
+  sub: string;
+  tenantId: string;
+  scope: 'tenant_refresh';
+  iat: number;
+  exp: number;
+  jti: string;
+}
+
 export function verifyTenantAccessToken(token: string): TenantJwtClaims {
   const claims = verifyHmacToken<TenantJwtClaims>(token, APP_CONFIG.jwtSecret);
   if (claims.scope !== 'tenant' || !claims.tenantId || !claims.sub) {
     throw new Error('JWT_INVALID_SCOPE');
+  }
+  return claims;
+}
+
+export function verifyTenantRefreshToken(token: string): TenantRefreshJwtClaims {
+  const claims = verifyHmacToken<TenantRefreshJwtClaims>(token, APP_CONFIG.jwtSecret);
+  if (claims.scope !== 'tenant_refresh' || !claims.tenantId || !claims.sub) {
+    throw new Error('JWT_INVALID_REFRESH_SCOPE');
   }
   return claims;
 }

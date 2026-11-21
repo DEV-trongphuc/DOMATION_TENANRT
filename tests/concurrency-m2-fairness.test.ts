@@ -416,7 +416,7 @@ describe('Milestone 2: High Concurrency, Non-blocking Cron/Notifications & Queue
 
       await client.query(
         `INSERT INTO capi_logs (tenant_id, lead_id, dataset_id, event_name, event_id, action_source, match_keys, sent_payload, response_status, sent_at)
-         VALUES ($1, $2, '9876543210', 'Lead', 'capi_evt_detached_test_1', 'system_cron_retry', '{}'::jsonb, '{"data":[{"event_name":"Lead"}]}'::jsonb, 502, clock_timestamp() - INTERVAL '10 minutes')`,
+         VALUES ($1, $2, '9876543210', 'Lead', 'capi_evt_detached_test_1', 'system_generated', '{}'::jsonb, '{"data":[{"event_name":"Lead"}]}'::jsonb, 502, clock_timestamp() - INTERVAL '10 minutes')`,
         [tenant1Id, testLeadId]
       );
     });
@@ -484,7 +484,7 @@ describe('Milestone 2: High Concurrency, Non-blocking Cron/Notifications & Queue
 
       await client.query(
         `INSERT INTO capi_logs (tenant_id, lead_id, dataset_id, event_name, event_id, action_source, match_keys, sent_payload, response_status, sent_at)
-         VALUES ($1, $2, '9876543210', 'Purchase', 'capi_evt_network_timeout', 'system_cron_retry', '{}'::jsonb, '{"data":[]}'::jsonb, 500, clock_timestamp() - INTERVAL '15 minutes')`,
+         VALUES ($1, $2, '9876543210', 'Purchase', 'capi_evt_network_timeout', 'system_generated', '{}'::jsonb, '{"data":[]}'::jsonb, 500, clock_timestamp() - INTERVAL '15 minutes')`,
         [tenant1Id, failLeadId]
       );
     });

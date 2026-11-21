@@ -207,6 +207,11 @@ async function runCrm360PostgresSchema(client: DbClient): Promise<void> {
     ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS options_json JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS is_filterable BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS show_in_table BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS default_value TEXT;
+    ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS validation_regex TEXT;
+    ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS placeholder VARCHAR(255);
     CREATE INDEX IF NOT EXISTS idx_custom_fields_lookup ON tenant_custom_fields(tenant_id, entity_type, is_active, sort_order ASC);
 
     -- 4. Unified Omnichannel CRM Activities

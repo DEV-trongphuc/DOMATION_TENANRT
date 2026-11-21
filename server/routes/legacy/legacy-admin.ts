@@ -4,7 +4,7 @@ import type { TenantContext } from '../../core/context/tenant-context.ts';
 import { normalizeTenantSettings, type TenantSettings } from '../../core/settings/tenant-settings.ts';
 import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
-import { buildLegacyDateFilter, formatDateTimeVnSql } from './legacy-helpers.ts';
+import { buildLegacyDateFilterFromParams, formatDateTimeVnSql } from './legacy-helpers.ts';
 import { getZonedDateParts } from '../workspace.routes.ts';
 import { hashPassword, verifyPassword } from '../../core/crypto/password.ts';
 import { encryptTenantSecret } from '../../core/crypto/vault.ts';
@@ -20,6 +20,10 @@ import {
   toggleMetaAdAccountStatus,
   upsertMetaAdAccount,
 } from '../../services/meta-ads.service.ts';
+import {
+  getSharedTenantAiConfig,
+  saveSharedTenantAiConfig,
+} from '../../services/dom-meta-report.service.ts';
 import { normalizePhoneE164 } from '../../services/phone.service.ts';
 import { maskPhoneString } from '../../core/security/pii-masker.ts';
 import { dispatchStageCapiEvent } from '../../services/capi.service.ts';
@@ -143,13 +147,37 @@ function pickSettingsForLegacy(cfg: TenantSettings, extra: Record<string, any> =
     ses_password: extra.ses_password ? '••••••••' : '',
     ses_sender_name: extra.ses_sender_name || cfg.brand_display_name || cfg.capi_event_source_name || 'DOMATION AUTO DATA',
     ses_sender_email: extra.ses_sender_email || cfg.support_email || 'noreply@domation.net',
+    resend_api_key: extra.resend_api_key ? '••••••••' : '',
+    resend_from_email: extra.resend_from_email || '',
+    discord_webhook_url: extra.discord_webhook_url || '',
     zalo_bot_token: extra.zalo_bot_token || '',
     zalo_webhook_secret: extra.zalo_webhook_secret || '',
     zalo_bot_link: extra.zalo_bot_link || '',
-    zalo_admin_group_chat_id: extra.zalo_admin_group_chat_id || '',
-    zalo_notify_only_group: extra.zalo_notify_only_group ? '1' : '0',
-    zalo_daily_report_time: extra.zalo_daily_report_time || '18:00',
-    daily_report_admins: JSON.stringify(extra.daily_report_admins || []),
+    zalo_admin_group_chat_id: cfg.zalo_admin_group_chat_id,
+    zalo_notify_only_group: cfg.zalo_notify_only_group ? '1' : '0',
+    zalo_daily_report_time: cfg.zalo_daily_report_time,
+    zalo_weekly_report_day: cfg.zalo_weekly_report_day,
+    zalo_weekly_report_time: cfg.zalo_weekly_report_time,
+    zalo_monthly_report_enabled: cfg.zalo_monthly_report_enabled,
+    zalo_monthly_report_time: cfg.zalo_monthly_report_time,
+    master_sync_enabled: Boolean(
+      extra.master_sync_enabled ??
+        (extra.master_two_way_sync === '1' || extra.master_two_way_sync === true)
+    ),
+    master_two_way_sync:
+      extra.master_sync_enabled === true ||
+      extra.master_sync_enabled === '1' ||
+      extra.master_two_way_sync === '1' ||
+      extra.master_two_way_sync === true
+        ? '1'
+        : '0',
+    master_google_script_url: String(extra.master_google_script_url || ''),
+    master_sheet_name: String(extra.master_sheet_name || ''),
+    daily_report_admins: JSON.stringify(cfg.daily_report_admins || []),
+    daily_report_channels: cfg.daily_report_channels,
+    daily_report_include_meta_ads: cfg.daily_report_include_meta_ads,
+    daily_report_meta_ads_metrics: cfg.daily_report_meta_ads_metrics,
+    daily_report_meta_account_ids: cfg.daily_report_meta_account_ids,
     ticket_notify_admins: JSON.stringify(extra.ticket_notify_admins || []),
     ai_screener_enabled: extra.ai_screener_enabled ? '1' : '0',
     ai_screener_mode: extra.ai_screener_mode || 'ai',
@@ -159,7 +187,21 @@ function pickSettingsForLegacy(cfg: TenantSettings, extra: Record<string, any> =
       : String(extra.ai_screener_rounds || ''),
     ai_screener_manual_action: extra.ai_screener_manual_action || 'hold',
     ai_screener_manual_rules: JSON.stringify(extra.ai_screener_manual_rules || []),
-    gemini_model: extra.gemini_model || 'gemini-3.5-flash-lite',
+    gemini_api_key: extra.gemini_api_key || '',
+    has_shared_gemini_key: extra.has_shared_gemini_key ? '1' : '0',
+    gemini_model: extra.gemini_model || 'gemini-2.5-flash',
+    ai_lead_eval_enabled:
+      extra.ai_lead_eval_enabled !== false &&
+      extra.ai_lead_eval_enabled !== '0' &&
+      extra.ai_lead_eval_enabled !== 0
+        ? '1'
+        : '0',
+    ai_ads_eval_enabled:
+      extra.ai_ads_eval_enabled !== false &&
+      extra.ai_ads_eval_enabled !== '0' &&
+      extra.ai_ads_eval_enabled !== 0
+        ? '1'
+        : '0',
     global_exclusion_keys: extra.global_exclusion_keys || '',
     global_exclusion_contacts: extra.global_exclusion_contacts || '',
     pipeline_capi_stages: cfg.pipeline_capi_stages,
@@ -201,6 +243,7 @@ export async function handleLegacyAdminStandalone(
       tenantName: brandDisplayName,
       tenantSlug: tenantInfo.slug || ctx.tenantSlug,
       frontendUrl,
+      includeMetaAds: normalizedCfg.daily_report_include_meta_ads,
     });
 
     const dispatchRes = await sendTenantEmailNotification({
@@ -268,7 +311,7 @@ export async function handleLegacyAdmin(
   // 1. ROUNDS & COMPENSATION
   // ============================================================================
   if (action === 'get_rounds') {
-    const dateFilter = buildLegacyDateFilter(params.get('date') || 'Tháng này');
+    const dateFilter = buildLegacyDateFilterFromParams(params, 'Tháng này');
     const qParams: unknown[] = [ctx.tenantId];
     const dateCond = dateFilter.bindSql('l.created_at', qParams);
 
@@ -311,6 +354,7 @@ export async function handleLegacyAdmin(
       }
     }
 
+    const allowLifetimeFallback = dateFilter.preset === 'all';
     const mapped = roundsRes.rows.map((r) => {
       const members = rcRes.rows.filter((m) => m.round_id === r.id);
       const ratios: Record<string, number> = {};
@@ -322,8 +366,16 @@ export async function handleLegacyAdmin(
         ratios[m.user_id] = Number(m.receive_ratio || 1);
         data_per_turns[m.user_id] = Number(m.data_per_turn || 1);
         compensations[m.user_id] = Number(m.compensation_count || 0);
-        leads_by_user[m.user_id] = lcMap.get(`${r.id}:${m.user_id}`) ?? Number(m.leads_received_in_round || 0);
+        const windowedCount = lcMap.get(`${r.id}:${m.user_id}`);
+        leads_by_user[m.user_id] =
+          windowedCount !== undefined
+            ? windowedCount
+            : allowLifetimeFallback
+              ? Number(m.leads_received_in_round || 0)
+              : 0;
       }
+
+      const windowedRoundTotal = roundTotalMap.get(r.id);
 
       return {
         id: r.id,
@@ -347,7 +399,7 @@ export async function handleLegacyAdmin(
           receive_ratio: Number(m.receive_ratio || 1),
           data_per_turn: Number(m.data_per_turn || 1),
           compensation_count: Number(m.compensation_count || 0),
-          leads_received: lcMap.get(`${r.id}:${m.user_id}`) ?? Number(m.leads_received_in_round || 0),
+          leads_received: leads_by_user[m.user_id] ?? 0,
           status: m.status || 'active',
           vacation_mode: m.vacation_mode ? 1 : 0,
         })),
@@ -355,7 +407,12 @@ export async function handleLegacyAdmin(
         data_per_turns,
         compensations,
         leads_by_user,
-        total_leads: roundTotalMap.get(r.id) || members.reduce((s, m) => s + Number(m.leads_received_in_round || 0), 0),
+        total_leads:
+          windowedRoundTotal !== undefined
+            ? windowedRoundTotal
+            : allowLifetimeFallback
+              ? members.reduce((s, m) => s + Number(m.leads_received_in_round || 0), 0)
+              : 0,
         created_at: formatDateTimeVnSql(r.created_at),
       };
     });
@@ -591,44 +648,211 @@ export async function handleLegacyAdmin(
   }
 
   if (action === 'get_consultant_stats') {
-    const consId = String(params.get('consultant_id') || '');
-    const dateMode = String(params.get('date_mode') || 'this_month');
-    const df = buildLegacyDateFilter(dateMode);
-    const qParams: unknown[] = [ctx.tenantId, consId];
-    const cond = df.bindSql('created_at', qParams);
+    const consId = String(params.get('consultant_id') || '').trim();
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(consId);
+    if (!isUuid) {
+      return {
+        success: true,
+        summary: {
+          total: 0,
+          successful: 0,
+          reminder: 0,
+          error: 0,
+          system_total_successful: 0,
+        },
+        by_date: [],
+        rounds: [],
+        by_source: [],
+        tickets: { total: 0, approved: 0, pending: 0, rejected: 0 },
+        active_compensation: 0,
+        blacklist_compensation: 0,
+        pipeline_stats: {
+          Qualified: 0,
+          Booked: 0,
+          Booking: 0,
+          Deposited: 0,
+          Closed: 0,
+          Badtiming: 0,
+          NoAnswer: 0,
+          Notlead: 0,
+          unrated: 0,
+          total: 0,
+        },
+        data: { total: 0, accepted: 0, qualified: 0, chart: [] },
+      };
+    }
 
-    const [sumRes, leadDatesRes] = await Promise.all([
-      client.query(
-        `SELECT COUNT(*) AS total,
-                COALESCE(SUM(CASE WHEN is_accepted = true THEN 1 ELSE 0 END), 0) AS accepted,
-                COALESCE(SUM(CASE WHEN LOWER(quality_status) IN ('qualified','booked','booking','closed','good') THEN 1 ELSE 0 END), 0) AS qualified
-         FROM leads
-         WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = false AND status != 'archived' AND (${cond})`,
+    const df = buildLegacyDateFilterFromParams(params, 'this_month', 'date_mode');
+    const qParams: unknown[] = [ctx.tenantId, consId];
+    const cond = df.bindSql('l.created_at', qParams);
+    const sysParams: unknown[] = [ctx.tenantId];
+    const sysCond = df.bindSql('created_at', sysParams);
+    const ticketParams: unknown[] = [ctx.tenantId, consId];
+    const ticketCond = df.bindSql('created_at', ticketParams);
+
+    const [leadsRes, sysRes, ticketsRes, activeCompRes] = await Promise.all([
+      client.query<{
+        created_at: Date | string;
+        status: string;
+        quality_status: string | null;
+        is_accepted: boolean;
+        is_duplicate_reminder: boolean | null;
+        is_duplicated: boolean | null;
+        source: string | null;
+        round_name: string | null;
+        custom_fields: Record<string, any> | null;
+      }>(
+        `SELECT l.created_at, l.status, l.quality_status, l.is_accepted,
+                l.is_duplicate_reminder, l.is_duplicated, l.source,
+                dr.name AS round_name, l.custom_fields
+         FROM leads l
+         LEFT JOIN distribution_rounds dr ON dr.tenant_id = l.tenant_id AND dr.id = l.round_id
+         WHERE l.tenant_id = $1 AND l.assigned_to = $2 AND l.is_deleted = false AND l.status != 'archived' AND (${cond})`,
         qParams
       ),
-      client.query<{ created_at: Date | string }>(
-        `SELECT created_at
+      client.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt
          FROM leads
-         WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = false AND status != 'archived' AND (${cond})`,
-        qParams
+         WHERE tenant_id = $1 AND is_deleted = false AND status = 'assigned'
+           AND COALESCE(is_duplicate_reminder, false) = false
+           AND (${sysCond})`,
+        sysParams
+      ),
+      client.query<{ status: string; compensation_granted: boolean }>(
+        `SELECT status, compensation_granted
+         FROM data_reports
+         WHERE tenant_id = $1 AND reporter_id = $2 AND (${ticketCond})`,
+        ticketParams
+      ),
+      client.query<{ total_comp: number }>(
+        `SELECT COALESCE(SUM(amount), 0)::int AS total_comp
+         FROM active_compensation_logs
+         WHERE tenant_id = $1 AND consultant_user_id = $2 AND (${ticketCond})`,
+        ticketParams
       ),
     ]);
+
     const dayMap = new Map<string, { date: string; count: number }>();
-    for (const row of leadDatesRes.rows) {
+    const roundMap = new Map<string, { round_name: string; successful_count: number; reminder_count: number; error_count: number }>();
+    const sourceMap = new Map<string, number>();
+    const pipStats = {
+      Qualified: 0,
+      Booked: 0,
+      Booking: 0,
+      Deposited: 0,
+      Closed: 0,
+      Badtiming: 0,
+      NoAnswer: 0,
+      Notlead: 0,
+      unrated: 0,
+      total: 0,
+    };
+
+    let successful = 0;
+    let reminder = 0;
+    let error = 0;
+    let accepted = 0;
+    let qualified = 0;
+
+    for (const row of leadsRes.rows) {
+      const isReminder = Boolean(row.is_duplicate_reminder || row.is_duplicated);
+      const isErr = row.status === 'rejected' || row.status === 'blacklisted';
+      const isSucc = !isReminder && !isErr && row.status === 'assigned';
+
+      if (isSucc) successful++;
+      else if (isReminder) reminder++;
+      else if (isErr) error++;
+
+      if (row.is_accepted) accepted++;
+      const qRaw = String(row.quality_status || '').trim();
+      const qLower = qRaw.toLowerCase();
+      if (['qualified', 'booked', 'booking', 'deposited', 'closed', 'good'].includes(qLower)) {
+        qualified++;
+      }
+
+      pipStats.total++;
+      if (qLower === 'qualified' || qLower === 'good') pipStats.Qualified++;
+      else if (qLower === 'booked') pipStats.Booked++;
+      else if (qLower === 'booking') pipStats.Booking++;
+      else if (qLower === 'deposited') pipStats.Deposited++;
+      else if (qLower === 'closed') pipStats.Closed++;
+      else if (qLower === 'badtiming') pipStats.Badtiming++;
+      else if (qLower === 'noanswer') pipStats.NoAnswer++;
+      else if (qLower === 'notlead' || qLower === 'spam') pipStats.Notlead++;
+      else pipStats.unrated++;
+
       const zp = getZonedDateParts(row.created_at, 'Asia/Ho_Chi_Minh');
-      if (!zp) continue;
-      const cur = dayMap.get(zp.ymd) || { date: zp.ddmm, count: 0 };
-      cur.count++;
-      dayMap.set(zp.ymd, cur);
+      if (zp) {
+        const cur = dayMap.get(zp.ymd) || { date: zp.ddmm, count: 0 };
+        if (isSucc || (!isReminder && !isErr)) cur.count++;
+        dayMap.set(zp.ymd, cur);
+      }
+
+      const rName = row.round_name || String(row.custom_fields?.round_name || 'Mặc định');
+      const rEntry = roundMap.get(rName) || {
+        round_name: rName,
+        successful_count: 0,
+        reminder_count: 0,
+        error_count: 0,
+      };
+      if (isSucc) rEntry.successful_count++;
+      else if (isReminder) rEntry.reminder_count++;
+      else if (isErr) rEntry.error_count++;
+      roundMap.set(rName, rEntry);
+
+      if (isSucc) {
+        const src = String(row.source || 'Khác').trim() || 'Khác';
+        sourceMap.set(src, (sourceMap.get(src) || 0) + 1);
+      }
     }
+
     const dailyChart = [...dayMap.entries()]
       .sort((a, b) => a[0].localeCompare(b[0]))
-      .slice(0, 31)
+      .slice(-31)
       .map(([, val]) => val);
+
+    const bySource = [...sourceMap.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([source, count]) => ({ source, count }));
+
+    let tApproved = 0;
+    let tPending = 0;
+    let tRejected = 0;
+    for (const t of ticketsRes.rows) {
+      if (t.status === 'approved') tApproved++;
+      else if (t.status === 'rejected') tRejected++;
+      else tPending++;
+    }
+
+    const total = leadsRes.rows.length;
+    const systemTotalSuccessful = Number(sysRes.rows[0]?.cnt || 0);
+    const activeComp = Number(activeCompRes.rows[0]?.total_comp || 0);
+
     return {
       success: true,
+      summary: {
+        total,
+        successful,
+        reminder,
+        error,
+        system_total_successful: systemTotalSuccessful,
+      },
+      by_date: dailyChart,
+      rounds: [...roundMap.values()],
+      by_source: bySource,
+      tickets: {
+        total: ticketsRes.rows.length,
+        approved: tApproved,
+        pending: tPending,
+        rejected: tRejected,
+      },
+      active_compensation: activeComp,
+      blacklist_compensation: 0,
+      pipeline_stats: pipStats,
       data: {
-        ...(sumRes.rows[0] || { total: 0, accepted: 0, qualified: 0 }),
+        total,
+        accepted,
+        qualified,
         chart: dailyChart,
       },
     };
@@ -865,7 +1089,7 @@ export async function handleLegacyAdmin(
           id: w.id,
           name: w.name,
           sheet_url: meta.sheet_url || w.url || '',
-          sheet_name: meta.sheet_name || 'Trang tính1',
+          sheet_name: meta.sheet_name || w.name || 'Trang tính1',
           spreadsheet_id: meta.spreadsheet_id || '',
           webhook_token: w.token,
           signing_secret: w.signing_secret,
@@ -968,7 +1192,13 @@ export async function handleLegacyAdmin(
     const list: any[] = [];
     for (const w of r.rows) {
       const mList = Array.isArray(w.field_mappings?.mappings) ? w.field_mappings.mappings : [];
-      for (const m of mList) list.push({ ...m, connection_id: w.id });
+      mList.forEach((m: any, idx: number) => {
+        list.push({
+          ...m,
+          id: m?.id || `${w.id}:${idx}`,
+          connection_id: w.id,
+        });
+      });
     }
     return { success: true, data: list };
   }
@@ -1035,15 +1265,18 @@ export async function handleLegacyAdmin(
   // 5. SETTINGS, TICKET SETTINGS, EMAIL, META CAPI & BATCH IMPORT
   // ============================================================================
   if (action === 'get_settings' || action === 'get_ticket_settings') {
-    const tRes = await client.query<{ settings: Record<string, any> }>(
-      'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
-      [ctx.tenantId]
-    );
+    const [tRes, aiRes, sharedAi] = await Promise.all([
+      client.query<{ settings: Record<string, any> }>(
+        'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+        [ctx.tenantId]
+      ),
+      client.query(
+        'SELECT is_enabled, mode, model_name, prompt_rules, manual_action, manual_rules, target_round_ids FROM ai_screener_configs WHERE tenant_id = $1 LIMIT 1',
+        [ctx.tenantId]
+      ),
+      getSharedTenantAiConfig(client, ctx.tenantId),
+    ]);
     const rawSettings = tRes.rows[0]?.settings || {};
-    const aiRes = await client.query(
-      'SELECT is_enabled, mode, model_name, prompt_rules, manual_action, manual_rules, target_round_ids FROM ai_screener_configs WHERE tenant_id = $1 LIMIT 1',
-      [ctx.tenantId]
-    );
     const aiRow = aiRes.rows[0];
     const data = pickSettingsForLegacy(normalizeTenantSettings(rawSettings), {
       ...rawSettings,
@@ -1058,6 +1291,11 @@ export async function handleLegacyAdmin(
             ai_screener_rounds: aiRow.target_round_ids,
           }
         : {}),
+      gemini_api_key: sharedAi.api_key_masked,
+      has_shared_gemini_key: sharedAi.has_api_key,
+      gemini_model: sharedAi.model || aiRow?.model_name || rawSettings.gemini_model,
+      ai_lead_eval_enabled: sharedAi.ai_lead_eval_enabled,
+      ai_ads_eval_enabled: sharedAi.ai_ads_eval_enabled,
     });
 
     if (action === 'get_ticket_settings') {
@@ -1082,15 +1320,20 @@ export async function handleLegacyAdmin(
         `UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1`,
         [ctx.tenantId, JSON.stringify(mergedSettings)]
       );
-      tenantRedis.invalidateTenantCache(ctx.tenantId);
+      tenantRedis.invalidateTenantCache(ctx.tenantId, ctx.tenantSlug);
       return { success: true, message: 'Đã lưu cấu hình thông báo Ticket.' };
     }
 
     const patchObj: Record<string, any> = { ...payload };
     delete patchObj.action;
     delete patchObj.tenant_settings;
+    delete patchObj.gemini_api_key;
+    delete patchObj.clear_gemini_api_key;
     if (patchObj.ses_password === '••••••••') {
       delete patchObj.ses_password;
+    }
+    if (patchObj.resend_api_key === '••••••••') {
+      delete patchObj.resend_api_key;
     }
 
     if (payload.tenant_settings && typeof payload.tenant_settings === 'object') {
@@ -1105,7 +1348,11 @@ export async function handleLegacyAdmin(
       'starvation_prevention_enabled',
       'ticket_auto_approve_enabled',
       'zalo_notify_only_group',
+      'zalo_monthly_report_enabled',
+      'daily_report_include_meta_ads',
       'ai_screener_enabled',
+      'ai_lead_eval_enabled',
+      'ai_ads_eval_enabled',
       'auto_accept_on_assign',
       'auto_drain_on_online',
       'drain_recalled_leads',
@@ -1123,15 +1370,25 @@ export async function handleLegacyAdmin(
       'pii_hide_internal_notes',
       'auto_disqualify_on_ticket_approve',
       'capi_enabled',
+      'master_sync_enabled',
     ];
     for (const bk of legacyBoolKeys) {
       if (patchObj[bk] !== undefined) {
         patchObj[bk] =
           patchObj[bk] === true ||
           patchObj[bk] === 1 ||
-          patchObj[bk] === '1' ||
-          patchObj[bk] === 'true';
+          ['true', '1'].includes(String(patchObj[bk]).trim().toLowerCase());
       }
+    }
+    if (patchObj.master_two_way_sync !== undefined) {
+      const masterOn =
+        patchObj.master_two_way_sync === true ||
+        patchObj.master_two_way_sync === 1 ||
+        ['true', '1'].includes(String(patchObj.master_two_way_sync).trim().toLowerCase());
+      patchObj.master_sync_enabled = masterOn;
+      patchObj.master_two_way_sync = masterOn ? '1' : '0';
+    } else if (patchObj.master_sync_enabled !== undefined) {
+      patchObj.master_two_way_sync = patchObj.master_sync_enabled ? '1' : '0';
     }
 
     const legacyJsonKeys = [
@@ -1144,6 +1401,9 @@ export async function handleLegacyAdmin(
       'blocked_phone_sequences',
       'role_permissions',
       'daily_report_admins',
+      'daily_report_channels',
+      'daily_report_meta_ads_metrics',
+      'daily_report_meta_account_ids',
       'ticket_notify_admins',
       'ai_screener_manual_rules',
     ];
@@ -1203,36 +1463,95 @@ export async function handleLegacyAdmin(
       [ctx.tenantId, JSON.stringify(finalStoredSettings)]
     );
 
+    const rawSubmittedGeminiKey =
+      typeof payload.gemini_api_key === 'string' ? payload.gemini_api_key.trim() : '';
+    const isProvisioningNewGeminiKey =
+      rawSubmittedGeminiKey.length > 0 &&
+      rawSubmittedGeminiKey !== '__KEEP_EXISTING__' &&
+      !rawSubmittedGeminiKey.includes('••••') &&
+      !rawSubmittedGeminiKey.includes('***') &&
+      !rawSubmittedGeminiKey.includes('...');
+
+    const hasSharedAiPatch =
+      payload.gemini_api_key !== undefined ||
+      payload.clear_gemini_api_key !== undefined ||
+      payload.ai_lead_eval_enabled !== undefined ||
+      payload.ai_ads_eval_enabled !== undefined;
+
+    if (hasSharedAiPatch) {
+      const parseSubmittedBool = (v: unknown): boolean =>
+        v === true || v === 1 || v === '1' || v === 'true';
+      await saveSharedTenantAiConfig(client, ctx.tenantId, {
+        ...(payload.gemini_api_key !== undefined
+          ? { api_key: String(payload.gemini_api_key) }
+          : {}),
+        ...(payload.clear_gemini_api_key === true || payload.clear_gemini_api_key === '1'
+          ? { clear_api_key: true }
+          : {}),
+        ...(payload.gemini_model !== undefined ? { model: String(payload.gemini_model) } : {}),
+        ...(payload.ai_lead_eval_enabled !== undefined
+          ? { ai_lead_eval_enabled: parseSubmittedBool(payload.ai_lead_eval_enabled) }
+          : {}),
+        ...(payload.ai_ads_eval_enabled !== undefined
+          ? { ai_ads_eval_enabled: parseSubmittedBool(payload.ai_ads_eval_enabled) }
+          : {}),
+      });
+    }
+
     if (
       payload.ai_screener_enabled !== undefined ||
       payload.ai_screener_rules !== undefined ||
       payload.ai_screener_mode !== undefined
     ) {
-      const isEnabled =
-        payload.ai_screener_enabled !== undefined
-          ? Number(payload.ai_screener_enabled) === 1 || payload.ai_screener_enabled === true
-          : true;
+      // When provisioning a brand-new Gemini key (e.g. CRM AI Key Modal initial setup), keep
+      // saveSharedTenantAiConfig's auto-activation behavior (required by dom-meta-report.test.ts).
+      // Otherwise (updates without provisioning a new key), always honor explicit ai_screener_enabled.
+      const explicitScreenerBool =
+        !isProvisioningNewGeminiKey && payload.ai_screener_enabled !== undefined
+          ? Number(payload.ai_screener_enabled) === 1 ||
+            payload.ai_screener_enabled === true ||
+            payload.ai_screener_enabled === 'true'
+          : null;
       await client.query(
-        `UPDATE ai_screener_configs
-         SET is_enabled = COALESCE($2, is_enabled),
-             mode = COALESCE($3, mode),
-             prompt_rules = COALESCE($4, prompt_rules),
-             model_name = COALESCE($5, model_name),
-             manual_action = COALESCE($6, manual_action),
-             updated_at = clock_timestamp()
-         WHERE tenant_id = $1`,
+        `INSERT INTO ai_screener_configs (
+           tenant_id, is_enabled, mode, prompt_rules, model_name, manual_action, manual_rules, target_round_ids
+         ) VALUES (
+           $1, COALESCE($2, true), COALESCE($3, 'ai'), $4, COALESCE($5, 'gemini-2.5-flash'), COALESCE($6, 'hold'), '[]'::jsonb, '[]'::jsonb
+         )
+         ON CONFLICT (tenant_id) DO UPDATE SET
+           is_enabled = COALESCE($2, ai_screener_configs.is_enabled),
+           mode = COALESCE($3, ai_screener_configs.mode),
+           prompt_rules = COALESCE($4, ai_screener_configs.prompt_rules),
+           model_name = COALESCE($5, ai_screener_configs.model_name),
+           manual_action = COALESCE($6, ai_screener_configs.manual_action),
+           updated_at = clock_timestamp()`,
         [
           ctx.tenantId,
-          isEnabled,
+          explicitScreenerBool,
           payload.ai_screener_mode || null,
           payload.ai_screener_rules || null,
           payload.gemini_model || null,
           payload.ai_screener_manual_action || null,
         ]
       );
+
+      if (explicitScreenerBool !== null && hasSharedAiPatch) {
+        const syncedSettingsRes = await client.query<{ settings: Record<string, any> | null }>(
+          'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        );
+        const syncedSettings =
+          syncedSettingsRes.rows[0]?.settings && typeof syncedSettingsRes.rows[0].settings === 'object'
+            ? { ...syncedSettingsRes.rows[0].settings, ai_screener_enabled: explicitScreenerBool }
+            : { ai_screener_enabled: explicitScreenerBool };
+        await client.query(
+          `UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1`,
+          [ctx.tenantId, JSON.stringify(syncedSettings)]
+        );
+      }
     }
 
-    tenantRedis.invalidateTenantCache(ctx.tenantId);
+    tenantRedis.invalidateTenantCache(ctx.tenantId, ctx.tenantSlug);
     return { success: true, message: 'Đã lưu cấu hình hệ thống.' };
   }
 

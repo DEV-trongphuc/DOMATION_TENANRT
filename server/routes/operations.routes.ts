@@ -13,6 +13,7 @@ import {
 import { validateAndNormalizePhone } from '../services/phone.service.ts';
 import { ingestAndDistributeLead } from '../services/distribution.service.ts';
 import { getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
+import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import { formatDateTimeVnSql } from './legacy/legacy-helpers.ts';
 
 export const operationsRouter = Router();
@@ -426,6 +427,7 @@ operationsRouter.put(
       );
       return r.rows[0];
     });
+    tenantRedis.invalidateGatekeeperPreflight(ctx.tenantId);
     res.json({ success: true, data: saved });
   } catch (err: any) {
     sendApiError(res, 500, 'GATEKEEPER_SAVE_FAILED', err?.message || 'Không thể lưu cấu hình AI Gatekeeper.');
@@ -533,6 +535,10 @@ operationsRouter.post('/gatekeeper/held-leads/:id/resolve', requirePermission('g
       return { ...row, nextStatus };
     });
 
+    if (action === 'blacklist' && heldRow.phone) {
+      tenantRedis.invalidateBlacklistCache(ctx.tenantId);
+    }
+
     let distributedLead: any = null;
     if (action === 'approve' || action === 'fallback') {
       const payload = (heldRow.payload_json && typeof heldRow.payload_json === 'object' ? heldRow.payload_json : {}) as any;
@@ -583,16 +589,27 @@ operationsRouter.post(
       return;
     }
 
+    const normalizedBlacklistValue =
+      entry_type === 'email'
+        ? cleanVal.toLowerCase()
+        : entry_type === 'phone'
+          ? (() => {
+              const p = validateAndNormalizePhone(cleanVal);
+              return p.valid && p.normalizedE164 ? p.normalizedE164 : cleanVal;
+            })()
+          : cleanVal;
+
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
       const r = await client.query(
         `INSERT INTO blacklist_entries (tenant_id, entry_type, value, reason, created_by)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (tenant_id, entry_type, value) DO UPDATE SET reason = EXCLUDED.reason
          RETURNING *`,
-        [ctx.tenantId, entry_type, entry_type === 'email' ? cleanVal.toLowerCase() : cleanVal, String(reason).trim(), ctx.userId]
+        [ctx.tenantId, entry_type, normalizedBlacklistValue, String(reason).trim(), ctx.userId]
       );
       return r.rows[0];
     });
+    tenantRedis.invalidateBlacklistCache(ctx.tenantId);
     res.status(201).json({ success: true, data: created });
   } catch (err: any) {
     sendApiError(res, 500, 'ADD_BLACKLIST_FAILED', err?.message || 'Không thể thêm vào danh sách chặn.');
@@ -611,6 +628,7 @@ operationsRouter.delete(
         req.params.id,
       ]);
     });
+    tenantRedis.invalidateBlacklistCache(ctx.tenantId);
     res.json({ success: true, data: { deleted: true } });
   } catch (err: any) {
     sendApiError(res, 500, 'DELETE_BLACKLIST_FAILED', err?.message || 'Không thể xóa mục chặn.');
@@ -675,6 +693,9 @@ operationsRouter.post('/admin-audit/:id/rollback', requirePermission('settings',
       );
       return upd.rows[0];
     });
+    if (out?.entity_type === 'tenant_settings') {
+      tenantRedis.invalidateTenantCache(ctx.tenantId, ctx.tenantSlug);
+    }
     res.json({ success: true, data: out });
   } catch (err: any) {
     sendApiError(res, 500, 'ROLLBACK_FAILED', err?.message || 'Không thể hoàn tác thao tác này.');
@@ -918,6 +939,10 @@ operationsRouter.post('/leads/batch-import', requirePermission('leads', 'import'
 
       return { batch_id: batchId, total_rows: list.length, imported_count: importedCount, duplicate_count: duplicateCount, skipped_count: skippedCount };
     });
+
+    if (summary.imported_count > 0) {
+      tenantRedis.incrementTenantMonthlyLeadCount(ctx.tenantId, summary.imported_count);
+    }
 
     res.status(201).json({ success: true, data: summary });
   } catch (err: any) {

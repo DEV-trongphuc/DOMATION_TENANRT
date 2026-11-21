@@ -75,6 +75,10 @@ describe('DOM ERP Global Multi-Tenant Standardization Integration Suite', () => 
       token: regB.json.data.access_token,
     };
 
+    await withTenantTransaction(tenantB.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantB.id]);
+    });
+
     const upB = await apiRequest(harness.baseUrl, '/api/v1/myerp/package-entitlements/upgrade', {
       method: 'POST',
       token: tenantB.token,
@@ -154,6 +158,11 @@ describe('DOM ERP Global Multi-Tenant Standardization Integration Suite', () => 
     assert.equal(leadCreate.status, 201);
     const preservedLeadId = leadCreate.json.data.lead_id || leadCreate.json.data.id;
     assert.ok(preservedLeadId);
+
+    // Fund tenantA wallet before paid package upgrade (`autodata_crm` -> `domation_promax`)
+    await withTenantTransaction(tenantA.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantA.id]);
+    });
 
     // Perform 1-click upgrade from `autodata_crm` -> `domation_promax` (`DOM ERP`)
     const upgradeRes = await apiRequest(harness.baseUrl, '/api/v1/myerp/package-entitlements/upgrade', {

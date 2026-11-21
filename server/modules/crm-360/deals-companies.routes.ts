@@ -634,8 +634,9 @@ dealsCompaniesRouter.put(
         const cur = curRes.rows[0];
 
         const nextStage = b.stage ? normalizeCanonicalDealStage(b.stage) : cur.stage;
+        let stageOutcome: { deal: Record<string, any>; becameWon: boolean } | null = null;
         if (nextStage !== cur.stage) {
-          await transitionDealStageInTx(client, {
+          stageOutcome = await transitionDealStageInTx(client, {
             tenantId: ctx.tenantId,
             dealId,
             nextStageRaw: nextStage,
@@ -697,14 +698,29 @@ dealsCompaniesRouter.put(
           ctx.tenantId,
           dealId,
         ]);
-        return fresh.rows[0];
+        return {
+          deal: fresh.rows[0],
+          becameWon: Boolean(stageOutcome?.becameWon),
+        };
       });
 
       if (!updated) {
         sendApiError(res, 404, 'DEAL_NOT_FOUND', 'Không tìm thấy cơ hội kinh doanh.');
         return;
       }
-      res.json({ success: true, data: updated });
+
+      if (updated.becameWon && updated.deal?.lead_id) {
+        emitDomainEventDetached('deal.won', {
+          tenantId: ctx.tenantId,
+          leadId: String(updated.deal.lead_id),
+          dealId,
+          amountVnd: Number(updated.deal.amount_vnd || 0),
+          sourceEntity: 'deal',
+          actorId: ctx.userId,
+        });
+      }
+
+      res.json({ success: true, data: updated.deal });
     } catch (err: any) {
       sendApiError(res, 500, 'CRM_DEAL_UPDATE_FAILED', err?.message || 'Không thể cập nhật cơ hội.');
     }

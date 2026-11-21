@@ -280,6 +280,7 @@ async function sendToGraphApiOrSimulate(
     accessToken &&
     !accessToken.startsWith('sandbox_') &&
     !accessToken.startsWith('test_') &&
+    !accessToken.startsWith('demo_') &&
     accessToken.length > 30;
 
   if (isLiveToken) {
@@ -327,12 +328,140 @@ export interface DispatchCapiResult {
   event_source_name?: string;
 }
 
+export function isLiveMetaCapiCredential(datasetId?: string | null, accessToken?: string | null): boolean {
+  const ds = String(datasetId || '').trim();
+  const tok = String(accessToken || '').trim();
+  return Boolean(
+    ds &&
+      ds !== 'DEMO_DATASET_PIXEL' &&
+      tok &&
+      !tok.startsWith('sandbox_') &&
+      !tok.startsWith('test_') &&
+      !tok.startsWith('demo_') &&
+      tok.length > 30
+  );
+}
+
+const LEGACY_QUALITY_CAPI_FALLBACK_MAP: Record<string, string> = {
+  qualified: 'Lead',
+  booked: 'Schedule',
+  booking: 'AddToCart',
+  deposited: 'InitiateCheckout',
+  closed: 'Purchase',
+};
+
+export function resolveCapiEventForQualityOrStage(params: {
+  stageCapiMapping?: string | null;
+  qualityStatus?: string | null;
+  tenantSettings?: Partial<TenantSettings> | null;
+}): string | null {
+  const stageMapping = String(params.stageCapiMapping || '').trim();
+  if (stageMapping && stageMapping.toLowerCase() !== 'skip') {
+    return stageMapping;
+  }
+
+  const qualityRaw = String(params.qualityStatus || '').trim();
+  if (!qualityRaw) return null;
+  const qualityLower = qualityRaw.toLowerCase();
+
+  const configuredStages = params.tenantSettings?.pipeline_capi_stages;
+  if (Array.isArray(configuredStages) && configuredStages.length > 0) {
+    const matched = configuredStages.find(
+      (s) => String(s?.key || '').trim().toLowerCase() === qualityLower
+    );
+    if (matched) {
+      if (matched.enabled === false) return null;
+      const ev = String(matched.capi_event || '').trim();
+      return ev && ev.toLowerCase() !== 'skip' ? ev : null;
+    }
+  }
+
+  return LEGACY_QUALITY_CAPI_FALLBACK_MAP[qualityLower] || null;
+}
+
 /**
  * Dispatches a Meta CAPI event COMPLETELY OUTSIDE any open PostgreSQL transaction or row lock:
  * 1. Resolves tenant CAPI Vault config & TenantSettings from hot tenant-isolated cache (or brief read tx on cold miss).
  * 2. Executes external Graph API HTTPS `fetch` (primary + optional Dual-Send in parallel) with zero DB connections checked out.
  * 3. Persists `capi_logs` (and optional `lead_timeline_events` audit entry) in a single short post-HTTP transaction.
  */
+export async function resolveEffectiveMetaCapiConfig(
+  tenantId: string,
+  client?: DbClient
+): Promise<MetaCapiConfig> {
+  const [integRow, fbAdsRow] = await Promise.all([
+    getTenantIntegrationCached(tenantId, 'meta_capi', client),
+    getTenantIntegrationCached(tenantId, 'facebook_ads', client),
+  ]);
+
+  let rawCapi: Record<string, any> = {};
+  if (integRow && integRow.status === 'active') {
+    try {
+      rawCapi =
+        decryptTenantSecret<Record<string, any>>(
+          tenantId,
+          integRow.config_encrypted,
+          integRow.iv,
+          integRow.auth_tag
+        ) || {};
+    } catch {
+      rawCapi = {};
+    }
+  }
+
+  let sharedPixelId = '';
+  let sharedAccessToken = '';
+  if (fbAdsRow && fbAdsRow.status === 'active') {
+    try {
+      const fbRaw = decryptTenantSecret<Record<string, any>>(
+        tenantId,
+        fbAdsRow.config_encrypted,
+        fbAdsRow.iv,
+        fbAdsRow.auth_tag
+      );
+      if (fbRaw && Array.isArray(fbRaw.accounts)) {
+        const primaryId = String(fbRaw.primary_account_id || '').trim();
+        const activeList = fbRaw.accounts.filter((a: any) => a && a.is_active !== false);
+        const candidates = activeList.length > 0 ? activeList : fbRaw.accounts;
+        const picked =
+          (primaryId ? candidates.find((a: any) => a.id === primaryId) : null) ||
+          candidates.find((a: any) => a?.pixel_id && a?.access_token) ||
+          candidates.find((a: any) => a?.access_token) ||
+          candidates[0];
+        const pixelSource =
+          (picked?.pixel_id ? picked : null) ||
+          candidates.find((a: any) => Boolean(a?.pixel_id));
+        sharedPixelId = String(pixelSource?.pixel_id || '').trim();
+        sharedAccessToken = String(picked?.access_token || '').trim();
+      } else if (fbRaw && typeof fbRaw === 'object') {
+        sharedPixelId = String(fbRaw.pixel_id || fbRaw.capi_pixel_id || '').trim();
+        sharedAccessToken = String(fbRaw.access_token || fbRaw.fb_access_token || '').trim();
+      }
+    } catch {
+      // ignore corrupted vault fallback
+    }
+  }
+
+  const explicitDatasetId = String(rawCapi.dataset_id || rawCapi.capi_pixel_id || '').trim();
+  const explicitTokenRaw = String(rawCapi.access_token || rawCapi.capi_access_token || '').trim();
+  const explicitToken =
+    explicitTokenRaw && explicitTokenRaw !== '__KEEP_EXISTING__' ? explicitTokenRaw : '';
+
+  const resolvedDatasetId = explicitDatasetId || sharedPixelId || 'DEMO_DATASET_PIXEL';
+  const resolvedAccessToken = explicitToken || sharedAccessToken || 'sandbox_demo_token';
+  const resolvedLiveHttp =
+    rawCapi.live_http_enabled !== undefined
+      ? Boolean(rawCapi.live_http_enabled)
+      : isLiveMetaCapiCredential(resolvedDatasetId, resolvedAccessToken);
+
+  return {
+    ...(rawCapi as Partial<MetaCapiConfig>),
+    dataset_id: resolvedDatasetId,
+    access_token: resolvedAccessToken,
+    live_http_enabled: resolvedLiveHttp,
+  };
+}
+
 export async function dispatchStageCapiEventDetached(params: {
   tenantId: string;
   tenantSlug: string;
@@ -350,26 +479,12 @@ export async function dispatchStageCapiEventDetached(params: {
     return { dispatched: false, event_name: 'Skip', event_id: '', status: 0, status_label: 'SKIPPED' };
   }
 
-  const [integRow, resolvedTs] = await Promise.all([
-    getTenantIntegrationCached(params.tenantId, 'meta_capi'),
+  const [config, resolvedTs] = await Promise.all([
+    resolveEffectiveMetaCapiConfig(params.tenantId),
     params.tenantSettings
       ? Promise.resolve(params.tenantSettings)
       : getTenantSettingsCached(params.tenantId),
   ]);
-
-  let config: MetaCapiConfig = {
-    dataset_id: 'DEMO_DATASET_PIXEL',
-    access_token: 'sandbox_demo_token',
-  };
-
-  if (integRow && integRow.status === 'active') {
-    config = decryptTenantSecret<MetaCapiConfig>(
-      params.tenantId,
-      integRow.config_encrypted,
-      integRow.iv,
-      integRow.auth_tag
-    );
-  }
 
   const ts = resolvedTs || {};
   const currency = config.default_currency || ts.default_currency || 'VND';
@@ -548,20 +663,7 @@ export async function dispatchStageCapiEvent(
     return { dispatched: false, event_name: 'Skip', event_id: '', status: 0, status_label: 'SKIPPED' };
   }
 
-  const integRow = await getTenantIntegrationCached(params.tenantId, 'meta_capi', client);
-  let config: MetaCapiConfig = {
-    dataset_id: 'DEMO_DATASET_PIXEL',
-    access_token: 'sandbox_demo_token',
-  };
-
-  if (integRow && integRow.status === 'active') {
-    config = decryptTenantSecret<MetaCapiConfig>(
-      params.tenantId,
-      integRow.config_encrypted,
-      integRow.iv,
-      integRow.auth_tag
-    );
-  }
+  const config = await resolveEffectiveMetaCapiConfig(params.tenantId, client);
 
   const ts = params.tenantSettings || (await getTenantSettingsCached(params.tenantId, client));
   const currency = config.default_currency || ts.default_currency || 'VND';

@@ -1044,7 +1044,7 @@ attendanceRouter.get('/logs', requirePermission('attendance', 'view'), async (re
       const pEnd = `$${params.length}`;
 
       const r = await client.query(
-        `SELECT l.*, u.full_name AS user_name, u.email AS user_email,
+        `SELECT l.*, u.full_name AS user_name, u.email AS user_email, u.avatar_url AS avatar_url,
                 b.name AS branch_name, s.name AS shift_name
          FROM tenant_hr_attendance_logs l
          LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.user_id
@@ -1055,17 +1055,27 @@ attendanceRouter.get('/logs', requirePermission('attendance', 'view'), async (re
         params
       );
 
-      return r.rows.map((x) => ({
-        ...x,
-        work_date_str:
-          x.work_date instanceof Date ? x.work_date.toISOString().slice(0, 10) : String(x.work_date).slice(0, 10),
-        distance_meters: x.distance_meters !== null ? toNum(x.distance_meters, 0) : null,
-        within_geofence: toBool(x.within_geofence, true),
-        late_minutes: Number(x.late_minutes || 0),
-        worked_hours: toNum(x.worked_hours, 0),
-        overtime_hours: toNum(x.overtime_hours, 0),
-        work_units: toNum(x.work_units, 0),
-      }));
+      return r.rows.map((x) => {
+        const dateStr =
+          x.work_date instanceof Date ? x.work_date.toISOString().slice(0, 10) : String(x.work_date).slice(0, 10);
+        const ciTimeStr = x.check_in_at ? new Date(x.check_in_at).toISOString().slice(11, 19) : null;
+        const coTimeStr = x.check_out_at ? new Date(x.check_out_at).toISOString().slice(11, 19) : null;
+        return {
+          ...x,
+          work_date_str: dateStr,
+          check_in_date: dateStr,
+          check_in_time: ciTimeStr,
+          check_out_time: coTimeStr,
+          avatar_url: x.avatar_url || null,
+          user_avatar: x.avatar_url || null,
+          distance_meters: x.distance_meters !== null ? toNum(x.distance_meters, 0) : null,
+          within_geofence: toBool(x.within_geofence, true),
+          late_minutes: Number(x.late_minutes || 0),
+          worked_hours: toNum(x.worked_hours, 0),
+          overtime_hours: toNum(x.overtime_hours, 0),
+          work_units: toNum(x.work_units, 0),
+        };
+      });
     });
 
     res.json({ success: true, data: rows });

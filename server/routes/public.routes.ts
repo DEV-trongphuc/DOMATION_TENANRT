@@ -4,6 +4,7 @@ import { APP_CONFIG } from '../config.ts';
 import { withSystemPrivilege } from '../core/database/transaction.ts';
 import { sendApiError } from '../core/security/rbac.ts';
 import { notifyPlatformConsultation } from '../services/platform-appscript.service.ts';
+import { resolvePublicDomMetaViewerAccess } from '../services/dom-meta-report.service.ts';
 
 export const publicRouter = Router();
 
@@ -257,6 +258,28 @@ publicRouter.post('/consultation', async (req, res) => {
       500,
       'CONSULTATION_SUBMIT_FAILED',
       err?.message || 'Không thể tiếp nhận yêu cầu tư vấn lúc này.'
+    );
+  }
+});
+
+publicRouter.get('/dom-meta/:slug/access', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet, noai, noimageai');
+  res.setHeader('TDM-Reservation', '1');
+  res.setHeader('Content-Usage', 'train-ai=n, ai=n');
+  try {
+    const result = await resolvePublicDomMetaViewerAccess(req.params.slug);
+    if (!result.success) {
+      sendApiError(res, result.status, result.code, result.message);
+      return;
+    }
+    res.json({ success: true, data: result.data });
+  } catch (err: any) {
+    sendApiError(
+      res,
+      500,
+      'DOM_META_PUBLIC_ACCESS_FAILED',
+      err?.message || 'Không thể kiểm tra quyền truy cập báo cáo công khai.'
     );
   }
 });

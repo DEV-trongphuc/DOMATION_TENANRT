@@ -34,6 +34,9 @@ const rawPort = process.env.PORT || '3100';
 export const APP_CONFIG = {
   port: (isNaN(Number(rawPort)) ? rawPort : Number(rawPort)) as number | string,
   nodeEnv: process.env.NODE_ENV || 'development',
+  appPublicUrl:
+    (process.env.APP_PUBLIC_URL || '').trim().replace(/\/+$/, '') ||
+    (process.env.NODE_ENV === 'production' ? 'https://data.domation.net' : ''),
   dbDialect: (process.env.DB_DIALECT ||
     (process.env.DATABASE_URL?.startsWith('mysql') || process.env.DATABASE_URL?.startsWith('mariadb')
       ? 'mariadb'

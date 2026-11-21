@@ -63,6 +63,12 @@ describe('Stage 4B Full-Clone: Commercial Finance, Supply Chain, Projects/Gantt,
     };
 
     // Unlock Package 4 (`domation_promax`) with `education_addon: false` default on Tenant A
+    await withTenantTransaction(tenantA.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantA.id]);
+    });
+    await withTenantTransaction(tenantB.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantB.id]);
+    });
     const swA = await apiRequest(harness.baseUrl, '/api/v1/workspace/package', {
       method: 'POST',
       token: tenantA.token,

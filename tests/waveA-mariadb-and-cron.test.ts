@@ -23,6 +23,7 @@ import { legacyRouter } from '../server/routes/legacy.routes.ts';
 import { enforceTenantOperationalPolicy } from '../server/services/billing.service.ts';
 import { executeMasterCron } from '../server/cron/master-cron.ts';
 import { domainEventBus } from '../server/core/events/event-bus.ts';
+import { setZnsDispatcherForTesting } from '../server/modules/marketing/dispatchers.ts';
 
 async function apiRequest<T = any>(
   baseUrl: string,
@@ -548,6 +549,12 @@ describe('Wave A Backend Infrastructure: MariaDB Compatibility, Consolidated Sch
         );
       });
 
+      setZnsDispatcherForTesting(async () => ({
+        sent: true,
+        messageId: 'wavea-zns-test',
+        provider: 'test_zns',
+      }));
+
       const cronResult = await executeMasterCron({
         tenantId: tenantA.id,
         subroutines: [
@@ -575,7 +582,7 @@ describe('Wave A Backend Infrastructure: MariaDB Compatibility, Consolidated Sch
           'SELECT status FROM mkt_campaigns WHERE tenant_id = $1 AND id = $2',
           [tenantA.id, campaignId]
         );
-        assert.equal(camp.rows[0]?.status, 'sent');
+        assert.equal(camp.rows[0]?.status, 'completed');
 
         const conf = await client.query<{ status: string; confirmed_by_type: string }>(
           'SELECT status, confirmed_by_type FROM tenant_attendance_confirmations WHERE tenant_id = $1 AND batch_id = $2',
@@ -613,6 +620,7 @@ describe('Wave A Backend Infrastructure: MariaDB Compatibility, Consolidated Sch
         }
       });
     } finally {
+      setZnsDispatcherForTesting(null);
       offListener();
     }
   });

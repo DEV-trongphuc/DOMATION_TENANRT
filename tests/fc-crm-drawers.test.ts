@@ -104,6 +104,9 @@ describe('Stage 3A: CRM 360° Screens, Slide-Over Drawers, Personal Workspace, P
 
     // Switch both tenants to Package 4 (`domation_promax`)
     for (const t of [tenantA, tenantB]) {
+      await withTenantTransaction(t.id, async (client) => {
+        await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [t.id]);
+      });
       const sw = await apiRequest(baseUrl, '/api/v1/workspace/package', {
         method: 'POST',
         token: t.token,

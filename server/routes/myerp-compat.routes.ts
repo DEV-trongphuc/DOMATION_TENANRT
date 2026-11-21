@@ -17,6 +17,7 @@ import { financeCompatRouter } from './myerp-compat/finance.ts';
 import { hrCompatRouter } from './myerp-compat/hr.ts';
 import { socialCompatRouter } from './myerp-compat/social.ts';
 import { marketingCompatRouter } from './myerp-compat/marketing-config.ts';
+import { publicMarketingPhpCompatRouter } from './myerp-compat/marketing-php-bridges.ts';
 
 export const myerpCompatRouter = Router();
 
@@ -26,6 +27,9 @@ myerpCompatRouter.use(methodOverride);
 myerpCompatRouter.get('/_health', (_req, res) => {
   ok(res, { service: 'myerp-compat', version: 1 });
 });
+
+// Public marketing .php compat endpoints (survey_public.php, voucher_claim.php, track.php)
+myerpCompatRouter.use(publicMarketingPhpCompatRouter);
 
 myerpCompatRouter.use(authenticate);
 

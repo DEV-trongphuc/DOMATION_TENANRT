@@ -634,6 +634,7 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_tenant_tasks_proj_status ON tenant_tasks(tenant_id, project_id, status_key, sort_order ASC);
     CREATE INDEX IF NOT EXISTS idx_tenant_tasks_lead ON tenant_tasks(tenant_id, lead_id);
+    CREATE INDEX IF NOT EXISTS idx_tenant_tasks_assignee_status ON tenant_tasks(tenant_id, assignee_user_id, status_key, due_date ASC);
 
     CREATE TABLE IF NOT EXISTS tenant_pomodoro_sessions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -683,6 +684,8 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
       CONSTRAINT fk_hd_creator FOREIGN KEY (tenant_id, created_by_user_id) REFERENCES users(tenant_id, id) ON DELETE SET NULL
     );
     CREATE INDEX IF NOT EXISTS idx_helpdesk_status_due ON tenant_helpdesk_tickets(tenant_id, status, resolution_due_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_helpdesk_lead ON tenant_helpdesk_tickets(tenant_id, lead_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_helpdesk_assignee_status ON tenant_helpdesk_tickets(tenant_id, assignee_user_id, status);
 
     CREATE TABLE IF NOT EXISTS tenant_helpdesk_comments (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -887,6 +890,8 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_tenant_deals_stage ON tenant_deals(tenant_id, stage, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tenant_deals_lead ON tenant_deals(tenant_id, lead_id);
+    CREATE INDEX IF NOT EXISTS idx_tenant_deals_owner_stage ON tenant_deals(tenant_id, owner_user_id, stage);
+    CREATE INDEX IF NOT EXISTS idx_tenant_deals_company ON tenant_deals(tenant_id, company_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS tenant_suppliers (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1504,14 +1509,17 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
       deposit_id UUID,
       company_id UUID,
       lead_id UUID,
+      deal_id UUID,
       supplier_id UUID,
       branch_id UUID,
-      customer_name VARCHAR(200) NOT NULL,
+      customer_name VARCHAR(200) NOT NULL DEFAULT '',
       customer_tax_code VARCHAR(60),
+      tax_code VARCHAR(50),
       customer_address TEXT,
       customer_email VARCHAR(255),
       status VARCHAR(30) NOT NULL DEFAULT 'issued',
       issue_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      issued_at TIMESTAMPTZ DEFAULT clock_timestamp(),
       due_date DATE,
       items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       subtotal_vnd BIGINT NOT NULL DEFAULT 0,
@@ -1727,9 +1735,11 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
       tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       project_id UUID,
       task_id UUID NOT NULL,
-      predecessor_task_id UUID NOT NULL,
-      dependency_type VARCHAR(10) NOT NULL DEFAULT 'FS',
+      predecessor_task_id UUID,
+      depends_on_task_id UUID,
+      dependency_type VARCHAR(30) NOT NULL DEFAULT 'FS',
       lag_days INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
       created_by UUID,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       CONSTRAINT uk_tenant_task_deps_tenant_id UNIQUE (tenant_id, id),
@@ -1743,10 +1753,11 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
       tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       task_id UUID NOT NULL,
       author_user_id UUID,
-      author_name VARCHAR(150) NOT NULL,
+      author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên',
       content TEXT NOT NULL,
       mentions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      edit_history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id),
@@ -1762,6 +1773,7 @@ async function runErpOpsPostgresSchema(client: DbClient): Promise<void> {
       file_url TEXT NOT NULL,
       mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
       size_bytes BIGINT NOT NULL DEFAULT 0,
+      cloud_file_id UUID,
       uploaded_by UUID,
       uploaded_by_name VARCHAR(150),
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -2608,14 +2620,17 @@ async function runErpOpsMariaDbSchema(client: DbClient): Promise<void> {
       deposit_id VARCHAR(36) NULL,
       company_id VARCHAR(36) NULL,
       lead_id VARCHAR(36) NULL,
+      deal_id VARCHAR(36) NULL,
       supplier_id VARCHAR(36) NULL,
       branch_id VARCHAR(36) NULL,
-      customer_name VARCHAR(200) NOT NULL,
+      customer_name VARCHAR(200) NOT NULL DEFAULT '',
       customer_tax_code VARCHAR(60) NULL,
+      tax_code VARCHAR(50) NULL,
       customer_address TEXT NULL,
       customer_email VARCHAR(255) NULL,
       status VARCHAR(30) NOT NULL DEFAULT 'issued',
-      issue_date DATE NOT NULL,
+      issue_date DATE NULL,
+      issued_at DATETIME(6) NULL,
       due_date DATE NULL,
       items_json JSON NULL,
       subtotal_vnd BIGINT NOT NULL DEFAULT 0,
@@ -2814,9 +2829,11 @@ async function runErpOpsMariaDbSchema(client: DbClient): Promise<void> {
       tenant_id VARCHAR(36) NOT NULL,
       project_id VARCHAR(36) NULL,
       task_id VARCHAR(36) NOT NULL,
-      predecessor_task_id VARCHAR(36) NOT NULL,
-      dependency_type VARCHAR(10) NOT NULL DEFAULT 'FS',
+      predecessor_task_id VARCHAR(36) NULL,
+      depends_on_task_id VARCHAR(36) NULL,
+      dependency_type VARCHAR(30) NOT NULL DEFAULT 'FS',
       lag_days INT NOT NULL DEFAULT 0,
+      note TEXT NULL,
       created_by VARCHAR(36) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_task_deps_tenant_id UNIQUE (tenant_id, id),
@@ -2827,10 +2844,11 @@ async function runErpOpsMariaDbSchema(client: DbClient): Promise<void> {
       tenant_id VARCHAR(36) NOT NULL,
       task_id VARCHAR(36) NOT NULL,
       author_user_id VARCHAR(36) NULL,
-      author_name VARCHAR(150) NOT NULL,
+      author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên',
       content TEXT NOT NULL,
       mentions_json JSON NULL,
       attachments_json JSON NULL,
+      edit_history_json JSON NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id)
@@ -2843,6 +2861,7 @@ async function runErpOpsMariaDbSchema(client: DbClient): Promise<void> {
       file_url TEXT NOT NULL,
       mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
       size_bytes BIGINT NOT NULL DEFAULT 0,
+      cloud_file_id VARCHAR(36) NULL,
       uploaded_by VARCHAR(36) NULL,
       uploaded_by_name VARCHAR(150) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -2964,6 +2983,12 @@ async function runErpOpsMariaDbSchema(client: DbClient): Promise<void> {
     'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS ects_score_6 DECIMAL(5,2) NULL',
     'ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS letter_grade VARCHAR(40) NULL',
     "ALTER TABLE tenant_edu_attendance_grades ADD COLUMN IF NOT EXISTS pass_status VARCHAR(20) NOT NULL DEFAULT 'passed'",
+    // Performance composite indexes for MariaDB 10.6 parity with PostgreSQL
+    'CREATE INDEX IF NOT EXISTS idx_tenant_tasks_assignee_status ON tenant_tasks(tenant_id, assignee_user_id, status_key, due_date)',
+    'CREATE INDEX IF NOT EXISTS idx_tenant_deals_owner_stage ON tenant_deals(tenant_id, owner_user_id, stage)',
+    'CREATE INDEX IF NOT EXISTS idx_tenant_deals_company ON tenant_deals(tenant_id, company_id, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_helpdesk_lead ON tenant_helpdesk_tickets(tenant_id, lead_id, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_helpdesk_assignee_status ON tenant_helpdesk_tickets(tenant_id, assignee_user_id, status)',
   ];
 
   for (const alt of mariaColumnUpgrades) {

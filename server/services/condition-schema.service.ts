@@ -28,6 +28,8 @@ export interface ConditionFieldOptionDto {
   group: string;
   options?: Array<{ value: string; label: string }>;
   placeholder?: string;
+  canonical_key?: string;
+  is_custom?: boolean;
 }
 
 export interface ConditionFieldGroupDto {
@@ -189,8 +191,12 @@ export const CONDITION_OPERATORS_BY_TYPE: Record<string, Array<{ value: string; 
   ],
 };
 
-function mapCustomFieldType(rawType: unknown): ConditionFieldOptionDto['type'] {
+function mapCustomFieldType(rawType: unknown, rawKey?: unknown): ConditionFieldOptionDto['type'] {
   const t = String(rawType || 'text').trim().toLowerCase();
+  const k = String(rawKey || '').trim().toLowerCase();
+  if (t === 'birthday' || ((t === 'date' || t === 'text') && ['birthday', 'dob', 'date_of_birth', 'dateofbirth', 'ngay_sinh', 'anniversary_date', 'anniversarydate'].includes(k))) {
+    return 'birthday';
+  }
   if (t === 'number') return 'number';
   if (t === 'currency') return 'currency';
   if (t === 'date') return 'date';
@@ -199,8 +205,45 @@ function mapCustomFieldType(rawType: unknown): ConditionFieldOptionDto['type'] {
   return 'text';
 }
 
+const INTERNAL_CUSTOM_KEY_BLOCKLIST = new Set([
+  'dom_journey_ai',
+  'ai_profile',
+  'ai_summary',
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+function inferCustomFieldTypeFromValue(sampleVal: unknown, key: string): ConditionFieldOptionDto['type'] {
+  const k = key.toLowerCase();
+  if (['birthday', 'dob', 'date_of_birth', 'dateofbirth', 'ngay_sinh', 'anniversary_date', 'anniversarydate'].includes(k)) {
+    return 'birthday';
+  }
+  if (typeof sampleVal === 'boolean') return 'boolean';
+  if (typeof sampleVal === 'number' && Number.isFinite(sampleVal)) {
+    return k.includes('vnd') || k.includes('price') || k.includes('budget') || k.includes('amount') || k.includes('value')
+      ? 'currency'
+      : 'number';
+  }
+  if (typeof sampleVal === 'string') {
+    const trimmed = sampleVal.trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return 'date';
+    if (/^-?\d+(\.\d+)?$/.test(trimmed) && !k.includes('phone') && !k.includes('id') && !k.includes('code') && !k.includes('zip')) {
+      return k.includes('vnd') || k.includes('price') || k.includes('budget') || k.includes('amount') ? 'currency' : 'number';
+    }
+  }
+  return 'text';
+}
+
+function humanizeCustomFieldKey(key: string): string {
+  return key
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (m) => m.toUpperCase())
+    .trim();
+}
+
 export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, tenantId: string) {
-  const [tenantRes, stagesRes, teamsRes, usersRes, tagsRes, listsRes, pipeCfRows, globalCfRows] = await Promise.all([
+  const [tenantRes, stagesRes, teamsRes, usersRes] = await Promise.all([
     client.query<{
       package_code?: string;
       plan_tier?: string;
@@ -258,39 +301,120 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
        LIMIT 300`,
       [tenantId]
     ),
-    safeSavepoint(
-      client,
-      `SELECT id, name, slug, color_hex, category
-       FROM tenant_tags
-       WHERE tenant_id = $1
-       ORDER BY name ASC`,
-      [tenantId]
-    ),
-    safeSavepoint(
-      client,
-      `SELECT id, name, audience_type, cached_member_count
-       FROM tenant_audiences
-       WHERE tenant_id = $1 AND audience_type IN ('static_data', 'static') AND is_active = true
-       ORDER BY name ASC`,
-      [tenantId]
-    ),
-    safeSavepoint(
-      client,
-      `SELECT DISTINCT field_key, field_label, field_type, options_json
-       FROM tenant_pipeline_custom_fields
-       WHERE tenant_id = $1
-       ORDER BY field_key ASC`,
-      [tenantId]
-    ),
-    safeSavepoint(
-      client,
-      `SELECT DISTINCT field_key, field_label, field_type, options_json
-       FROM tenant_custom_fields
-       WHERE tenant_id = $1 AND entity_type IN ('contact', 'lead', 'customer') AND is_active = true
-       ORDER BY field_key ASC`,
-      [tenantId]
-    ),
   ]);
+
+  // Run optional-table SAVEPOINT queries strictly sequentially on the single PG client
+  // so a ROLLBACK TO SAVEPOINT for a missing table never aborts sibling queries.
+  const branchesRes = await safeSavepoint(
+    client,
+    `SELECT id, code, name
+     FROM tenant_branches
+     WHERE tenant_id = $1 AND is_active = true
+     ORDER BY name ASC`,
+    [tenantId]
+  );
+  const roundsRes = await safeSavepoint(
+    client,
+    `SELECT id, name, pipeline_id
+     FROM distribution_rounds
+     WHERE tenant_id = $1 AND is_active = true
+     ORDER BY priority ASC, name ASC`,
+    [tenantId]
+  );
+  const tagsRes = await safeSavepoint(
+    client,
+    `SELECT id, name, slug, color_hex, category
+     FROM tenant_tags
+     WHERE tenant_id = $1
+     ORDER BY name ASC`,
+    [tenantId]
+  );
+  const listsRes = await safeSavepoint(
+    client,
+    `SELECT id, name, audience_type, cached_member_count
+     FROM tenant_audiences
+     WHERE tenant_id = $1 AND is_active = true
+     ORDER BY name ASC`,
+    [tenantId]
+  );
+  const campaignsRes = await safeSavepoint(
+    client,
+    `SELECT id, name, channel, status
+     FROM mkt_campaigns
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT 150`,
+    [tenantId]
+  );
+  const flowsRes = await safeSavepoint(
+    client,
+    `SELECT id, name, status
+     FROM mkt_flows
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT 150`,
+    [tenantId]
+  );
+  const surveysRes = await safeSavepoint(
+    client,
+    `SELECT id, title, survey_type
+     FROM mkt_surveys
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT 100`,
+    [tenantId]
+  );
+  const formsRes = await safeSavepoint(
+    client,
+    `SELECT id, name
+     FROM mkt_forms
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT 100`,
+    [tenantId]
+  );
+  const vouchersRes = await safeSavepoint(
+    client,
+    `SELECT id, name, code_prefix
+     FROM mkt_voucher_campaigns
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT 100`,
+    [tenantId]
+  );
+  const pipeCfRows = await safeSavepoint(
+    client,
+    `SELECT DISTINCT field_key, field_label, field_type, options_json
+     FROM tenant_pipeline_custom_fields
+     WHERE tenant_id = $1
+     ORDER BY field_key ASC`,
+    [tenantId]
+  );
+  const globalCfRows = await safeSavepoint(
+    client,
+    `SELECT DISTINCT field_key, field_label, field_type, options_json
+     FROM tenant_custom_fields
+     WHERE tenant_id = $1 AND entity_type IN ('contact', 'lead', 'customer') AND is_active = true
+     ORDER BY field_key ASC`,
+    [tenantId]
+  );
+  const legacyCfDefsRows = await safeSavepoint(
+    client,
+    `SELECT DISTINCT field_key, field_label, field_type, options_json
+     FROM custom_field_definitions
+     WHERE tenant_id = $1
+     ORDER BY field_key ASC`,
+    [tenantId]
+  );
+  const sampledLeadCfRows = await safeSavepoint(
+    client,
+    `SELECT custom_fields
+     FROM leads
+     WHERE tenant_id = $1 AND is_deleted = false AND custom_fields IS NOT NULL AND custom_fields != '{}'::jsonb
+     ORDER BY updated_at DESC
+     LIMIT 200`,
+    [tenantId]
+  );
 
   const tenantRow = tenantRes.rows[0] || {};
   const rawSettings = safeObj(tenantRow.settings);
@@ -332,6 +456,20 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
     leader_user_id: t.leader_user_id ? String(t.leader_user_id) : null,
   }));
 
+  const branches = branchesRes.map((b: any) => ({
+    id: String(b.id),
+    value: String(b.id),
+    label: String(b.name || b.code || b.id),
+    code: String(b.code || ''),
+  }));
+
+  const rounds = roundsRes.map((r: any) => ({
+    id: String(r.id),
+    value: String(r.id),
+    label: String(r.name),
+    pipeline_id: r.pipeline_id ? String(r.pipeline_id) : null,
+  }));
+
   const tags = tagsRes.map((tg: any) => ({
     id: String(tg.id),
     value: String(tg.slug || tg.name || tg.id),
@@ -349,11 +487,51 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
     member_count: Number(aud.cached_member_count || 0),
   }));
 
+  const campaigns = campaignsRes.map((c: any) => ({
+    id: String(c.id),
+    value: String(c.id),
+    label: String(c.name),
+    channel: String(c.channel || 'email'),
+    status: String(c.status || 'draft'),
+  }));
+
+  const flows = flowsRes.map((f: any) => ({
+    id: String(f.id),
+    value: String(f.id),
+    label: String(f.name),
+    status: String(f.status || 'draft'),
+  }));
+
+  const surveys = surveysRes.map((s: any) => ({
+    id: String(s.id),
+    value: String(s.id),
+    label: String(s.title),
+    survey_type: String(s.survey_type || 'survey'),
+  }));
+
+  const forms = formsRes.map((f: any) => ({
+    id: String(f.id),
+    value: String(f.id),
+    label: String(f.name),
+  }));
+
+  const voucherCampaigns = vouchersRes.map((v: any) => ({
+    id: String(v.id),
+    value: String(v.id),
+    label: String(v.name),
+    code_prefix: String(v.code_prefix || 'DOM'),
+  }));
+
   const stageOpts = stages.map((s) => ({ value: s.value, label: s.label }));
   const userOpts = users.map((u) => ({ value: u.value, label: u.label }));
   const teamOpts = teams.map((t) => ({ value: t.value, label: t.label }));
+  const branchOpts = branches.map((b) => ({ value: b.value, label: b.label }));
+  const roundOpts = rounds.map((r) => ({ value: r.value, label: r.label }));
   const tagOpts = tags.map((tg) => ({ value: tg.value, label: tg.label }));
   const listOpts = lists.map((l) => ({ value: l.value, label: l.label }));
+  const campaignOpts = campaigns.map((c) => ({ value: c.value, label: c.label }));
+  const flowOpts = flows.map((f) => ({ value: f.value, label: f.label }));
+  const voucherOpts = voucherCampaigns.map((v) => ({ value: v.value, label: v.label }));
 
   const groups: ConditionFieldGroupDto[] = [
     {
@@ -363,28 +541,59 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
         { value: 'name', key: 'name', label: 'Họ & Tên đầy đủ', type: 'text', group: 'profile', placeholder: 'VD: Nguyễn Văn A...' },
         { value: 'firstName', key: 'firstName', label: 'Tên (First Name)', type: 'text', group: 'profile' },
         { value: 'lastName', key: 'lastName', label: 'Họ & Tên đệm (Last Name)', type: 'text', group: 'profile' },
-        { value: 'phoneNumber', key: 'phoneNumber', label: 'Số điện thoại', type: 'text', group: 'profile', placeholder: 'VD: 090...' },
+        { value: 'phone', key: 'phone', label: 'Số điện thoại', type: 'text', group: 'profile', placeholder: 'VD: 090...' },
         { value: 'email', key: 'email', label: 'Địa chỉ Email', type: 'text', group: 'profile', placeholder: 'VD: @gmail.com' },
         { value: 'has_phone', key: 'has_phone', label: 'Có Số điện thoại', type: 'boolean_presence', group: 'profile' },
         { value: 'has_email', key: 'has_email', label: 'Có Địa chỉ Email', type: 'boolean_presence', group: 'profile' },
-        { value: 'cf.company', key: 'cf.company', label: 'Công ty / Tổ chức', type: 'text', group: 'profile' },
-        { value: 'cf.job_title', key: 'cf.job_title', label: 'Chức danh / Nghề nghiệp', type: 'text', group: 'profile' },
+        { value: 'city', key: 'city', label: 'Tỉnh / Thành phố', type: 'text', group: 'profile', placeholder: 'VD: Hồ Chí Minh, Hà Nội...' },
         {
-          value: 'cf.gender',
-          key: 'cf.gender',
+          value: 'gender',
+          key: 'gender',
           label: 'Giới tính',
           type: 'select',
           group: 'profile',
           options: [
-            { value: 'Nam', label: 'Nam' },
-            { value: 'Nữ', label: 'Nữ' },
-            { value: 'Khác', label: 'Khác' },
+            { value: 'male', label: 'Nam' },
+            { value: 'female', label: 'Nữ' },
+            { value: 'other', label: 'Khác' },
           ],
         },
-        { value: 'cf.city', key: 'cf.city', label: 'Tỉnh / Thành phố', type: 'text', group: 'profile' },
-        { value: 'cf.address', key: 'cf.address', label: 'Địa chỉ liên hệ', type: 'text', group: 'profile' },
+        { value: 'source', key: 'source', label: 'Nguồn khách hàng (Source)', type: 'text', group: 'profile', placeholder: 'VD: Facebook Ads, Website...' },
         { value: 'product_interest', key: 'product_interest', label: 'Sản phẩm / Dịch vụ quan tâm', type: 'text', group: 'profile' },
         { value: 'budget_range', key: 'budget_range', label: 'Khoảng ngân sách dự kiến', type: 'text', group: 'profile' },
+        { value: 'lead_score', key: 'lead_score', label: 'Điểm tương tác (Lead Score)', type: 'number', group: 'profile', placeholder: '0 - 100' },
+        { value: 'lead_value', key: 'lead_value', label: 'Giá trị Khách hàng / Doanh thu (VNĐ)', type: 'currency', group: 'profile' },
+        {
+          value: 'quality_status',
+          key: 'quality_status',
+          label: 'Chất lượng Lead (Quality Status)',
+          type: 'select',
+          group: 'profile',
+          options: [
+            { value: 'Pending', label: 'Chờ thẩm định (Pending)' },
+            { value: 'Qualified', label: 'Đạt chuẩn (Qualified)' },
+            { value: 'Hot', label: 'Tiềm năng nóng (Hot)' },
+            { value: 'Warm', label: 'Tiềm năng ấm (Warm)' },
+            { value: 'Cold', label: 'Tiềm năng lạnh (Cold)' },
+            { value: 'Disqualified', label: 'Không phù hợp (Disqualified)' },
+            { value: 'Junk', label: 'Lead rác (Junk)' },
+          ],
+        },
+        {
+          value: 'status',
+          key: 'status',
+          label: 'Trạng thái hồ sơ (Status)',
+          type: 'select',
+          group: 'profile',
+          options: [
+            { value: 'marketing_nurture', label: 'Nuôi dưỡng Marketing' },
+            { value: 'unassigned_pending', label: 'Chờ chia Sale' },
+            { value: 'assigned', label: 'Đã phân bổ Sale' },
+            { value: 'recalled', label: 'Đã thu hồi' },
+            { value: 'archived', label: 'Lưu trữ' },
+            { value: 'rejected', label: 'Từ chối' },
+          ],
+        },
         {
           value: 'lifecycle_stage',
           key: 'lifecycle_stage',
@@ -398,6 +607,7 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
             { value: 'sql', label: 'SQL' },
             { value: 'opportunity', label: 'Opportunity' },
             { value: 'customer', label: 'Customer' },
+            { value: 'evangelist', label: 'Evangelist' },
             { value: 'disqualified', label: 'Disqualified' },
           ],
         },
@@ -411,6 +621,7 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
             { value: 'subscribed', label: 'Đang đăng ký (Subscribed)' },
             { value: 'unsubscribed', label: 'Đã hủy đăng ký' },
             { value: 'bounced', label: 'Bị trả lại (Bounced)' },
+            { value: 'complained', label: 'Báo Spam (Complained)' },
           ],
         },
         {
@@ -424,17 +635,24 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
             { value: 'opted_out', label: 'Từ chối (Opted-out)' },
           ],
         },
+        { value: 'created_at', key: 'created_at', label: 'Ngày tạo hồ sơ', type: 'date', group: 'profile' },
+        { value: 'days_since_created', key: 'days_since_created', label: 'Số ngày kể từ lúc tạo', type: 'number', group: 'profile', placeholder: 'VD: 7, 30...' },
+        { value: 'inactive_days', key: 'inactive_days', label: 'Số ngày chưa tương tác (Ngủ đông)', type: 'number', group: 'profile', placeholder: 'VD: 14, 30...' },
+        { value: 'cf.company', key: 'cf.company', label: 'Công ty / Tổ chức', type: 'text', group: 'profile' },
+        { value: 'cf.job_title', key: 'cf.job_title', label: 'Chức danh / Nghề nghiệp', type: 'text', group: 'profile' },
+        { value: 'cf.address', key: 'cf.address', label: 'Địa chỉ liên hệ', type: 'text', group: 'profile' },
+        { value: 'cf.birthday', key: 'cf.birthday', label: 'Ngày sinh (Birthday)', type: 'birthday', group: 'profile' },
       ],
     },
     {
       id: 'crm_pipeline',
-      label: 'CRM Pipeline, Phân bổ & Nguồn QC',
+      label: 'CRM & Pipeline',
       fields: [
         { value: 'crm_stage_id', key: 'crm_stage_id', label: 'Giai đoạn Pipeline (CRM Stage)', type: 'stage', group: 'crm_pipeline', options: stageOpts },
         {
           value: 'crm_lead_status',
           key: 'crm_lead_status',
-          label: 'Trạng thái xử lý Lead',
+          label: 'Trạng thái xử lý Lead CRM',
           type: 'select',
           group: 'crm_pipeline',
           options: [
@@ -457,59 +675,156 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
             { value: 'cold', label: 'Lạnh (Cold)' },
           ],
         },
-        { value: 'leadScore', key: 'leadScore', label: 'Điểm tương tác (Lead Score)', type: 'number', group: 'crm_pipeline' },
         { value: 'crm_owner_id', key: 'crm_owner_id', label: 'Nhân sự Sale phụ trách', type: 'owner_select', group: 'crm_pipeline', options: userOpts },
+        { value: 'round_id', key: 'round_id', label: 'Vòng chia Sale (Distribution Round)', type: 'select', group: 'crm_pipeline', options: roundOpts },
         { value: 'crm_team_id', key: 'crm_team_id', label: 'Nhóm Sale (Team)', type: 'team', group: 'crm_pipeline', options: teamOpts },
+        { value: 'crm_branch_id', key: 'crm_branch_id', label: 'Chi nhánh / Cơ sở (Branch)', type: 'select', group: 'crm_pipeline', options: branchOpts },
         { value: 'sla_breached', key: 'sla_breached', label: 'Vi phạm SLA tiếp nhận', type: 'boolean', group: 'crm_pipeline' },
-        { value: 'lastActivityDays', key: 'lastActivityDays', label: 'Số ngày chưa tương tác (Ngủ đông)', type: 'number', group: 'crm_pipeline' },
-        { value: 'crm_created_at', key: 'crm_created_at', label: 'Ngày tạo Lead', type: 'date', group: 'crm_pipeline' },
-        { value: 'source', key: 'source', label: 'Nguồn khách hàng (Source)', type: 'text', group: 'crm_pipeline' },
-        { value: 'campaign', key: 'campaign', label: 'Chiến dịch (Campaign)', type: 'text', group: 'crm_pipeline' },
-        { value: 'utm_source', key: 'utm_source', label: 'UTM Source', type: 'text', group: 'crm_pipeline' },
-        { value: 'utm_medium', key: 'utm_medium', label: 'UTM Medium', type: 'text', group: 'crm_pipeline' },
-        { value: 'ad_id', key: 'ad_id', label: 'Meta Ad ID', type: 'text', group: 'crm_pipeline' },
-        { value: 'adset_id', key: 'adset_id', label: 'Meta Adset ID', type: 'text', group: 'crm_pipeline' },
-        { value: 'campaign_id', key: 'campaign_id', label: 'Meta Campaign ID', type: 'text', group: 'crm_pipeline' },
-        { value: 'tags', key: 'tags', label: 'Nhãn phân loại (Tags)', type: 'tags', group: 'crm_pipeline', options: tagOpts },
-        { value: 'list', key: 'list', label: 'Thuộc Danh sách Tĩnh (Static List)', type: 'list_select', group: 'crm_pipeline', options: listOpts },
+        { value: 'tag', key: 'tag', label: 'Nhãn phân loại (Tag)', type: 'tags', group: 'crm_pipeline', options: tagOpts },
+        { value: 'in_audience', key: 'in_audience', label: 'Thuộc Danh sách / Tệp (Audience)', type: 'list_select', group: 'crm_pipeline', options: listOpts },
       ],
     },
     {
       id: 'deals_revenue',
       label: 'Cơ hội (Deals) & Doanh thu',
       fields: [
-        { value: 'erp_deal_value', key: 'erp_deal_value', label: 'Tổng giá trị Deal / Doanh thu (VNĐ)', type: 'currency', group: 'deals_revenue' },
+        { value: 'has_deal', key: 'has_deal', label: 'Đã tạo Cơ hội (Has Deal)', type: 'boolean', group: 'deals_revenue' },
+        {
+          value: 'deal_stage',
+          key: 'deal_stage',
+          label: 'Giai đoạn Cơ hội (Deal Stage)',
+          type: 'select',
+          group: 'deals_revenue',
+          options: [
+            { value: 'open', label: 'Đang mở (Open Deal)' },
+            { value: 'qualification', label: 'Thẩm định (Qualification)' },
+            { value: 'discovery', label: 'Khám phá nhu cầu (Discovery)' },
+            { value: 'proposal', label: 'Đã gửi báo giá (Proposal)' },
+            { value: 'negotiation', label: 'Đàm phán (Negotiation)' },
+            { value: 'won', label: 'Đã chốt thành công (Won)' },
+            { value: 'lost', label: 'Thất bại (Lost)' },
+            { value: 'no_deal', label: 'Chưa có Deal' },
+          ],
+        },
+        { value: 'deal_value', key: 'deal_value', label: 'Tổng giá trị Cơ hội Deal (VNĐ)', type: 'currency', group: 'deals_revenue' },
+        { value: 'erp_deal_value', key: 'erp_deal_value', label: 'Tổng doanh thu thực thu (VNĐ)', type: 'currency', group: 'deals_revenue' },
         { value: 'has_revenue', key: 'has_revenue', label: 'Đã phát sinh doanh thu', type: 'boolean', group: 'deals_revenue' },
-        { value: 'is_won_stage', key: 'is_won_stage', label: 'Đã chốt thành công (Won)', type: 'boolean', group: 'deals_revenue' },
-        { value: 'is_lost_stage', key: 'is_lost_stage', label: 'Đã thất bại (Lost)', type: 'boolean', group: 'deals_revenue' },
+        { value: 'is_won_stage', key: 'is_won_stage', label: 'Ở bước Chốt thành công (Won)', type: 'boolean', group: 'deals_revenue' },
+        { value: 'is_lost_stage', key: 'is_lost_stage', label: 'Ở bước Thất bại (Lost)', type: 'boolean', group: 'deals_revenue' },
+      ],
+    },
+    {
+      id: 'ad_attribution',
+      label: 'Quảng cáo & UTM',
+      fields: [
+        { value: 'utm_source', key: 'utm_source', label: 'UTM Source', type: 'text', group: 'ad_attribution', placeholder: 'VD: facebook, google, tiktok...' },
+        { value: 'utm_medium', key: 'utm_medium', label: 'UTM Medium', type: 'text', group: 'ad_attribution', placeholder: 'VD: cpc, paid_social, email...' },
+        { value: 'utm_campaign', key: 'utm_campaign', label: 'UTM Campaign / Tên chiến dịch', type: 'text', group: 'ad_attribution', placeholder: 'VD: black_friday_2026...' },
+        { value: 'utm_content', key: 'utm_content', label: 'UTM Content', type: 'text', group: 'ad_attribution', placeholder: 'VD: video_hook_1...' },
+        { value: 'ad_name', key: 'ad_name', label: 'Tên bài Quảng cáo (Ad Name)', type: 'text', group: 'ad_attribution', placeholder: 'VD: Video Testimonial V2...' },
+        { value: 'ad_id', key: 'ad_id', label: 'Meta Ad ID', type: 'text', group: 'ad_attribution' },
+        { value: 'adset_id', key: 'adset_id', label: 'Meta Adset ID', type: 'text', group: 'ad_attribution' },
+        { value: 'campaign_id', key: 'campaign_id', label: 'Meta Campaign ID', type: 'text', group: 'ad_attribution' },
+        { value: 'fbclid_present', key: 'fbclid_present', label: 'Có dấu vết Meta Click (fbclid/fbc)', type: 'boolean', group: 'ad_attribution' },
       ],
     },
     {
       id: 'behavior',
-      label: 'Hành vi Marketing Đa kênh',
+      label: 'Email & Automation Flow',
       fields: [
-        { value: 'opened_email', key: 'opened_email', label: 'Đã mở Email Marketing', type: 'event', group: 'behavior' },
-        { value: 'clicked_email', key: 'clicked_email', label: 'Đã click link trong Email', type: 'event', group: 'behavior' },
+        { value: 'opened_campaign', key: 'opened_campaign', label: 'Đã mở chiến dịch Email', type: campaignOpts.length > 0 ? 'select' : 'event', group: 'behavior', options: campaignOpts.length > 0 ? [{ value: 'any', label: 'Bất kỳ chiến dịch nào' }, ...campaignOpts] : undefined },
+        { value: 'clicked_campaign', key: 'clicked_campaign', label: 'Đã click link trong chiến dịch Email', type: campaignOpts.length > 0 ? 'select' : 'event', group: 'behavior', options: campaignOpts.length > 0 ? [{ value: 'any', label: 'Bất kỳ chiến dịch nào' }, ...campaignOpts] : undefined },
+        { value: 'email_open_count', key: 'email_open_count', label: 'Tổng số lần mở Email', type: 'number', group: 'behavior', placeholder: 'VD: 3' },
+        { value: 'email_click_count', key: 'email_click_count', label: 'Tổng số lần click Email', type: 'number', group: 'behavior', placeholder: 'VD: 1' },
+        { value: 'is_suppressed', key: 'is_suppressed', label: 'Nằm trong danh sách chặn gửi (Suppressed)', type: 'boolean', group: 'behavior' },
+        { value: 'in_flow', key: 'in_flow', label: 'Đang chạy trong Automation Flow', type: flowOpts.length > 0 ? 'select' : 'event', group: 'behavior', options: flowOpts.length > 0 ? [{ value: 'any', label: 'Bất kỳ Flow nào' }, ...flowOpts] : undefined },
+        { value: 'completed_flow', key: 'completed_flow', label: 'Đã hoàn thành Automation Flow', type: flowOpts.length > 0 ? 'select' : 'event', group: 'behavior', options: flowOpts.length > 0 ? [{ value: 'any', label: 'Bất kỳ Flow nào' }, ...flowOpts] : undefined },
+        { value: 'opened_email', key: 'opened_email', label: 'Đã mở Email Marketing (Timeline)', type: 'event', group: 'behavior' },
+        { value: 'clicked_email', key: 'clicked_email', label: 'Đã click link Email (Timeline)', type: 'event', group: 'behavior' },
         { value: 'submitted_form', key: 'submitted_form', label: 'Đã điền Form đăng ký', type: 'event', group: 'behavior' },
-        { value: 'completed_survey', key: 'completed_survey', label: 'Đã hoàn thành Khảo sát / Quiz', type: 'event', group: 'behavior' },
-        { value: 'quiz_score', key: 'quiz_score', label: 'Điểm bài Quiz', type: 'number', group: 'behavior' },
-        { value: 'visited_url', key: 'visited_url', label: 'Đã truy cập trang Web', type: 'event', group: 'behavior' },
-        { value: 'claimed_voucher', key: 'claimed_voucher', label: 'Đã nhận mã Voucher', type: 'event', group: 'behavior' },
-        { value: 'received_zns', key: 'received_zns', label: 'Đã nhận Zalo ZNS', type: 'event', group: 'behavior' },
-        { value: 'statsOpened', key: 'statsOpened', label: 'Số lần mở Email', type: 'number', group: 'behavior' },
-        { value: 'statsClicked', key: 'statsClicked', label: 'Số lần click link', type: 'number', group: 'behavior' },
+        { value: 'received_zns', key: 'received_zns', label: 'Đã nhận tin nhắn Zalo ZNS', type: 'event', group: 'behavior' },
+      ],
+    },
+    {
+      id: 'web_behavior',
+      label: 'Hành vi Website',
+      fields: [
+        { value: 'web_visited_url', key: 'web_visited_url', label: 'Đã truy cập URL trang Web', type: 'text', group: 'web_behavior', placeholder: 'VD: /bang-gia, /san-pham...' },
+        { value: 'web_clicked_cta', key: 'web_clicked_cta', label: 'Đã bấm nút CTA / Phần tử Web', type: 'text', group: 'web_behavior', placeholder: 'VD: Đăng ký tư vấn, #cta-buy...' },
+        { value: 'web_max_scroll_pct', key: 'web_max_scroll_pct', label: 'Độ sâu cuộn trang tối đa (%)', type: 'number', group: 'web_behavior', placeholder: '0 - 100' },
+        { value: 'web_active_duration_sec', key: 'web_active_duration_sec', label: 'Tổng thời gian xem Web (giây)', type: 'number', group: 'web_behavior', placeholder: 'VD: 60, 180...' },
+        { value: 'web_pricing_intent', key: 'web_pricing_intent', label: 'Có tín hiệu xem Bảng giá (Pricing Intent)', type: 'boolean', group: 'web_behavior' },
+        {
+          value: 'web_device_type',
+          key: 'web_device_type',
+          label: 'Thiết bị truy cập Website',
+          type: 'select',
+          group: 'web_behavior',
+          options: [
+            { value: 'desktop', label: 'Máy tính (Desktop)' },
+            { value: 'mobile', label: 'Điện thoại (Mobile)' },
+            { value: 'tablet', label: 'Máy tính bảng (Tablet)' },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'engagement_social',
+      label: 'Khảo sát, Voucher & Social',
+      fields: [
+        { value: 'completed_survey', key: 'completed_survey', label: 'Đã hoàn thành Khảo sát / Quiz', type: 'event', group: 'engagement_social' },
+        { value: 'survey_score', key: 'survey_score', label: 'Điểm Khảo sát / Quiz (Survey Score)', type: 'number', group: 'engagement_social' },
+        { value: 'quiz_score', key: 'quiz_score', label: 'Điểm Quiz (Timeline)', type: 'number', group: 'engagement_social' },
+        {
+          value: 'nps_category',
+          key: 'nps_category',
+          label: 'Nhóm hài lòng NPS',
+          type: 'select',
+          group: 'engagement_social',
+          options: [
+            { value: 'promoter', label: 'Ủng hộ tích cực (Promoter 9-10)' },
+            { value: 'passive', label: 'Trung lập (Passive 7-8)' },
+            { value: 'detractor', label: 'Chưa hài lòng (Detractor 0-6)' },
+          ],
+        },
+        { value: 'voucher_claimed', key: 'voucher_claimed', label: 'Đã nhận / Đổi mã Voucher', type: voucherOpts.length > 0 ? 'select' : 'event', group: 'engagement_social', options: voucherOpts.length > 0 ? [{ value: 'any', label: 'Bất kỳ Voucher nào' }, ...voucherOpts] : undefined },
+        {
+          value: 'social_channel',
+          key: 'social_channel',
+          label: 'Kênh Chat Social đã tương tác',
+          type: 'select',
+          group: 'engagement_social',
+          options: [
+            { value: 'messenger', label: 'Facebook Messenger' },
+            { value: 'zalo_oa', label: 'Zalo OA' },
+            { value: 'web_chat', label: 'Live Web Chat' },
+          ],
+        },
       ],
     },
   ];
 
-  // Dynamic Custom Fields from `tenants.settings.custom_fields`, `tenant_pipeline_custom_fields`, `tenant_custom_fields`
+  // Dynamic Custom Fields from ALL tenant sources:
+  // `tenant_pipeline_custom_fields`, `tenant_custom_fields`, `tenants.settings.custom_fields`,
+  // `custom_field_definitions`, AND sampled keys from `leads.custom_fields` JSONB!
   const customFieldMap = new Map<string, ConditionFieldOptionDto>();
-  const registerCustomField = (rawKey: unknown, rawLabel: unknown, rawType: unknown, rawOpts?: unknown) => {
+  const seenCleanCustomKeys = new Set<string>();
+
+  const registerCustomField = (
+    rawKey: unknown,
+    rawLabel: unknown,
+    rawType: unknown,
+    rawOpts?: unknown,
+    prefix: 'cf' | 'custom' = 'cf'
+  ) => {
     const cleanKey = String(rawKey || '').replace(/^(?:cf|custom_fields|custom)\./i, '').trim();
     if (!cleanKey || !/^[a-zA-Z0-9_-]{1,64}$/.test(cleanKey)) return;
-    const fullKey = `cf.${cleanKey}`;
-    if (customFieldMap.has(fullKey)) return;
-    const mappedType = mapCustomFieldType(rawType);
+    if (INTERNAL_CUSTOM_KEY_BLOCKLIST.has(cleanKey.toLowerCase())) return;
+    if (seenCleanCustomKeys.has(cleanKey.toLowerCase())) return;
+    seenCleanCustomKeys.add(cleanKey.toLowerCase());
+
+    const fullKey = `${prefix}.${cleanKey}`;
+    const mappedType = mapCustomFieldType(rawType, cleanKey);
     const opts = safeArr(rawOpts)
       .map((o: any) =>
         typeof o === 'string'
@@ -522,7 +837,9 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
     customFieldMap.set(fullKey, {
       value: fullKey,
       key: fullKey,
-      label: String(rawLabel || cleanKey).trim(),
+      canonical_key: `custom.${cleanKey}`,
+      is_custom: true,
+      label: String(rawLabel || humanizeCustomFieldKey(cleanKey)).trim(),
       type: mappedType,
       group: 'custom_fields',
       ...(opts.length > 0 ? { options: opts } : {}),
@@ -530,24 +847,37 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
   };
 
   for (const row of [...pipeCfRows, ...globalCfRows]) {
-    registerCustomField(row.field_key, row.field_label, row.field_type, row.options_json);
+    registerCustomField(row.field_key, row.field_label, row.field_type, row.options_json, 'cf');
   }
   const settingsCustom = rawSettings.custom_fields;
   if (Array.isArray(settingsCustom)) {
     for (const item of settingsCustom) {
       if (item && typeof item === 'object') {
         const obj = item as Record<string, unknown>;
-        registerCustomField(obj.key ?? obj.field_key ?? obj.name, obj.label ?? obj.field_label, obj.type ?? obj.field_type, obj.options ?? obj.options_json);
+        registerCustomField(obj.key ?? obj.field_key ?? obj.name, obj.label ?? obj.field_label, obj.type ?? obj.field_type, obj.options ?? obj.options_json, 'cf');
       }
     }
   } else if (settingsCustom && typeof settingsCustom === 'object') {
     for (const [k, v] of Object.entries(settingsCustom as Record<string, unknown>)) {
       if (v && typeof v === 'object' && !Array.isArray(v)) {
         const obj = v as Record<string, unknown>;
-        registerCustomField(k, obj.label ?? obj.field_label ?? k, obj.type ?? obj.field_type, obj.options);
+        registerCustomField(k, obj.label ?? obj.field_label ?? k, obj.type ?? obj.field_type, obj.options, 'cf');
       } else {
-        registerCustomField(k, typeof v === 'string' ? v : k, 'text');
+        registerCustomField(k, typeof v === 'string' ? v : k, 'text', undefined, 'cf');
       }
+    }
+  }
+  for (const row of legacyCfDefsRows) {
+    registerCustomField(row.field_key, row.field_label, row.field_type, row.options_json, 'custom');
+  }
+
+  // Sample dynamic JSONB keys from tenant's actual `leads.custom_fields`
+  for (const row of sampledLeadCfRows) {
+    const cfObj = safeObj(row.custom_fields);
+    for (const [k, v] of Object.entries(cfObj)) {
+      if (v === null || v === undefined || typeof v === 'object') continue;
+      const inferredType = inferCustomFieldTypeFromValue(v, k);
+      registerCustomField(k, humanizeCustomFieldKey(k), inferredType, undefined, 'custom');
     }
   }
 
@@ -596,16 +926,26 @@ export async function buildDynamicConditionSchemaRegistryInTx(client: DbClient, 
   }
 
   const fields = groups.flatMap((g) => g.fields);
+  const customFieldKeys = Array.from(customFieldMap.values()).map((f) => f.canonical_key || f.key);
+
   return {
     groups,
     fields,
+    custom_field_keys: customFieldKeys,
     operators_by_type: CONDITION_OPERATORS_BY_TYPE,
     dynamic_options: {
       stages,
       users,
       teams,
+      branches,
+      rounds,
       tags,
       lists,
+      campaigns,
+      flows,
+      surveys,
+      forms,
+      voucher_campaigns: voucherCampaigns,
     },
     education_enabled: educationEnabled,
   };

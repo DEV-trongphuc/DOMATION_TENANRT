@@ -1,4 +1,4 @@
-import { resolveDateBounds, bindDateParams } from '../workspace.routes.ts';
+import { resolveDateBounds, bindDateParams, isValidIsoDateString } from '../workspace.routes.ts';
 import type { TenantContext } from '../../core/context/tenant-context.ts';
 import type { TenantSettings } from '../../core/settings/tenant-settings.ts';
 import { maskEmailString, maskPhoneString, shouldMaskPiiForActor } from '../../core/security/pii-masker.ts';
@@ -7,29 +7,48 @@ export interface ParsedLegacyDateRange {
   preset: string;
   startDate?: string | null;
   endDate?: string | null;
+  sinceIso?: string | null;
+  untilIso?: string | null;
   isSingleDay: boolean;
   label: string;
   bindSql: (col: string, params: unknown[]) => string;
   bindPrevSql: (col: string, params: unknown[]) => string | null;
 }
 
-export function normalizeLegacyDatePreset(raw?: string | null): {
+export function normalizeLegacyDatePreset(
+  raw?: string | null,
+  since?: string | null,
+  until?: string | null
+): {
   preset: string;
   startDate?: string | null;
   endDate?: string | null;
   isSingleDay: boolean;
 } {
+  const cleanSince = since ? String(since).trim() : '';
+  const cleanUntil = until ? String(until).trim() : '';
+  if (isValidIsoDateString(cleanSince) && isValidIsoDateString(cleanUntil)) {
+    const [sIso, eIso] = cleanSince <= cleanUntil ? [cleanSince, cleanUntil] : [cleanUntil, cleanSince];
+    return {
+      preset: 'custom',
+      startDate: sIso,
+      endDate: eIso,
+      isSingleDay: sIso === eIso,
+    };
+  }
+
   const trimmed = String(raw || 'Tháng này').trim();
   const lower = trimmed.toLowerCase();
 
-  if (lower.includes('đến') || lower.includes(' - ')) {
-    const parts = trimmed.split(/\s*(?:đến| - )\s*/i).map((s) => s.trim());
-    if (parts.length === 2 && /^\d{4}-\d{2}-\d{2}$/.test(parts[0]) && /^\d{4}-\d{2}-\d{2}$/.test(parts[1])) {
+  if (lower.includes('đến') || lower.includes(' - ') || lower.includes(' ~ ') || lower.includes('..')) {
+    const parts = trimmed.split(/\s*(?:đến| - | ~ |\.\.)\s*/i).map((s) => s.trim());
+    if (parts.length === 2 && isValidIsoDateString(parts[0]) && isValidIsoDateString(parts[1])) {
+      const [sIso, eIso] = parts[0] <= parts[1] ? [parts[0], parts[1]] : [parts[1], parts[0]];
       return {
         preset: 'custom',
-        startDate: parts[0],
-        endDate: parts[1],
-        isSingleDay: parts[0] === parts[1],
+        startDate: sIso,
+        endDate: eIso,
+        isSingleDay: sIso === eIso,
       };
     }
   }
@@ -39,15 +58,27 @@ export function normalizeLegacyDatePreset(raw?: string | null): {
     today: { p: 'today', single: true },
     'hôm qua': { p: 'yesterday', single: true },
     yesterday: { p: 'yesterday', single: true },
+    'hôm qua - hôm nay': { p: 'yesterday_to_today', single: false },
+    'hôm qua – hôm nay': { p: 'yesterday_to_today', single: false },
+    'yesterday - today': { p: 'yesterday_to_today', single: false },
+    yesterday_to_today: { p: 'yesterday_to_today', single: false },
     'tuần này': { p: 'this_week', single: false },
     this_week: { p: 'this_week', single: false },
     'tuần trước': { p: 'last_week', single: false },
     last_week: { p: 'last_week', single: false },
     'tuần trước nữa': { p: '7_days', single: false },
     '7 ngày qua': { p: '7_days', single: false },
+    '7 ngày gần nhất': { p: '7_days', single: false },
+    'last 7 days': { p: '7_days', single: false },
+    last_7days: { p: '7_days', single: false },
+    last_7_days: { p: '7_days', single: false },
     '7_days': { p: '7_days', single: false },
     '7days': { p: '7_days', single: false },
     '30 ngày qua': { p: '30_days', single: false },
+    '30 ngày gần nhất': { p: '30_days', single: false },
+    'last 30 days': { p: '30_days', single: false },
+    last_30days: { p: '30_days', single: false },
+    last_30_days: { p: '30_days', single: false },
     '30_days': { p: '30_days', single: false },
     '30days': { p: '30_days', single: false },
     'tháng này': { p: 'this_month', single: false },
@@ -69,30 +100,49 @@ export function normalizeLegacyDatePreset(raw?: string | null): {
   };
 }
 
-export function buildLegacyDateFilter(raw?: string | null): ParsedLegacyDateRange {
-  const { preset, startDate, endDate, isSingleDay } = normalizeLegacyDatePreset(raw);
-  const resolved = resolveDateBounds(preset, startDate, endDate);
+function shiftIsoDate(iso: string, deltaDays: number): string {
+  const dt = new Date(`${iso}T00:00:00Z`);
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  return dt.toISOString().slice(0, 10);
+}
+
+export function buildLegacyDateFilter(
+  raw?: string | null,
+  opts?: { since?: string | null; until?: string | null; nowRef?: Date }
+): ParsedLegacyDateRange {
+  const { preset, startDate, endDate, isSingleDay } = normalizeLegacyDatePreset(raw, opts?.since, opts?.until);
+  const resolved = resolveDateBounds(preset, startDate, endDate, opts?.nowRef);
 
   const prevPresetMap: Record<string, string | null> = {
     today: 'yesterday',
-    yesterday: null,
     this_week: 'last_week',
     this_month: 'last_month',
-    last_month: null,
-    '7_days': null,
-    '30_days': null,
     all: null,
-    custom: null,
   };
-  const prevPreset = prevPresetMap[preset];
-  const prevResolved = prevPreset ? resolveDateBounds(prevPreset, null, null) : null;
+  let prevResolved: { clause: string; params: unknown[] } | null = null;
+  if (preset in prevPresetMap) {
+    const pp = prevPresetMap[preset];
+    prevResolved = pp ? resolveDateBounds(pp, null, null, opts?.nowRef) : null;
+  } else if (resolved.sinceIso && resolved.untilIso) {
+    const startMs = Date.parse(`${resolved.sinceIso}T00:00:00Z`);
+    const endMs = Date.parse(`${resolved.untilIso}T00:00:00Z`);
+    const spanDays = Math.max(1, Math.round((endMs - startMs) / 86_400_000) + 1);
+    const prevUntil = shiftIsoDate(resolved.sinceIso, -1);
+    const prevSince = shiftIsoDate(prevUntil, -(spanDays - 1));
+    prevResolved = resolveDateBounds('custom', prevSince, prevUntil, opts?.nowRef);
+  }
 
   return {
     preset,
-    startDate,
-    endDate,
+    startDate: startDate ?? resolved.sinceIso ?? null,
+    endDate: endDate ?? resolved.untilIso ?? null,
+    sinceIso: resolved.sinceIso ?? null,
+    untilIso: resolved.untilIso ?? null,
     isSingleDay,
-    label: String(raw || 'Tháng này'),
+    label:
+      opts?.since && opts?.until && isValidIsoDateString(opts.since) && isValidIsoDateString(opts.until)
+        ? `${resolved.sinceIso} - ${resolved.untilIso}`
+        : String(raw || 'Tháng này'),
     bindSql: (col: string, params: unknown[]) =>
       bindDateParams(resolved.clause, params, resolved).replace(/\bcreated_at\b/g, col),
     bindPrevSql: (col: string, params: unknown[]) => {
@@ -100,6 +150,17 @@ export function buildLegacyDateFilter(raw?: string | null): ParsedLegacyDateRang
       return bindDateParams(prevResolved.clause, params, prevResolved).replace(/\bcreated_at\b/g, col);
     },
   };
+}
+
+export function buildLegacyDateFilterFromParams(
+  params: URLSearchParams,
+  fallbackDate = 'Tháng này',
+  dateParamKey = 'date'
+): ParsedLegacyDateRange {
+  const since = params.get('since') || params.get('start_date');
+  const until = params.get('until') || params.get('end_date');
+  const rawDate = params.get(dateParamKey) || params.get('date') || fallbackDate;
+  return buildLegacyDateFilter(rawDate, { since, until });
 }
 
 export function formatPctDelta(curr: number, prev: number): string {

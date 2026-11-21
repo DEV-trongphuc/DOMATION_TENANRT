@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { DbClient } from '../../core/database/db-adapter.ts';
 import type { TenantContext } from '../../core/context/tenant-context.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import {
   resolveUserEffectivePermissions,
   type DataScope,
@@ -432,6 +433,8 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
           Math.max(0, Math.min(100, Number(args.lead_score ?? 25))),
         ]
       );
+
+      tenantRedis.invalidateTenantMonthlyLeadCount(ctx.tenantId);
 
       return {
         mode: 'created',
@@ -3174,7 +3177,7 @@ export const DOM_AGENT_TOOLS_REGISTRY: ReadonlyArray<DomAgentToolDefinition> = [
              ON sl.tenant_id = r.tenant_id AND sl.request_id = r.id AND sl.step_order = r.current_step_order AND sl.status = 'pending'
            LEFT JOIN users u ON u.tenant_id = sl.tenant_id AND u.id = sl.assigned_user_id
            WHERE r.tenant_id = $1 AND r.status = 'pending'
-           ORDER BY sl.due_at ASC NULLS LAST, r.created_at ASC
+           ORDER BY CASE WHEN sl.due_at IS NULL THEN 1 ELSE 0 END, sl.due_at ASC, r.created_at ASC
            LIMIT 15`,
           [ctx.tenantId]
         )) || [];

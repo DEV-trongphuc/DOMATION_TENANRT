@@ -1,21 +1,38 @@
 import crypto from 'node:crypto';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
 import type { DbClient } from '../core/database/db-adapter.ts';
 import { withTenantTransaction, withSystemPrivilege } from '../core/database/transaction.ts';
 import { encryptTenantSecret, decryptTenantSecret } from '../core/crypto/vault.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import {
+  DEFAULT_TENANT_SETTINGS,
   normalizeTenantSettings,
   renderTemplateString,
   resolveTenantBrandName,
 } from '../core/settings/tenant-settings.ts';
-import { getTenantIntegrationCached, getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
+import {
+  getTenantIntegrationCached,
+  getTenantIntegrationsBatchCached,
+  getTenantMetaCached,
+  getTenantSettingsCached,
+} from '../core/settings/tenant-cache.ts';
+import { isLocalLoopbackUrl, isOutboundSilentMode } from '../core/security/outbound-guard.ts';
 import { dispatchOutboundWebhookEvent } from './webhook.service.ts';
 
 export interface ZaloIntegrationConfig {
   app_id?: string;
   oa_id?: string;
   oa_secret?: string;
+  secret_key?: string;
   bot_token?: string;
+  botToken?: string;
+  chat_id?: string;
+  chatId?: string;
+  enabled?: boolean;
+  silent_mode?: boolean;
+  silentMode?: boolean;
   access_token?: string;
   refresh_token?: string;
   group_chat_id?: string;
@@ -42,6 +59,43 @@ export interface SmtpIntegrationConfig {
   smtp_pass?: string;
   notify_email?: string;
   from_name?: string;
+  from_email?: string;
+  fromEmail?: string;
+  sender_email?: string;
+  sesRegion?: string;
+  region?: string;
+  aws_region?: string;
+  authUser?: string;
+  accessKeyId?: string;
+  aws_access_key_id?: string;
+  apiKey?: string;
+  api_key?: string;
+  server_token?: string;
+  serverToken?: string;
+  secretAccessKey?: string;
+  aws_secret_access_key?: string;
+  max_send_rate?: number;
+  max_send_rate_per_sec?: number;
+  sandbox_mode?: boolean;
+  dkim_verified?: boolean;
+}
+
+export type EmailProvider = 'appscript' | 'resend' | 'smtp' | 'ses' | 'sendgrid' | 'postmark';
+
+export interface PreloadedEmailTenantState {
+  tenantId: string;
+  smtpCfg: SmtpIntegrationConfig;
+  hasSmtpVault: boolean;
+  sesCfg: SmtpIntegrationConfig;
+  hasSesVault: boolean;
+  resendCfg: SmtpIntegrationConfig;
+  hasResendVault: boolean;
+  sendgridCfg: SmtpIntegrationConfig;
+  hasSendgridVault: boolean;
+  postmarkCfg: SmtpIntegrationConfig;
+  hasPostmarkVault: boolean;
+  rawRow: { name: string; slug: string; settings: Record<string, any> };
+  tenantCfg: ReturnType<typeof normalizeTenantSettings>;
 }
 
 export type EmailCategory =
@@ -69,35 +123,81 @@ export interface EmailDispatchMessage {
   html?: string;
   category?: EmailCategory;
   meta?: Record<string, unknown>;
-  overrideProvider?: 'appscript' | 'ses' | 'smtp';
+  overrideProvider?: EmailProvider;
   overrideWebhookUrl?: string;
   overrideSecret?: string;
+  /** When true (Marketing Automation), Google Apps Script is strictly forbidden. */
+  disallowAppscript?: boolean;
+  /** When true, SMTP / AWS SES SMTP uses persistent connection pooling (maxConnections: 10, maxMessages: 200). */
+  pooled?: boolean;
+  fromEmailOverride?: string;
+  fromNameOverride?: string;
+  /** Preloaded decrypted tenant + vault state from Phase 1 so Phase 2 makes zero DB queries per message. */
+  preloadedState?: PreloadedEmailTenantState;
 }
 
 export interface EmailDispatchResult {
   sent: boolean;
   messageId: string;
+  headerMessageId?: string;
   recipient: string;
   smtpHost: string;
-  provider: 'appscript' | 'smtp' | 'ses' | 'silent_guard';
+  provider: EmailProvider | 'silent_guard';
   category: string;
   remainingQuota?: number | null;
   sheetLogged?: boolean;
   error?: string;
 }
 
+export interface ZaloBotSendResult {
+  success: boolean;
+  messageId?: string;
+  silent: boolean;
+  mocked: boolean;
+  error?: string;
+}
+
+export interface DiscordSendResult {
+  success: boolean;
+  messageId?: string;
+  silent: boolean;
+  mocked: boolean;
+  error?: string;
+}
+
 type SmtpTransportFn = (
   cfg: SmtpIntegrationConfig,
-  msg: { to: string; subject: string; text: string }
+  msg: { to: string; subject: string; text: string; html?: string; fromName?: string; cc?: string }
 ) => Promise<{ accepted: boolean; messageId: string }>;
+
+export type ZaloOAuthFetcherFn = (
+  cfg: ZaloIntegrationConfig
+) => Promise<{ access_token: string; refresh_token: string; expires_in: number }>;
 
 type EmailWebhookFetcherFn = (
   url: string,
   init: { method: string; headers: Record<string, string>; body: string }
 ) => Promise<{ ok: boolean; status: number; text: () => Promise<string>; headers?: { get(k: string): string | null } }>;
 
+export type ZaloBotTransportFn = (payload: {
+  chatId: string;
+  text: string;
+  botToken?: string;
+}) => Promise<{ messageId?: string; ok?: boolean } | void>;
+
+export type DiscordTransportFn = (payload: {
+  webhookUrl?: string;
+  channelId?: string;
+  content: string;
+  username?: string;
+  embeds?: Array<Record<string, unknown>>;
+}) => Promise<{ messageId?: string; id?: string } | void>;
+
 let customSmtpTransport: SmtpTransportFn | null = null;
 let customEmailWebhookFetcher: EmailWebhookFetcherFn | null = null;
+let customZaloBotTransport: ZaloBotTransportFn | null = null;
+let customDiscordTransport: DiscordTransportFn | null = null;
+let customZaloOAuthFetcher: ZaloOAuthFetcherFn | null = null;
 
 export function setSmtpTransportForTesting(fn: SmtpTransportFn | null): void {
   customSmtpTransport = fn;
@@ -105,6 +205,18 @@ export function setSmtpTransportForTesting(fn: SmtpTransportFn | null): void {
 
 export function setEmailWebhookFetcherForTesting(fn: EmailWebhookFetcherFn | null): void {
   customEmailWebhookFetcher = fn;
+}
+
+export function setZaloBotTransportForTesting(fn: ZaloBotTransportFn | null): void {
+  customZaloBotTransport = fn;
+}
+
+export function setDiscordTransportForTesting(fn: DiscordTransportFn | null): void {
+  customDiscordTransport = fn;
+}
+
+export function setZaloOAuthFetcherForTesting(fn: ZaloOAuthFetcherFn | null): void {
+  customZaloOAuthFetcher = fn;
 }
 
 function escapeHtml(val: unknown): string {
@@ -164,6 +276,7 @@ export function buildCategoryTestEmailContent(params: {
   tenantName: string;
   tenantSlug: string;
   frontendUrl: string;
+  includeMetaAds?: boolean;
 }): { category: EmailCategory; subject: string; text: string; html: string; meta: Record<string, unknown> } {
   const baseUrl = params.frontendUrl.replace(/\/+$/, '') || 'https://domation.net/data';
   const portalUrl = `${baseUrl}/${params.tenantSlug}`;
@@ -263,13 +376,23 @@ export function buildCategoryTestEmailContent(params: {
       badge: 'BÁO CÁO CUỐI NGÀY',
       accent: '#059669',
       title: `Tổng kết hiệu suất phân phối Data hôm nay — ${params.tenantName}`,
-      summary: 'Báo cáo tổng hợp tình hình tiếp nhận Lead, tỷ lệ thiện chí & kết quả xử lý SLA trong ngày.',
+      summary: params.includeMetaAds
+        ? 'Báo cáo tổng hợp tình hình tiếp nhận Lead, tỷ lệ thiện chí, kết quả xử lý SLA và hiệu quả Meta Ads trong ngày.'
+        : 'Báo cáo tổng hợp tình hình tiếp nhận Lead, tỷ lệ thiện chí & kết quả xử lý SLA trong ngày.',
       cta: 'Xem Báo cáo Chi tiết',
       rows: [
         { label: 'Tổng Lead tiếp nhận', value: '42 Lead (100% đã phân bổ)' },
         { label: 'Đã tiếp nhận đúng SLA', value: '39 / 42 (92.8%)' },
         { label: 'Thiện chí & Hẹn gặp', value: '24 Lead (57.1%)' },
         { label: 'Ticket bù lỗi', value: '2 đã duyệt • 0 tồn đọng' },
+        ...(params.includeMetaAds
+          ? [
+              {
+                label: 'Hiệu quả Meta Ads (Preview)',
+                value: 'Chi tiêu 1,230,000₫ • Reach 19,000 • 27 Leads • 45 Tin nhắn • Cao điểm 20:00',
+              },
+            ]
+          : []),
       ],
     },
   };
@@ -319,43 +442,1028 @@ function isEmailSilentBlocked(): boolean {
   );
 }
 
-/**
- * Dispatches an operational, assignment, ticket, report, or SLA alert email using the tenant's
- * configured Google Apps Script Web App (`appscript_webhook_url`) or SMTP vault config.
- */
-export async function sendTenantEmailNotification(input: EmailDispatchMessage): Promise<EmailDispatchResult | null> {
-  const loadState = async (txClient: DbClient) => {
-    const [smtpRes, tRes] = await Promise.all([
-      txClient.query<{ status: string; config_encrypted: string; iv: string; auth_tag: string }>(
-        `SELECT status, config_encrypted, iv, auth_tag
-         FROM tenant_integrations
-         WHERE tenant_id = $1 AND integration_type = 'smtp' AND status = 'active'
-         LIMIT 1`,
-        [input.tenantId]
-      ),
-      txClient.query<{ name: string; slug: string; settings: Record<string, any> }>(
-        'SELECT name, slug, settings FROM tenants WHERE id = $1 LIMIT 1',
-        [input.tenantId]
-      ),
-    ]);
-    return {
-      row: smtpRes.rows[0] || null,
-      rawRow: tRes.rows[0] || { name: 'DOMATION AutoData', slug: '', settings: {} },
+function isLoopbackHost(host: string): boolean {
+  return isLocalLoopbackUrl(`http://${host}`);
+}
+
+const EMAIL_RECIPIENT_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function sanitizeEmailAddress(raw: unknown): string {
+  return String(raw || '').replace(/[\r\n<>]/g, '').trim();
+}
+
+function sanitizeEmailDisplayName(raw: unknown): string {
+  return String(raw || '')
+    .replace(/[\r\n<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function parseEmailRecipientList(rawCc: unknown, excludeTo?: string): string[] {
+  const excludeLow = sanitizeEmailAddress(excludeTo).toLowerCase();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const parts = Array.isArray(rawCc) ? rawCc : String(rawCc || '').split(/[,;\s]+/);
+  for (const part of parts) {
+    const addr = sanitizeEmailAddress(part);
+    if (!addr || !EMAIL_RECIPIENT_REGEX.test(addr)) continue;
+    const low = addr.toLowerCase();
+    if (excludeLow && low === excludeLow) continue;
+    if (seen.has(low)) continue;
+    seen.add(low);
+    out.push(addr);
+  }
+  return out;
+}
+
+export function stripHtmlTagsForPlainText(input: string): string {
+  return String(input || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<\/?[a-zA-Z][^>]*>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .trim();
+}
+
+export function chunkTextForChat(text: string, maxChars = 1950): string[] {
+  const clean = String(text || '').trim();
+  if (!clean) return [];
+  if (clean.length <= maxChars) return [clean];
+
+  const chunks: string[] = [];
+  let remaining = clean;
+  while (remaining.length > maxChars) {
+    let splitIdx = remaining.lastIndexOf('\n', maxChars);
+    if (splitIdx < Math.floor(maxChars * 0.4)) {
+      splitIdx = remaining.lastIndexOf(' ', maxChars);
+    }
+    if (splitIdx <= 0) {
+      splitIdx = maxChars;
+    }
+    chunks.push(remaining.slice(0, splitIdx).trim());
+    remaining = remaining.slice(splitIdx).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks.filter(Boolean);
+}
+
+function encodeMimeHeaderUtf8(text: string): string {
+  return `=?UTF-8?B?${Buffer.from(text, 'utf8').toString('base64')}?=`;
+}
+
+function wrapBase64Lines(b64: string, width = 76): string {
+  const lines: string[] = [];
+  for (let i = 0; i < b64.length; i += width) {
+    lines.push(b64.slice(i, i + width));
+  }
+  return lines.join('\r\n');
+}
+
+export async function sendRawSmtpMail(opts: {
+  host: string;
+  port: number;
+  user?: string;
+  pass?: string;
+  fromEmail: string;
+  fromName?: string;
+  to: string;
+  cc?: string;
+  subject: string;
+  text: string;
+  html: string;
+  messageId?: string;
+  timeoutMs?: number;
+}): Promise<{ accepted: boolean; messageId: string; headerMessageId?: string; error?: string }> {
+  const host = opts.host.trim();
+  const port = Number.isFinite(opts.port) && opts.port > 0 ? Math.round(opts.port) : 587;
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const messageId = (opts.messageId || `msg_${crypto.randomBytes(8).toString('hex')}@autodata.vn`).replace(/^<|>$/g, '');
+  const loopback = isLoopbackHost(host);
+  const fromEmail = sanitizeEmailAddress(opts.fromEmail);
+  const toEmail = sanitizeEmailAddress(opts.to);
+  const ccList = parseEmailRecipientList(opts.cc, toEmail);
+  const safeFromName = sanitizeEmailDisplayName(opts.fromName);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let socket: net.Socket | tls.TLSSocket | null = null;
+    let buffer = '';
+    let pendingResolve: ((res: { code: number; lines: string[] }) => void) | null = null;
+    let pendingReject: ((err: Error) => void) | null = null;
+    let currentLines: string[] = [];
+
+    const finish = (result: { accepted: boolean; messageId: string; headerMessageId?: string; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket?.destroy();
+      } catch {}
+      resolve(result);
     };
+
+    const attachSocketHandlers = (sock: net.Socket | tls.TLSSocket) => {
+      sock.setEncoding('utf8');
+      sock.setTimeout(timeoutMs, () => {
+        const err = new Error(`SMTP timeout after ${timeoutMs}ms (${host}:${port})`);
+        pendingReject?.(err);
+        finish({ accepted: false, messageId, error: err.message });
+      });
+      sock.on('error', (err) => {
+        pendingReject?.(err);
+        finish({ accepted: false, messageId, error: err.message || 'SMTP socket error' });
+      });
+      sock.on('close', () => {
+        if (!settled && pendingReject) {
+          pendingReject(new Error('SMTP connection closed unexpectedly'));
+        }
+      });
+      sock.on('data', (chunk: string) => {
+        buffer += chunk;
+        let idx = buffer.indexOf('\n');
+        while (idx !== -1) {
+          const rawLine = buffer.slice(0, idx).replace(/\r$/, '');
+          buffer = buffer.slice(idx + 1);
+          if (/^\d{3}[- ]/.test(rawLine)) {
+            currentLines.push(rawLine);
+            if (rawLine[3] === ' ') {
+              const code = Number(rawLine.slice(0, 3));
+              const lines = currentLines;
+              currentLines = [];
+              const resFn = pendingResolve;
+              pendingResolve = null;
+              pendingReject = null;
+              resFn?.({ code, lines });
+            }
+          }
+          idx = buffer.indexOf('\n');
+        }
+      });
+    };
+
+    const readReply = (): Promise<{ code: number; lines: string[] }> =>
+      new Promise((res, rej) => {
+        pendingResolve = res;
+        pendingReject = rej;
+      });
+
+    const sendCmd = async (cmd: string, expectedCodes: number[]): Promise<{ code: number; lines: string[] }> => {
+      if (!socket) throw new Error('SMTP socket not initialized');
+      const replyPromise = readReply();
+      socket.write(`${cmd}\r\n`);
+      const reply = await replyPromise;
+      if (!expectedCodes.includes(reply.code)) {
+        throw new Error(`SMTP ${cmd.split(' ')[0]} failed (${reply.code}): ${reply.lines.join(' | ')}`);
+      }
+      return reply;
+    };
+
+    (async () => {
+      if (port === 465) {
+        socket = tls.connect({ host, port, servername: host, rejectUnauthorized: !loopback });
+      } else {
+        socket = net.createConnection({ host, port });
+      }
+      attachSocketHandlers(socket);
+
+      const greeting = await readReply();
+      if (greeting.code !== 220) {
+        throw new Error(`SMTP greeting rejected (${greeting.code}): ${greeting.lines.join(' | ')}`);
+      }
+
+      let ehlo = await sendCmd('EHLO autodata.local', [250]);
+      const supportsStartTls = ehlo.lines.some((l) => /STARTTLS/i.test(l));
+
+      if (port !== 465 && supportsStartTls) {
+        await sendCmd('STARTTLS', [220]);
+        const plainSock = socket;
+        plainSock.removeAllListeners('data');
+        plainSock.removeAllListeners('error');
+        plainSock.removeAllListeners('close');
+        plainSock.removeAllListeners('timeout');
+        buffer = '';
+        currentLines = [];
+
+        const tlsSock = await new Promise<tls.TLSSocket>((res, rej) => {
+          const upgraded = tls.connect(
+            { socket: plainSock, servername: host, rejectUnauthorized: !loopback },
+            () => res(upgraded)
+          );
+          upgraded.once('error', rej);
+        });
+        socket = tlsSock;
+        attachSocketHandlers(socket);
+        ehlo = await sendCmd('EHLO autodata.local', [250]);
+      }
+
+      if (opts.user && opts.pass) {
+        const ehloJoined = ehlo.lines.join(' ').toUpperCase();
+        if (ehloJoined.includes('AUTH') && ehloJoined.includes('PLAIN')) {
+          const token = Buffer.from(`\0${opts.user}\0${opts.pass}`, 'utf8').toString('base64');
+          await sendCmd(`AUTH PLAIN ${token}`, [235]);
+        } else if (ehloJoined.includes('AUTH')) {
+          await sendCmd('AUTH LOGIN', [334]);
+          await sendCmd(Buffer.from(opts.user, 'utf8').toString('base64'), [334]);
+          await sendCmd(Buffer.from(opts.pass, 'utf8').toString('base64'), [235]);
+        }
+      }
+
+      await sendCmd(`MAIL FROM:<${fromEmail}>`, [250]);
+      await sendCmd(`RCPT TO:<${toEmail}>`, [250, 251]);
+      for (const ccAddr of ccList) {
+        await sendCmd(`RCPT TO:<${ccAddr}>`, [250, 251]);
+      }
+      await sendCmd('DATA', [354]);
+
+      const boundary = `=_dom_${crypto.randomBytes(8).toString('hex')}`;
+      const fromHeader = safeFromName
+        ? `${encodeMimeHeaderUtf8(safeFromName)} <${fromEmail}>`
+        : `<${fromEmail}>`;
+
+      const mimeLines = [
+        `From: ${fromHeader}`,
+        `To: <${toEmail}>`,
+        ...(ccList.length > 0 ? [`Cc: ${ccList.join(', ')}`] : []),
+        `Subject: ${encodeMimeHeaderUtf8(opts.subject)}`,
+        `Date: ${new Date().toUTCString()}`,
+        `Message-ID: <${messageId}>`,
+        'MIME-Version: 1.0',
+        `Content-Type: multipart/alternative; boundary="${boundary}"`,
+        '',
+        `--${boundary}`,
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        wrapBase64Lines(Buffer.from(opts.text || '', 'utf8').toString('base64')),
+        '',
+        `--${boundary}`,
+        'Content-Type: text/html; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        wrapBase64Lines(Buffer.from(opts.html || opts.text || '', 'utf8').toString('base64')),
+        '',
+        `--${boundary}--`,
+      ];
+
+      const stuffedBody = mimeLines
+        .map((line) => (line.startsWith('.') ? `.${line}` : line))
+        .join('\r\n');
+
+      const dataReplyPromise = readReply();
+      socket.write(`${stuffedBody}\r\n.\r\n`);
+      const dataReply = await dataReplyPromise;
+      if (dataReply.code !== 250) {
+        throw new Error(`SMTP DATA rejected (${dataReply.code}): ${dataReply.lines.join(' | ')}`);
+      }
+
+      const sesOkLine = dataReply.lines
+        .map((line) => line.match(/^250[- ]\s*Ok\s+([A-Za-z0-9-]+)$/i))
+        .find(Boolean);
+      const resolvedMessageId = sesOkLine?.[1] ? sesOkLine[1].trim() : messageId;
+
+      try {
+        await sendCmd('QUIT', [221]);
+      } catch {
+        // Ignore QUIT close race after 250 OK
+      }
+      finish({ accepted: true, messageId: resolvedMessageId, headerMessageId: messageId });
+    })().catch((err: any) => {
+      finish({ accepted: false, messageId, error: err?.message || 'SMTP dispatch failed' });
+    });
+  });
+}
+
+// ============================================================================
+// High-Throughput Pooled SMTP Transporter Cache (maxConnections: 10, maxMessages: 200)
+// & Keep-Alive HTTPS Agent for AWS SES v2 / Resend / SendGrid / Postmark
+// ============================================================================
+const sesKeepAliveAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 20,
+  maxFreeSockets: 10,
+});
+
+async function postJsonKeepAlive(
+  rawUrl: string,
+  init: { method: string; headers: Record<string, string>; body: string },
+  timeoutMs = 18_000
+): Promise<{ ok: boolean; status: number; text: () => Promise<string>; headers: { get(k: string): string | null } }> {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== 'https:') {
+    const r = await fetch(rawUrl, {
+      ...init,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return r;
+  }
+
+  return new Promise((resolve, reject) => {
+    const bodyBuf = Buffer.from(init.body || '', 'utf8');
+    const req = https.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port ? Number(parsed.port) : 443,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: init.method || 'POST',
+        agent: sesKeepAliveAgent,
+        headers: {
+          ...init.headers,
+          'Content-Length': String(bodyBuf.byteLength),
+          Connection: 'keep-alive',
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer | string) => chunks.push(typeof c === 'string' ? Buffer.from(c) : c));
+        res.on('end', () => {
+          const textBody = Buffer.concat(chunks).toString('utf8');
+          const status = res.statusCode || 0;
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            async text() {
+              return textBody;
+            },
+            headers: {
+              get(k: string) {
+                const v = res.headers[k.toLowerCase()];
+                return Array.isArray(v) ? v.join(', ') : v ?? null;
+              },
+            },
+          });
+        });
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error(`HTTPS keep-alive request timeout after ${timeoutMs}ms (${parsed.hostname})`));
+    });
+    req.on('error', reject);
+    req.write(bodyBuf);
+    req.end();
+  });
+}
+
+interface PooledSmtpSendOpts {
+  host: string;
+  port: number;
+  user?: string;
+  pass?: string;
+  fromEmail: string;
+  fromName?: string;
+  to: string;
+  cc?: string;
+  subject: string;
+  text: string;
+  html: string;
+  messageId?: string;
+  timeoutMs?: number;
+}
+
+class PooledSmtpSession {
+  private socket: net.Socket | tls.TLSSocket | null = null;
+  private buffer = '';
+  private currentLines: string[] = [];
+  private pendingResolve: ((res: { code: number; lines: string[] }) => void) | null = null;
+  private pendingReject: ((err: Error) => void) | null = null;
+  public closed = false;
+  public messagesSent = 0;
+  public lastUsedAt = Date.now();
+  private readonly host: string;
+  private readonly port: number;
+  private readonly user?: string;
+  private readonly pass?: string;
+  private readonly timeoutMs: number;
+
+  constructor(opts: { host: string; port: number; user?: string; pass?: string; timeoutMs?: number }) {
+    this.host = opts.host.trim();
+    this.port = Number.isFinite(opts.port) && opts.port > 0 ? Math.round(opts.port) : 587;
+    this.user = opts.user;
+    this.pass = opts.pass;
+    this.timeoutMs = opts.timeoutMs ?? 15_000;
+  }
+
+  private attachSocket(sock: net.Socket | tls.TLSSocket): void {
+    sock.setEncoding('utf8');
+    sock.setTimeout(this.timeoutMs, () => {
+      const err = new Error(`SMTP pool timeout after ${this.timeoutMs}ms (${this.host}:${this.port})`);
+      this.failPending(err);
+      this.destroy();
+    });
+    sock.on('error', (err) => {
+      this.failPending(err);
+      this.destroy();
+    });
+    sock.on('close', () => {
+      this.closed = true;
+      this.failPending(new Error('SMTP pooled connection closed'));
+    });
+    sock.on('data', (chunk: string) => {
+      this.buffer += chunk;
+      let idx = this.buffer.indexOf('\n');
+      while (idx !== -1) {
+        const rawLine = this.buffer.slice(0, idx).replace(/\r$/, '');
+        this.buffer = this.buffer.slice(idx + 1);
+        if (/^\d{3}[- ]/.test(rawLine)) {
+          this.currentLines.push(rawLine);
+          if (rawLine[3] === ' ') {
+            const code = Number(rawLine.slice(0, 3));
+            const lines = this.currentLines;
+            this.currentLines = [];
+            const resFn = this.pendingResolve;
+            this.pendingResolve = null;
+            this.pendingReject = null;
+            resFn?.({ code, lines });
+          }
+        }
+        idx = this.buffer.indexOf('\n');
+      }
+    });
+  }
+
+  private failPending(err: Error): void {
+    const rej = this.pendingReject;
+    this.pendingResolve = null;
+    this.pendingReject = null;
+    rej?.(err);
+  }
+
+  private readReply(): Promise<{ code: number; lines: string[] }> {
+    if (this.closed || !this.socket || this.socket.destroyed) {
+      return Promise.reject(new Error('SMTP pooled socket closed'));
+    }
+    return new Promise((res, rej) => {
+      this.pendingResolve = res;
+      this.pendingReject = rej;
+    });
+  }
+
+  private async sendCmd(cmd: string, expectedCodes: number[]): Promise<{ code: number; lines: string[] }> {
+    if (!this.socket || this.closed || this.socket.destroyed) {
+      throw new Error('SMTP pooled socket not connected');
+    }
+    const p = this.readReply();
+    this.socket.write(`${cmd}\r\n`);
+    const reply = await p;
+    if (!expectedCodes.includes(reply.code)) {
+      throw new Error(`SMTP ${cmd.split(' ')[0]} failed (${reply.code}): ${reply.lines.join(' | ')}`);
+    }
+    return reply;
+  }
+
+  async connect(): Promise<void> {
+    const loopback = isLoopbackHost(this.host);
+    this.socket =
+      this.port === 465
+        ? tls.connect({ host: this.host, port: this.port, servername: this.host, rejectUnauthorized: !loopback })
+        : net.createConnection({ host: this.host, port: this.port });
+    this.attachSocket(this.socket);
+
+    const greeting = await this.readReply();
+    if (greeting.code !== 220) {
+      throw new Error(`SMTP greeting rejected (${greeting.code}): ${greeting.lines.join(' | ')}`);
+    }
+
+    let ehlo = await this.sendCmd('EHLO autodata.local', [250]);
+    const supportsStartTls = ehlo.lines.some((l) => /STARTTLS/i.test(l));
+    if (this.port !== 465 && supportsStartTls) {
+      await this.sendCmd('STARTTLS', [220]);
+      const plainSock = this.socket;
+      plainSock.removeAllListeners('data');
+      plainSock.removeAllListeners('error');
+      plainSock.removeAllListeners('close');
+      plainSock.removeAllListeners('timeout');
+      this.buffer = '';
+      this.currentLines = [];
+
+      const tlsSock = await new Promise<tls.TLSSocket>((res, rej) => {
+        const upgraded = tls.connect(
+          { socket: plainSock, servername: this.host, rejectUnauthorized: !loopback },
+          () => res(upgraded)
+        );
+        upgraded.once('error', rej);
+      });
+      this.socket = tlsSock;
+      this.attachSocket(this.socket);
+      ehlo = await this.sendCmd('EHLO autodata.local', [250]);
+    }
+
+    if (this.user && this.pass) {
+      const ehloJoined = ehlo.lines.join(' ').toUpperCase();
+      if (ehloJoined.includes('AUTH') && ehloJoined.includes('PLAIN')) {
+        const token = Buffer.from(`\0${this.user}\0${this.pass}`, 'utf8').toString('base64');
+        await this.sendCmd(`AUTH PLAIN ${token}`, [235]);
+      } else if (ehloJoined.includes('AUTH')) {
+        await this.sendCmd('AUTH LOGIN', [334]);
+        await this.sendCmd(Buffer.from(this.user, 'utf8').toString('base64'), [334]);
+        await this.sendCmd(Buffer.from(this.pass, 'utf8').toString('base64'), [235]);
+      }
+    }
+    this.lastUsedAt = Date.now();
+  }
+
+  async sendMessage(opts: PooledSmtpSendOpts): Promise<{ accepted: boolean; messageId: string; headerMessageId?: string }> {
+    if (!this.socket || this.closed || this.socket.destroyed) {
+      throw new Error('SMTP pooled socket closed');
+    }
+    this.socket.ref?.();
+    const messageId = (opts.messageId || `msg_${crypto.randomBytes(8).toString('hex')}@autodata.vn`).replace(/^<|>$/g, '');
+    const fromEmail = sanitizeEmailAddress(opts.fromEmail);
+    const toEmail = sanitizeEmailAddress(opts.to);
+    const ccList = parseEmailRecipientList(opts.cc, toEmail);
+    const safeFromName = sanitizeEmailDisplayName(opts.fromName);
+
+    if (this.messagesSent > 0) {
+      await this.sendCmd('RSET', [250]);
+    }
+    await this.sendCmd(`MAIL FROM:<${fromEmail}>`, [250]);
+    await this.sendCmd(`RCPT TO:<${toEmail}>`, [250, 251]);
+    for (const ccAddr of ccList) {
+      await this.sendCmd(`RCPT TO:<${ccAddr}>`, [250, 251]);
+    }
+    await this.sendCmd('DATA', [354]);
+
+    const boundary = `=_dom_${crypto.randomBytes(8).toString('hex')}`;
+    const fromHeader = safeFromName ? `${encodeMimeHeaderUtf8(safeFromName)} <${fromEmail}>` : `<${fromEmail}>`;
+    const mimeLines = [
+      `From: ${fromHeader}`,
+      `To: <${toEmail}>`,
+      ...(ccList.length > 0 ? [`Cc: ${ccList.join(', ')}`] : []),
+      `Subject: ${encodeMimeHeaderUtf8(opts.subject)}`,
+      `Date: ${new Date().toUTCString()}`,
+      `Message-ID: <${messageId}>`,
+      'MIME-Version: 1.0',
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      wrapBase64Lines(Buffer.from(opts.text || '', 'utf8').toString('base64')),
+      '',
+      `--${boundary}`,
+      'Content-Type: text/html; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      wrapBase64Lines(Buffer.from(opts.html || opts.text || '', 'utf8').toString('base64')),
+      '',
+      `--${boundary}--`,
+    ];
+    const stuffedBody = mimeLines.map((line) => (line.startsWith('.') ? `.${line}` : line)).join('\r\n');
+    const dataReplyPromise = this.readReply();
+    this.socket.write(`${stuffedBody}\r\n.\r\n`);
+    const dataReply = await dataReplyPromise;
+    if (dataReply.code !== 250) {
+      throw new Error(`SMTP DATA rejected (${dataReply.code}): ${dataReply.lines.join(' | ')}`);
+    }
+
+    const sesOkLine = dataReply.lines
+      .map((line) => line.match(/^250[- ]\s*Ok\s+([A-Za-z0-9-]+)$/i))
+      .find(Boolean);
+    const resolvedMessageId = sesOkLine?.[1] ? sesOkLine[1].trim() : messageId;
+
+    this.messagesSent++;
+    this.lastUsedAt = Date.now();
+    this.socket.unref?.();
+    return { accepted: true, messageId: resolvedMessageId, headerMessageId: messageId };
+  }
+
+  async quitAndDestroy(): Promise<void> {
+    if (!this.closed && this.socket && !this.socket.destroyed) {
+      try {
+        await this.sendCmd('QUIT', [221]);
+      } catch {
+        // Ignore close race
+      }
+    }
+    this.destroy();
+  }
+
+  destroy(): void {
+    this.closed = true;
+    try {
+      this.socket?.destroy();
+    } catch {}
+    this.socket = null;
+  }
+}
+
+class SmtpConnectionPool {
+  public readonly maxConnections: number;
+  public readonly maxMessages: number;
+  private readonly idleTimeoutMs: number;
+  private readonly host: string;
+  private readonly port: number;
+  private readonly user?: string;
+  private readonly pass?: string;
+  private idle: PooledSmtpSession[] = [];
+  private activeCount = 0;
+  private waiters: Array<(sess: PooledSmtpSession | null) => void> = [];
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  public totalReused = 0;
+  public totalCreated = 0;
+
+  constructor(opts: {
+    host: string;
+    port: number;
+    user?: string;
+    pass?: string;
+    maxConnections?: number;
+    maxMessages?: number;
+    idleTimeoutMs?: number;
+  }) {
+    this.host = opts.host;
+    this.port = opts.port;
+    this.user = opts.user;
+    this.pass = opts.pass;
+    this.maxConnections = Math.max(1, Math.min(20, opts.maxConnections ?? 10));
+    this.maxMessages = Math.max(1, opts.maxMessages ?? 200);
+    this.idleTimeoutMs = opts.idleTimeoutMs ?? 45_000;
+    this.sweepTimer = setInterval(() => this.sweepIdle(), 15_000);
+    this.sweepTimer.unref?.();
+  }
+
+  private sweepIdle(): void {
+    const cutoff = Date.now() - this.idleTimeoutMs;
+    const kept: PooledSmtpSession[] = [];
+    for (const s of this.idle) {
+      if (s.closed || s.lastUsedAt < cutoff) {
+        s.destroy();
+      } else {
+        kept.push(s);
+      }
+    }
+    this.idle = kept;
+  }
+
+  private async acquire(): Promise<{ session: PooledSmtpSession; reused: boolean }> {
+    while (this.idle.length > 0) {
+      const candidate = this.idle.pop()!;
+      if (!candidate.closed && candidate.messagesSent < this.maxMessages) {
+        this.activeCount++;
+        this.totalReused++;
+        return { session: candidate, reused: true };
+      }
+      candidate.destroy();
+    }
+
+    if (this.activeCount < this.maxConnections) {
+      this.activeCount++;
+      this.totalCreated++;
+      const sess = new PooledSmtpSession({
+        host: this.host,
+        port: this.port,
+        user: this.user,
+        pass: this.pass,
+      });
+      try {
+        await sess.connect();
+        return { session: sess, reused: false };
+      } catch (err) {
+        this.activeCount = Math.max(0, this.activeCount - 1);
+        sess.destroy();
+        this.wakeNextWaiter();
+        throw err;
+      }
+    }
+
+    const handed = await new Promise<PooledSmtpSession | null>((resolve) => {
+      this.waiters.push(resolve);
+    });
+    if (handed && !handed.closed && handed.messagesSent < this.maxMessages) {
+      this.totalReused++;
+      return { session: handed, reused: true };
+    }
+    handed?.destroy();
+    return this.acquire();
+  }
+
+  private wakeNextWaiter(): void {
+    const next = this.waiters.shift();
+    if (next) next(null);
+  }
+
+  private release(sess: PooledSmtpSession, broken: boolean): void {
+    if (broken || sess.closed || sess.messagesSent >= this.maxMessages) {
+      this.activeCount = Math.max(0, this.activeCount - 1);
+      if (sess.messagesSent >= this.maxMessages && !broken && !sess.closed) {
+        void sess.quitAndDestroy();
+      } else {
+        sess.destroy();
+      }
+      this.wakeNextWaiter();
+      return;
+    }
+
+    const nextWaiter = this.waiters.shift();
+    if (nextWaiter) {
+      nextWaiter(sess);
+      return;
+    }
+    this.activeCount = Math.max(0, this.activeCount - 1);
+    this.idle.push(sess);
+  }
+
+  async send(opts: PooledSmtpSendOpts): Promise<{ accepted: boolean; messageId: string; headerMessageId?: string; error?: string }> {
+    const fallbackId = (opts.messageId || `msg_${crypto.randomBytes(8).toString('hex')}@autodata.vn`).replace(/^<|>$/g, '');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let acquired: { session: PooledSmtpSession; reused: boolean } | null = null;
+      try {
+        acquired = await this.acquire();
+        const res = await acquired.session.sendMessage(opts);
+        this.release(acquired.session, false);
+        return res;
+      } catch (err: any) {
+        if (acquired) {
+          this.release(acquired.session, true);
+        }
+        // Retry once transparently if a reused idle connection was closed by remote peer
+        if (attempt === 0 && acquired?.reused) {
+          continue;
+        }
+        return { accepted: false, messageId: fallbackId, error: err?.message || 'SMTP pooled dispatch failed' };
+      }
+    }
+    return { accepted: false, messageId: fallbackId, error: 'SMTP pooled dispatch failed' };
+  }
+
+  close(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    for (const s of this.idle) s.destroy();
+    this.idle = [];
+    while (this.waiters.length > 0) {
+      const w = this.waiters.shift();
+      w?.(null);
+    }
+  }
+}
+
+const smtpPoolCache = new Map<string, SmtpConnectionPool>();
+
+function getOrCreateSmtpPool(opts: { host: string; port: number; user?: string; pass?: string }): SmtpConnectionPool {
+  const passHash = opts.pass ? sha256Hex(opts.pass).slice(0, 12) : 'nopass';
+  const key = `${opts.host.trim().toLowerCase()}:${opts.port}:${opts.user || ''}:${passHash}`;
+  let pool = smtpPoolCache.get(key);
+  if (!pool) {
+    pool = new SmtpConnectionPool({
+      host: opts.host,
+      port: opts.port,
+      user: opts.user,
+      pass: opts.pass,
+      maxConnections: 10,
+      maxMessages: 200,
+    });
+    smtpPoolCache.set(key, pool);
+  }
+  return pool;
+}
+
+export async function sendPooledSmtpMail(
+  opts: PooledSmtpSendOpts
+): Promise<{ accepted: boolean; messageId: string; headerMessageId?: string; error?: string }> {
+  const pool = getOrCreateSmtpPool({
+    host: opts.host,
+    port: Number.isFinite(opts.port) && opts.port > 0 ? Math.round(opts.port) : 587,
+    user: opts.user,
+    pass: opts.pass,
+  });
+  return pool.send(opts);
+}
+
+export function closeSmtpConnectionPools(): void {
+  for (const pool of smtpPoolCache.values()) {
+    pool.close();
+  }
+  smtpPoolCache.clear();
+}
+
+export function getSmtpPoolStats(): Array<{ key: string; maxConnections: number; maxMessages: number; totalCreated: number; totalReused: number }> {
+  return Array.from(smtpPoolCache.entries()).map(([key, pool]) => ({
+    key,
+    maxConnections: pool.maxConnections,
+    maxMessages: pool.maxMessages,
+    totalCreated: pool.totalCreated,
+    totalReused: pool.totalReused,
+  }));
+}
+
+/**
+ * Loads decrypted email channel vault rows & tenant settings ONCE (Phase 1) so Phase 2
+ * concurrent high-speed campaign workers dispatch with ZERO per-email DB queries.
+ */
+export async function loadEmailTenantStateForCampaign(
+  client: DbClient,
+  tenantId: string
+): Promise<PreloadedEmailTenantState> {
+  type VaultRow = { integration_type: string; status: string; config_encrypted: string; iv: string; auth_tag: string };
+  const [intRes, tRes] = await Promise.all([
+    client.query<VaultRow>(
+      `SELECT integration_type, status, config_encrypted, iv, auth_tag
+       FROM tenant_integrations
+       WHERE tenant_id = $1 AND integration_type IN ('smtp', 'aws_ses', 'resend', 'sendgrid', 'postmark') AND status = 'active'
+       ORDER BY updated_at DESC`,
+      [tenantId]
+    ),
+    client.query<{ name: string; slug: string; settings: Record<string, any> }>(
+      'SELECT name, slug, settings FROM tenants WHERE id = $1 LIMIT 1',
+      [tenantId]
+    ),
+  ]);
+
+  const decryptByType = (type: string): { has: boolean; cfg: SmtpIntegrationConfig } => {
+    const row = intRes.rows.find((r) => r.integration_type === type);
+    if (!row) return { has: false, cfg: {} };
+    try {
+      return {
+        has: true,
+        cfg: decryptTenantSecret<SmtpIntegrationConfig>(tenantId, row.config_encrypted, row.iv, row.auth_tag) || {},
+      };
+    } catch {
+      return { has: false, cfg: {} };
+    }
   };
 
-  let row: { status: string; config_encrypted: string; iv: string; auth_tag: string } | null = null;
-  let rawRow: { name: string; slug: string; settings: Record<string, any> };
-  let tenantCfg;
+  const smtp = decryptByType('smtp');
+  const ses = decryptByType('aws_ses');
+  const resend = decryptByType('resend');
+  const sendgrid = decryptByType('sendgrid');
+  const postmark = decryptByType('postmark');
+  const rawRow = tRes.rows[0] || { name: 'DOMATION AutoData', slug: '', settings: {} };
 
-  if (input.client) {
-    const st = await loadState(input.client);
-    row = st.row;
+  return {
+    tenantId,
+    smtpCfg: smtp.cfg,
+    hasSmtpVault: smtp.has,
+    sesCfg: ses.cfg,
+    hasSesVault: ses.has,
+    resendCfg: resend.cfg,
+    hasResendVault: resend.has,
+    sendgridCfg: sendgrid.cfg,
+    hasSendgridVault: sendgrid.has,
+    postmarkCfg: postmark.cfg,
+    hasPostmarkVault: postmark.has,
+    rawRow,
+    tenantCfg: normalizeTenantSettings(rawRow.settings || {}),
+  };
+}
+
+function hmacSha256(key: Buffer | string, data: string): Buffer {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+}
+
+function sha256Hex(data: string): string {
+  return crypto.createHash('sha256').update(data, 'utf8').digest('hex');
+}
+
+function signAwsSigV4Headers(params: {
+  method: string;
+  host: string;
+  path: string;
+  region: string;
+  service: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  payload: string;
+  contentType: string;
+}): Record<string, string> {
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex(params.payload);
+
+  const canonicalHeaders =
+    `content-type:${params.contentType}\n` +
+    `host:${params.host}\n` +
+    `x-amz-content-sha256:${payloadHash}\n` +
+    `x-amz-date:${amzDate}\n`;
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+
+  const canonicalRequest = [
+    params.method.toUpperCase(),
+    params.path,
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+
+  const credentialScope = `${dateStamp}/${params.region}/${params.service}/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+
+  const kDate = hmacSha256(`AWS4${params.secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, params.region);
+  const kService = hmacSha256(kRegion, params.service);
+  const kSigning = hmacSha256(kService, 'aws4_request');
+  const signature = hmacSha256(kSigning, stringToSign).toString('hex');
+
+  return {
+    'Content-Type': params.contentType,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Content-Sha256': payloadHash,
+    Authorization: `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  };
+}
+
+/**
+ * Dispatches an operational, assignment, ticket, report, or SLA alert email using the tenant's
+ * configured Google Apps Script Web App, Resend API, SMTP, or AWS SES driver.
+ */
+export async function sendTenantEmailNotification(input: EmailDispatchMessage): Promise<EmailDispatchResult | null> {
+  type VaultIntegrationRow = { integration_type?: string; status: string; config_encrypted: string; iv: string; auth_tag: string };
+
+  let hasSmtpVault = false;
+  let hasSesVault = false;
+  let hasResendVault = false;
+  let hasSendgridVault = false;
+  let hasPostmarkVault = false;
+  let cfg: SmtpIntegrationConfig = {};
+  let sesCfg: SmtpIntegrationConfig = {};
+  let resendCfg: SmtpIntegrationConfig = {};
+  let sendgridCfg: SmtpIntegrationConfig = {};
+  let postmarkCfg: SmtpIntegrationConfig = {};
+  let rawRow: { name: string; slug: string; settings: Record<string, any> };
+  let tenantCfg: ReturnType<typeof normalizeTenantSettings>;
+
+  if (input.preloadedState) {
+    const st = input.preloadedState;
+    cfg = st.smtpCfg;
+    hasSmtpVault = st.hasSmtpVault;
+    sesCfg = st.sesCfg;
+    hasSesVault = st.hasSesVault;
+    resendCfg = st.resendCfg;
+    hasResendVault = st.hasResendVault;
+    sendgridCfg = st.sendgridCfg;
+    hasSendgridVault = st.hasSendgridVault;
+    postmarkCfg = st.postmarkCfg;
+    hasPostmarkVault = st.hasPostmarkVault;
     rawRow = st.rawRow;
-    tenantCfg = normalizeTenantSettings(rawRow.settings || {});
+    tenantCfg = st.tenantCfg;
+  } else if (input.client) {
+    const st = await loadEmailTenantStateForCampaign(input.client, input.tenantId);
+    cfg = st.smtpCfg;
+    hasSmtpVault = st.hasSmtpVault;
+    sesCfg = st.sesCfg;
+    hasSesVault = st.hasSesVault;
+    resendCfg = st.resendCfg;
+    hasResendVault = st.hasResendVault;
+    sendgridCfg = st.sendgridCfg;
+    hasSendgridVault = st.hasSendgridVault;
+    postmarkCfg = st.postmarkCfg;
+    hasPostmarkVault = st.hasPostmarkVault;
+    rawRow = st.rawRow;
+    tenantCfg = st.tenantCfg;
   } else {
-    const cachedRow = await getTenantIntegrationCached(input.tenantId, 'smtp');
-    row = cachedRow && cachedRow.status === 'active' ? cachedRow : null;
+    const cachedBatch = await getTenantIntegrationsBatchCached(input.tenantId, [
+      'smtp',
+      'aws_ses',
+      'resend',
+      'sendgrid',
+      'postmark',
+    ]);
+    const decryptRow = (r: VaultIntegrationRow | null | undefined): { has: boolean; cfg: SmtpIntegrationConfig } => {
+      if (!r || r.status !== 'active') return { has: false, cfg: {} };
+      try {
+        return {
+          has: true,
+          cfg: decryptTenantSecret<SmtpIntegrationConfig>(input.tenantId, r.config_encrypted, r.iv, r.auth_tag) || {},
+        };
+      } catch {
+        return { has: false, cfg: {} };
+      }
+    };
+    const smtp = decryptRow(cachedBatch.smtp);
+    const ses = decryptRow(cachedBatch.aws_ses);
+    const resend = decryptRow(cachedBatch.resend);
+    const sendgrid = decryptRow(cachedBatch.sendgrid);
+    const postmark = decryptRow(cachedBatch.postmark);
+    cfg = smtp.cfg;
+    hasSmtpVault = smtp.has;
+    sesCfg = ses.cfg;
+    hasSesVault = ses.has;
+    resendCfg = resend.cfg;
+    hasResendVault = resend.has;
+    sendgridCfg = sendgrid.cfg;
+    hasSendgridVault = sendgrid.has;
+    postmarkCfg = postmark.cfg;
+    hasPostmarkVault = postmark.has;
+
     const [tc, tRow] = await Promise.all([
       getTenantSettingsCached(input.tenantId),
       withTenantTransaction(input.tenantId, async (c) => {
@@ -370,32 +1478,107 @@ export async function sendTenantEmailNotification(input: EmailDispatchMessage): 
     rawRow = tRow;
   }
 
-  const cfg: SmtpIntegrationConfig = row
-    ? decryptTenantSecret<SmtpIntegrationConfig>(input.tenantId, row.config_encrypted, row.iv, row.auth_tag)
-    : {};
-
   const rawSettings = rawRow.settings || {};
   const appscriptUrl = (input.overrideWebhookUrl || rawSettings.appscript_webhook_url || '').trim();
-  const appscriptSecret = (input.overrideSecret || rawSettings.appscript_secret || '').trim();
-  const requestedProvider = input.overrideProvider || rawSettings.email_provider || (appscriptUrl ? 'appscript' : 'smtp');
-  const provider: 'appscript' | 'smtp' | 'ses' =
-    requestedProvider === 'appscript' || (appscriptUrl && !row) ? 'appscript' : requestedProvider === 'ses' ? 'ses' : 'smtp';
-
-  const recipient = (
-    input.to ||
-    rawSettings.fallback_cc_email ||
-    cfg.notify_email ||
-    cfg.smtp_user ||
-    cfg.user ||
-    ''
+  const appscriptSecret = (input.overrideSecret !== undefined ? input.overrideSecret : rawSettings.appscript_secret || '').trim();
+  const resendApiKey = (
+    input.overrideProvider === 'resend' && input.overrideSecret !== undefined
+      ? input.overrideSecret
+      : resendCfg.apiKey || resendCfg.api_key || rawSettings.resend_api_key || process.env.RESEND_API_KEY || ''
   ).trim();
+  const sendgridApiKey = (
+    input.overrideProvider === 'sendgrid' && input.overrideSecret !== undefined
+      ? input.overrideSecret
+      : sendgridCfg.apiKey || sendgridCfg.api_key || rawSettings.sendgrid_api_key || ''
+  ).trim();
+  const postmarkToken = (
+    input.overrideProvider === 'postmark' && input.overrideSecret !== undefined
+      ? input.overrideSecret
+      : postmarkCfg.server_token || postmarkCfg.serverToken || postmarkCfg.apiKey || postmarkCfg.api_key || rawSettings.postmark_api_key || rawSettings.postmark_server_token || ''
+  ).trim();
+
+  const rawExplicitProvider = String(input.overrideProvider || rawSettings.email_provider || '')
+    .trim()
+    .toLowerCase();
+  const explicitProvider =
+    rawExplicitProvider === 'aws_ses'
+      ? 'ses'
+      : input.disallowAppscript && rawExplicitProvider === 'appscript'
+        ? ''
+        : rawExplicitProvider;
+
+  let provider: EmailProvider;
+  if (
+    explicitProvider === 'resend' ||
+    explicitProvider === 'ses' ||
+    explicitProvider === 'smtp' ||
+    explicitProvider === 'sendgrid' ||
+    explicitProvider === 'postmark' ||
+    (!input.disallowAppscript && explicitProvider === 'appscript')
+  ) {
+    provider = explicitProvider;
+  } else if (hasSesVault) {
+    provider = 'ses';
+  } else if (hasSmtpVault) {
+    provider = 'smtp';
+  } else if (hasResendVault || rawSettings.resend_api_key) {
+    provider = 'resend';
+  } else if (hasSendgridVault || rawSettings.sendgrid_api_key) {
+    provider = 'sendgrid';
+  } else if (hasPostmarkVault || rawSettings.postmark_api_key || rawSettings.postmark_server_token) {
+    provider = 'postmark';
+  } else if (!input.disallowAppscript && appscriptUrl) {
+    provider = 'appscript';
+  } else {
+    provider = 'smtp';
+  }
+
+  const recipient = sanitizeEmailAddress(
+    input.to ||
+      rawSettings.fallback_cc_email ||
+      cfg.notify_email ||
+      sesCfg.notify_email ||
+      cfg.smtp_user ||
+      cfg.user ||
+      ''
+  );
   if (!recipient) {
     return null;
   }
 
   const brandName = resolveTenantBrandName(tenantCfg, { name: rawRow.name, slug: rawRow.slug, rawSettings });
-  const fromName = String(rawSettings.ses_sender_name || cfg.from_name || brandName || 'DOMATION AutoData').trim();
-  const smtpHost = (cfg.smtp_host || cfg.host || rawSettings.ses_host || tenantCfg.default_smtp_host || 'script.google.com').trim();
+  const fromName = sanitizeEmailDisplayName(
+    input.fromNameOverride ||
+      rawSettings.ses_sender_name ||
+      cfg.from_name ||
+      sesCfg.from_name ||
+      resendCfg.from_name ||
+      sendgridCfg.from_name ||
+      postmarkCfg.from_name ||
+      brandName ||
+      'DOMATION AutoData'
+  );
+  const sesRegion = (
+    sesCfg.sesRegion ||
+    sesCfg.region ||
+    sesCfg.aws_region ||
+    rawSettings.ses_region ||
+    process.env.AWS_REGION ||
+    'ap-southeast-1'
+  ).trim();
+  const smtpHost =
+    provider === 'appscript'
+      ? 'script.google.com'
+      : provider === 'resend'
+        ? 'api.resend.com'
+        : provider === 'sendgrid'
+          ? 'api.sendgrid.com'
+          : provider === 'postmark'
+            ? 'api.postmarkapp.com'
+            : provider === 'ses'
+              ? (sesCfg.smtp_host || sesCfg.host || rawSettings.ses_host || '').trim() || `email.${sesRegion}.amazonaws.com`
+              : (cfg.smtp_host || cfg.host || rawSettings.ses_host || tenantCfg.default_smtp_host || '').trim() ||
+                'smtp.gmail.com';
   const category = input.category || 'system_alert';
   const renderedHtml =
     input.html ||
@@ -409,20 +1592,38 @@ export async function sendTenantEmailNotification(input: EmailDispatchMessage): 
     });
 
   let messageId = `msg_${crypto.randomBytes(8).toString('hex')}@autodata.vn`;
-  let accepted = true;
+  let headerMessageId: string | undefined;
+  let accepted = false;
   let remainingQuota: number | null = null;
   let sheetLogged = false;
   let errMsg: string | undefined;
 
+  const fetcher: EmailWebhookFetcherFn =
+    customEmailWebhookFetcher ||
+    (async (u, init) => {
+      if (u.startsWith('https://')) {
+        return postJsonKeepAlive(u, init, 18_000);
+      }
+      const r = await fetch(u, {
+        ...init,
+        redirect: 'follow',
+        signal: AbortSignal.timeout(18_000),
+      });
+      return r;
+    });
+
   if (customSmtpTransport) {
-    const out = await customSmtpTransport(cfg, {
+    const out = await customSmtpTransport(hasSesVault && !hasSmtpVault ? sesCfg : cfg, {
       to: recipient,
       subject: input.subject,
       text: input.text,
+      html: renderedHtml,
+      fromName,
+      cc: input.cc || rawSettings.fallback_cc_email,
     });
     accepted = out.accepted;
     messageId = out.messageId;
-  } else if (provider === 'appscript') {
+  } else if (provider === 'appscript' && !input.disallowAppscript) {
     if (!appscriptUrl) {
       return {
         sent: false,
@@ -454,7 +1655,7 @@ export async function sendTenantEmailNotification(input: EmailDispatchMessage): 
       secret: appscriptSecret || undefined,
       to: recipient,
       email: recipient,
-      cc: input.cc || rawSettings.fallback_cc_email || '',
+      cc: parseEmailRecipientList(input.cc || rawSettings.fallback_cc_email, recipient).join(', '),
       from_name: fromName,
       subject: input.subject,
       text: input.text,
@@ -464,17 +1665,6 @@ export async function sendTenantEmailNotification(input: EmailDispatchMessage): 
     });
 
     try {
-      const fetcher: EmailWebhookFetcherFn =
-        customEmailWebhookFetcher ||
-        (async (u, init) => {
-          const r = await fetch(u, {
-            ...init,
-            redirect: 'follow',
-            signal: AbortSignal.timeout(18_000),
-          });
-          return r;
-        });
-
       const resp = await fetcher(appscriptUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -507,40 +1697,509 @@ export async function sendTenantEmailNotification(input: EmailDispatchMessage): 
       accepted = false;
       errMsg = err?.message || 'Không thể kết nối tới Google Apps Script Web App URL.';
     }
-  } else if (isEmailSilentBlocked()) {
-    return {
-      sent: true,
+  } else if (provider === 'resend') {
+    if (!resendApiKey) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: 'api.resend.com',
+        provider: 'resend',
+        category,
+        error: 'Chưa cấu hình Resend API Key.',
+      };
+    }
+
+    if (isEmailSilentBlocked()) {
+      return {
+        sent: true,
+        messageId,
+        recipient,
+        smtpHost: 'api.resend.com',
+        provider: 'silent_guard',
+        category,
+      };
+    }
+
+    const fromEmail = sanitizeEmailAddress(
+      input.fromEmailOverride ||
+        resendCfg.from_email ||
+        resendCfg.fromEmail ||
+        resendCfg.sender_email ||
+        rawSettings.resend_from_email ||
+        rawSettings.ses_sender_email ||
+        cfg.from_email ||
+        cfg.notify_email ||
+        tenantCfg.support_email ||
+        'onboarding@resend.dev'
+    );
+
+    try {
+      const ccList = parseEmailRecipientList(input.cc || rawSettings.fallback_cc_email, recipient);
+      const resendBody: Record<string, unknown> = {
+        from: `${fromName} <${fromEmail}>`,
+        to: [recipient],
+        ...(ccList.length > 0 ? { cc: ccList } : {}),
+        subject: input.subject,
+        html: renderedHtml,
+        text: input.text,
+      };
+      const resp = await fetcher('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${resendApiKey}`,
+        },
+        body: JSON.stringify(resendBody),
+      });
+      const rawText = await resp.text();
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = null;
+      }
+      if (!resp.ok) {
+        accepted = false;
+        errMsg = parsed?.message || parsed?.error || `Resend API trả về lỗi HTTP ${resp.status}`;
+      } else {
+        accepted = true;
+        if (parsed?.id) messageId = String(parsed.id);
+      }
+    } catch (err: any) {
+      accepted = false;
+      errMsg = err?.message || 'Không thể kết nối tới Resend Email API.';
+    }
+  } else if (provider === 'sendgrid') {
+    if (!sendgridApiKey) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: 'api.sendgrid.com',
+        provider: 'sendgrid',
+        category,
+        error: 'Chưa cấu hình SendGrid API Key.',
+      };
+    }
+
+    if (isEmailSilentBlocked()) {
+      return {
+        sent: true,
+        messageId,
+        recipient,
+        smtpHost: 'api.sendgrid.com',
+        provider: 'silent_guard',
+        category,
+      };
+    }
+
+    const fromEmail = sanitizeEmailAddress(
+      input.fromEmailOverride ||
+        sendgridCfg.from_email ||
+        sendgridCfg.fromEmail ||
+        sendgridCfg.sender_email ||
+        rawSettings.ses_sender_email ||
+        tenantCfg.support_email ||
+        ''
+    );
+    if (!fromEmail) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: 'api.sendgrid.com',
+        provider: 'sendgrid',
+        category,
+        error: 'Chưa cấu hình địa chỉ Email người gửi (From) cho SendGrid.',
+      };
+    }
+
+    try {
+      const ccList = parseEmailRecipientList(input.cc || rawSettings.fallback_cc_email, recipient);
+      const sgPayload = {
+        personalizations: [
+          {
+            to: [{ email: recipient }],
+            ...(ccList.length > 0 ? { cc: ccList.map((e) => ({ email: e })) } : {}),
+            subject: input.subject,
+          },
+        ],
+        from: { email: fromEmail, name: fromName },
+        content: [
+          { type: 'text/plain', value: input.text || input.subject },
+          { type: 'text/html', value: renderedHtml },
+        ],
+      };
+      const resp = await fetcher('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sendgridApiKey}`,
+        },
+        body: JSON.stringify(sgPayload),
+      });
+      if (!resp.ok) {
+        const rawText = await resp.text().catch(() => '');
+        accepted = false;
+        errMsg = rawText.slice(0, 240) || `SendGrid API trả về lỗi HTTP ${resp.status}`;
+      } else {
+        accepted = true;
+        const sgMsgId = resp.headers?.get('x-message-id');
+        if (sgMsgId) messageId = sgMsgId.trim();
+      }
+    } catch (err: any) {
+      accepted = false;
+      errMsg = err?.message || 'Không thể kết nối tới SendGrid Email API.';
+    }
+  } else if (provider === 'postmark') {
+    if (!postmarkToken) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: 'api.postmarkapp.com',
+        provider: 'postmark',
+        category,
+        error: 'Chưa cấu hình Postmark Server Token.',
+      };
+    }
+
+    if (isEmailSilentBlocked()) {
+      return {
+        sent: true,
+        messageId,
+        recipient,
+        smtpHost: 'api.postmarkapp.com',
+        provider: 'silent_guard',
+        category,
+      };
+    }
+
+    const fromEmail = sanitizeEmailAddress(
+      input.fromEmailOverride ||
+        postmarkCfg.from_email ||
+        postmarkCfg.fromEmail ||
+        postmarkCfg.sender_email ||
+        rawSettings.ses_sender_email ||
+        tenantCfg.support_email ||
+        ''
+    );
+    if (!fromEmail) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: 'api.postmarkapp.com',
+        provider: 'postmark',
+        category,
+        error: 'Chưa cấu hình địa chỉ Email người gửi (From) cho Postmark.',
+      };
+    }
+
+    try {
+      const ccList = parseEmailRecipientList(input.cc || rawSettings.fallback_cc_email, recipient);
+      const pmPayload: Record<string, unknown> = {
+        From: `${fromName} <${fromEmail}>`,
+        To: recipient,
+        ...(ccList.length > 0 ? { Cc: ccList.join(', ') } : {}),
+        Subject: input.subject,
+        HtmlBody: renderedHtml,
+        TextBody: input.text || input.subject,
+      };
+      const resp = await fetcher('https://api.postmarkapp.com/email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-Postmark-Server-Token': postmarkToken,
+        },
+        body: JSON.stringify(pmPayload),
+      });
+      const rawText = await resp.text().catch(() => '');
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = null;
+      }
+      if (!resp.ok || (parsed && parsed.ErrorCode && parsed.ErrorCode !== 0)) {
+        accepted = false;
+        errMsg = parsed?.Message || `Postmark API trả về lỗi HTTP ${resp.status}`;
+      } else {
+        accepted = true;
+        if (parsed?.MessageID) messageId = String(parsed.MessageID);
+      }
+    } catch (err: any) {
+      accepted = false;
+      errMsg = err?.message || 'Không thể kết nối tới Postmark API.';
+    }
+  } else if (provider === 'ses') {
+    const sesSmtpHost = (sesCfg.smtp_host || sesCfg.host || rawSettings.ses_host || '').trim();
+    const sesSmtpUser = (sesCfg.smtp_user || sesCfg.user || rawSettings.ses_username || '').trim();
+    const sesSmtpPass = (sesCfg.smtp_pass || sesCfg.pass || rawSettings.ses_password || '').trim();
+    const sesFromEmail = sanitizeEmailAddress(
+      input.fromEmailOverride ||
+        sesCfg.from_email ||
+        sesCfg.fromEmail ||
+        sesCfg.sender_email ||
+        rawSettings.ses_sender_email ||
+        cfg.notify_email ||
+        tenantCfg.support_email ||
+        ''
+    );
+
+    if (sesSmtpHost && sesSmtpUser && sesSmtpPass && sesFromEmail) {
+      if (isEmailSilentBlocked()) {
+        return {
+          sent: true,
+          messageId,
+          recipient,
+          smtpHost: sesSmtpHost,
+          provider: 'silent_guard',
+          category,
+        };
+      }
+      const smtpDispatchFn = input.pooled ? sendPooledSmtpMail : sendRawSmtpMail;
+      const smtpRes = await smtpDispatchFn({
+        host: sesSmtpHost,
+        port: Number(sesCfg.smtp_port || sesCfg.port || rawSettings.ses_port || tenantCfg.default_smtp_port || 587),
+        user: sesSmtpUser,
+        pass: sesSmtpPass,
+        fromEmail: sesFromEmail,
+        fromName,
+        to: recipient,
+        cc: input.cc || rawSettings.fallback_cc_email,
+        subject: input.subject,
+        text: input.text,
+        html: renderedHtml,
+        messageId,
+      });
+      accepted = smtpRes.accepted;
+      messageId = smtpRes.messageId;
+      headerMessageId = smtpRes.headerMessageId;
+      errMsg = smtpRes.error;
+    } else {
+      const accessKeyId = (
+        sesCfg.authUser ||
+        sesCfg.accessKeyId ||
+        sesCfg.aws_access_key_id ||
+        rawSettings.ses_username ||
+        process.env.AWS_ACCESS_KEY_ID ||
+        ''
+      ).trim();
+      const secretAccessKey = (
+        sesCfg.apiKey ||
+        sesCfg.secretAccessKey ||
+        sesCfg.aws_secret_access_key ||
+        rawSettings.ses_password ||
+        process.env.AWS_SECRET_ACCESS_KEY ||
+        ''
+      ).trim();
+      const region = sesRegion;
+
+      if (!accessKeyId || !secretAccessKey || !sesFromEmail) {
+        return {
+          sent: false,
+          messageId,
+          recipient,
+          smtpHost: `email.${region}.amazonaws.com`,
+          provider: 'ses',
+          category,
+          error: 'Chưa cấu hình AWS SES (SMTP hoặc IAM Access Key / Email người gửi).',
+        };
+      }
+
+      if (isEmailSilentBlocked()) {
+        return {
+          sent: true,
+          messageId,
+          recipient,
+          smtpHost: `email.${region}.amazonaws.com`,
+          provider: 'silent_guard',
+          category,
+        };
+      }
+
+      const sesHost = `email.${region}.amazonaws.com`;
+      const sesPath = '/v2/email/outbound-emails';
+      const ccList = parseEmailRecipientList(input.cc || rawSettings.fallback_cc_email, recipient);
+      const sesPayload = JSON.stringify({
+        FromEmailAddress: `${fromName} <${sesFromEmail}>`,
+        Destination: {
+          ToAddresses: [recipient],
+          ...(ccList.length > 0 ? { CcAddresses: ccList } : {}),
+        },
+        Content: {
+          Simple: {
+            Subject: { Data: input.subject, Charset: 'UTF-8' },
+            Body: {
+              Text: { Data: input.text, Charset: 'UTF-8' },
+              Html: { Data: renderedHtml, Charset: 'UTF-8' },
+            },
+          },
+        },
+      });
+      const signedHeaders = signAwsSigV4Headers({
+        method: 'POST',
+        host: sesHost,
+        path: sesPath,
+        region,
+        service: 'ses',
+        accessKeyId,
+        secretAccessKey,
+        payload: sesPayload,
+        contentType: 'application/json',
+      });
+      try {
+        const resp = await fetcher(`https://${sesHost}${sesPath}`, {
+          method: 'POST',
+          headers: signedHeaders,
+          body: sesPayload,
+        });
+        const rawText = await resp.text();
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          parsed = null;
+        }
+        if (!resp.ok) {
+          accepted = false;
+          errMsg = parsed?.message || parsed?.Message || `AWS SES trả về lỗi HTTP ${resp.status}`;
+        } else {
+          accepted = true;
+          if (parsed?.MessageId) messageId = String(parsed.MessageId);
+        }
+      } catch (err: any) {
+        accepted = false;
+        errMsg = err?.message || 'Không thể kết nối tới AWS SES API.';
+      }
+    }
+  } else {
+    // SMTP driver (pure Node node:net + node:tls — pooled when `input.pooled` is true)
+    const explicitHost = (
+      cfg.smtp_host ||
+      cfg.host ||
+      rawSettings.ses_host ||
+      (rawSettings.default_smtp_host !== 'smtp.gmail.com' ? rawSettings.default_smtp_host : '') ||
+      ''
+    ).trim();
+    const smtpUser = (cfg.smtp_user || cfg.user || rawSettings.ses_username || '').trim();
+    const smtpPass = (cfg.smtp_pass || cfg.pass || rawSettings.ses_password || '').trim();
+    const effectiveHost =
+      explicitHost ||
+      (hasSmtpVault && (cfg.smtp_host || cfg.host) ? String(cfg.smtp_host || cfg.host).trim() : '') ||
+      (smtpUser && smtpPass ? tenantCfg.default_smtp_host : '');
+    const effectivePort = Number(cfg.smtp_port || cfg.port || rawSettings.ses_port || tenantCfg.default_smtp_port || 587);
+    const fromEmail = (
+      input.fromEmailOverride ||
+      rawSettings.ses_sender_email ||
+      cfg.from_email ||
+      cfg.fromEmail ||
+      cfg.sender_email ||
+      cfg.notify_email ||
+      smtpUser ||
+      tenantCfg.support_email ||
+      ''
+    ).trim();
+
+    if (!effectiveHost || effectiveHost === 'script.google.com') {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: effectiveHost || '',
+        provider: 'smtp',
+        category,
+        error: 'Chưa cấu hình SMTP Host.',
+      };
+    }
+
+    if (!isLoopbackHost(effectiveHost) && (!smtpUser || !smtpPass)) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: effectiveHost,
+        provider: 'smtp',
+        category,
+        error: 'Chưa cấu hình tài khoản/mật khẩu SMTP.',
+      };
+    }
+
+    if (!fromEmail) {
+      return {
+        sent: false,
+        messageId,
+        recipient,
+        smtpHost: effectiveHost,
+        provider: 'smtp',
+        category,
+        error: 'Chưa cấu hình địa chỉ Email người gửi (From).',
+      };
+    }
+
+    if (isEmailSilentBlocked()) {
+      return {
+        sent: true,
+        messageId,
+        recipient,
+        smtpHost: effectiveHost,
+        provider: 'silent_guard',
+        category,
+      };
+    }
+
+    const smtpDispatchFn = input.pooled ? sendPooledSmtpMail : sendRawSmtpMail;
+    const smtpRes = await smtpDispatchFn({
+      host: effectiveHost,
+      port: effectivePort,
+      user: smtpUser || undefined,
+      pass: smtpPass || undefined,
+      fromEmail,
+      fromName,
+      to: recipient,
+      cc: input.cc || rawSettings.fallback_cc_email,
+      subject: input.subject,
+      text: input.text,
+      html: renderedHtml,
       messageId,
-      recipient,
-      smtpHost,
-      provider: 'silent_guard',
-      category,
-    };
+    });
+    accepted = smtpRes.accepted;
+    messageId = smtpRes.messageId;
+    headerMessageId = smtpRes.headerMessageId;
+    errMsg = smtpRes.error;
   }
 
-  if (row) {
-    if (input.client) {
-      await input.client.query(
+  const syncedTypes: string[] = [];
+  if (hasSmtpVault && (provider === 'smtp' || customSmtpTransport)) syncedTypes.push('smtp');
+  if (hasSesVault && provider === 'ses') syncedTypes.push('aws_ses');
+  if (hasResendVault && provider === 'resend') syncedTypes.push('resend');
+  if (hasSendgridVault && provider === 'sendgrid') syncedTypes.push('sendgrid');
+  if (hasPostmarkVault && provider === 'postmark') syncedTypes.push('postmark');
+
+  // Skip per-message DB write when dispatched inside high-speed preloaded campaign batch (flushed in Phase 3)
+  if (accepted && syncedTypes.length > 0 && !input.preloadedState) {
+    const updateSynced = async (c: DbClient) => {
+      await c.query(
         `UPDATE tenant_integrations
          SET last_synced_at = clock_timestamp()
-         WHERE tenant_id = $1 AND integration_type = 'smtp'`,
-        [input.tenantId]
+         WHERE tenant_id = $1 AND integration_type = ANY($2)`,
+        [input.tenantId, syncedTypes]
       );
+    };
+    if (input.client) {
+      await updateSynced(input.client);
     } else {
-      await withTenantTransaction(input.tenantId, async (client) => {
-        await client.query(
-          `UPDATE tenant_integrations
-           SET last_synced_at = clock_timestamp()
-           WHERE tenant_id = $1 AND integration_type = 'smtp'`,
-          [input.tenantId]
-        );
-      });
+      await withTenantTransaction(input.tenantId, updateSynced);
     }
   }
 
   return {
     sent: accepted,
     messageId,
+    ...(headerMessageId && headerMessageId !== messageId ? { headerMessageId } : {}),
     recipient,
     smtpHost,
     provider,
@@ -552,15 +2211,442 @@ export async function sendTenantEmailNotification(input: EmailDispatchMessage): 
 }
 
 /**
+ * Outbound Zalo Bot API sender (`bot-api.zaloplatforms.com/bot<token>/sendMessage`).
+ */
+export async function sendZaloBotNotification(
+  tenantId: string | null,
+  text: string,
+  options?: {
+    chatId?: string;
+    botToken?: string;
+    silentOverride?: boolean;
+  }
+): Promise<ZaloBotSendResult> {
+  let vaultCfg: ZaloIntegrationConfig | null = null;
+  let rawSettings: Record<string, any> = {};
+
+  if (tenantId) {
+    try {
+      const [zBatch, meta] = await Promise.all([
+        getTenantIntegrationsBatchCached(tenantId, ['zalo_bot', 'zalo_oa']),
+        getTenantMetaCached(tenantId),
+      ]);
+      rawSettings = (meta?.rawSettings || {}) as Record<string, any>;
+      const row = zBatch.zalo_bot || zBatch.zalo_oa;
+      if (row && row.status === 'active') {
+        vaultCfg = decryptTenantSecret<ZaloIntegrationConfig>(
+          tenantId,
+          row.config_encrypted,
+          row.iv,
+          row.auth_tag
+        );
+      }
+    } catch {
+      vaultCfg = null;
+    }
+  }
+
+  if (rawSettings.zalo_bot_disabled === true) {
+    return {
+      success: false,
+      silent: false,
+      mocked: false,
+      error: 'Zalo Bot chưa được kích hoạt cho không gian làm việc này.',
+    };
+  }
+
+  const botToken = String(
+    options?.botToken || vaultCfg?.bot_token || vaultCfg?.botToken || rawSettings.zalo_bot_token || ''
+  ).trim();
+  const targetChatId = String(
+    options?.chatId ||
+      vaultCfg?.chat_id ||
+      vaultCfg?.chatId ||
+      vaultCfg?.group_chat_id ||
+      rawSettings.zalo_admin_group_chat_id ||
+      ''
+  ).trim();
+
+  if (vaultCfg?.enabled === false || vaultCfg?.silent_mode === true || vaultCfg?.silentMode === true) {
+    return { success: true, silent: true, mocked: true };
+  }
+
+  const plainText = stripHtmlTagsForPlainText(text);
+  const chunks = chunkTextForChat(plainText, 1950);
+  if (chunks.length === 0) {
+    return { success: false, silent: false, mocked: false, error: 'Nội dung tin nhắn Zalo trống.' };
+  }
+
+  const isSilent =
+    options?.silentOverride !== undefined
+      ? options.silentOverride
+      : customZaloBotTransport
+        ? false
+        : isOutboundSilentMode();
+
+  if (isSilent) {
+    return { success: true, silent: true, mocked: true };
+  }
+
+  if (customZaloBotTransport) {
+    try {
+      let lastId: string | undefined;
+      for (const chunk of chunks) {
+        const out = await customZaloBotTransport({
+          chatId: targetChatId,
+          text: chunk,
+          botToken: botToken || undefined,
+        });
+        if (out?.messageId) lastId = out.messageId;
+      }
+      return { success: true, messageId: lastId || 'zalo_mock_msg', silent: false, mocked: true };
+    } catch (err: any) {
+      return {
+        success: false,
+        silent: false,
+        mocked: true,
+        error: err?.message || 'Zalo mock transport failed',
+      };
+    }
+  }
+
+  if (!botToken) {
+    return {
+      success: false,
+      silent: false,
+      mocked: false,
+      error: 'Zalo Bot Token chưa được cấu hình.',
+    };
+  }
+
+  if (!targetChatId) {
+    return {
+      success: false,
+      silent: false,
+      mocked: false,
+      error: 'Zalo Chat ID / Group ID chưa được cấu hình.',
+    };
+  }
+
+  const url = `https://bot-api.zaloplatforms.com/bot${encodeURIComponent(botToken)}/sendMessage`;
+  let lastMessageId: string | undefined;
+  try {
+    for (const chunk of chunks) {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: targetChatId, text: chunk }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = (await resp.json().catch(() => ({}))) as any;
+      if (!resp.ok || data?.ok === false || (data?.error !== undefined && Number(data.error) !== 0)) {
+        return {
+          success: false,
+          silent: false,
+          mocked: false,
+          error: data?.description || data?.message || `Zalo Bot API error: HTTP ${resp.status}`,
+        };
+      }
+      if (data?.result?.message_id) {
+        lastMessageId = String(data.result.message_id);
+      }
+    }
+    return {
+      success: true,
+      messageId: lastMessageId,
+      silent: false,
+      mocked: false,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      silent: false,
+      mocked: false,
+      error: err?.message || 'Failed to dispatch Zalo Bot HTTP request',
+    };
+  }
+}
+
+/**
+ * Outbound Discord Webhook / Bot API sender.
+ */
+export async function sendDiscordNotification(
+  tenantId: string | null,
+  content: string,
+  options?: {
+    webhookUrl?: string;
+    botToken?: string;
+    channelId?: string;
+    username?: string;
+    embeds?: Array<Record<string, unknown>>;
+    silentOverride?: boolean;
+  }
+): Promise<DiscordSendResult> {
+  let rawSettings: Record<string, any> = {};
+  let brandName = 'DOMATION AutoData';
+
+  if (tenantId) {
+    try {
+      const meta = await getTenantMetaCached(tenantId);
+      rawSettings = (meta?.rawSettings || {}) as Record<string, any>;
+      brandName = String(
+        rawSettings.brand_display_name || meta?.name || rawSettings.capi_event_source_name || 'DOMATION AutoData'
+      ).trim();
+    } catch {
+      rawSettings = {};
+    }
+  }
+
+  const webhookUrl = String(options?.webhookUrl || rawSettings.discord_webhook_url || '').trim();
+  const botToken = String(options?.botToken || rawSettings.discord_bot_token || '').trim();
+  const channelId = String(options?.channelId || rawSettings.discord_channel_id || '').trim();
+  const username = String(options?.username || brandName).trim() || 'DOMATION AutoData';
+
+  const plainText = stripHtmlTagsForPlainText(content);
+  const chunks = chunkTextForChat(plainText, 1950);
+  if (chunks.length === 0) {
+    return { success: false, silent: false, mocked: false, error: 'Nội dung tin nhắn Discord trống.' };
+  }
+
+  const isSilent =
+    options?.silentOverride !== undefined
+      ? options.silentOverride
+      : customDiscordTransport
+        ? false
+        : isOutboundSilentMode();
+
+  if (isSilent) {
+    return { success: true, silent: true, mocked: true };
+  }
+
+  if (customDiscordTransport) {
+    try {
+      let lastId: string | undefined;
+      for (let i = 0; i < chunks.length; i++) {
+        const out = await customDiscordTransport({
+          webhookUrl: webhookUrl || undefined,
+          channelId: channelId || undefined,
+          content: chunks[i],
+          username,
+          embeds: i === 0 ? options?.embeds : undefined,
+        });
+        if (out?.messageId || out?.id) lastId = String(out.messageId || out.id);
+      }
+      return { success: true, messageId: lastId || 'discord_mock_msg', silent: false, mocked: true };
+    } catch (err: any) {
+      return {
+        success: false,
+        silent: false,
+        mocked: true,
+        error: err?.message || 'Discord mock transport failed',
+      };
+    }
+  }
+
+  const hasValidWebhook = /^https:\/\/(?:discord\.com|discordapp\.com)\/api\/webhooks\/.+/i.test(webhookUrl);
+  const hasBotCreds = Boolean(botToken && channelId);
+  if (!hasValidWebhook && !hasBotCreds) {
+    return {
+      success: false,
+      silent: false,
+      mocked: false,
+      error: 'Chưa cấu hình Discord Webhook URL hoặc Discord Bot Token/Channel ID.',
+    };
+  }
+
+  let targetUrl = '';
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (hasValidWebhook) {
+    const parsedUrl = new URL(webhookUrl);
+    if (!parsedUrl.searchParams.has('wait')) parsedUrl.searchParams.set('wait', 'true');
+    targetUrl = parsedUrl.toString();
+  } else {
+    targetUrl = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`;
+    headers.Authorization = `Bot ${botToken}`;
+  }
+
+  let lastMessageId: string | undefined;
+  try {
+    for (let i = 0; i < chunks.length; i++) {
+      const bodyPayload: Record<string, unknown> = {
+        content: chunks[i],
+        ...(hasValidWebhook ? { username } : {}),
+        ...(i === 0 && Array.isArray(options?.embeds) && options.embeds.length > 0 ? { embeds: options.embeds } : {}),
+      };
+      const resp = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(bodyPayload),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (resp.status === 204) {
+        continue;
+      }
+      const data = (await resp.json().catch(() => ({}))) as any;
+      if (!resp.ok) {
+        return {
+          success: false,
+          silent: false,
+          mocked: false,
+          error: data?.message || `Discord API error: HTTP ${resp.status}`,
+        };
+      }
+      if (data?.id) {
+        lastMessageId = String(data.id);
+      }
+    }
+    return {
+      success: true,
+      messageId: lastMessageId,
+      silent: false,
+      mocked: false,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      silent: false,
+      mocked: false,
+      error: err?.message || 'Failed to dispatch Discord HTTP request',
+    };
+  }
+}
+
+/**
  * Proactive Zalo OAuth Token Refresh Loop:
  * Scans integrations expiring within tenant-configured window (default 4 hours), acquires Redlock
  * `lock:tenant:{tenant_id}:integration:zalo_oa:refresh`, rotates token, and
  * re-encrypts using AES-256-GCM with a CRYPTOGRAPHICALLY FRESH 96-bit CSPRNG IV.
  * On upstream OAuth failure, transitions status to `refresh_required` per spec.
  */
+export async function refreshTenantZaloIntegrationsOnClient(
+  client: DbClient,
+  tenantId: string,
+  mockOAuthFetcher?: ZaloOAuthFetcherFn
+): Promise<{ refreshedCount: number; failedCount: number; newIvs: string[]; latestAccessToken?: string }> {
+  const tenantCfg = await getTenantSettingsCached(tenantId, client);
+  let refreshedCount = 0;
+  let failedCount = 0;
+  const newIvs: string[] = [];
+  let latestAccessToken: string | undefined;
+
+  const rows = await client.query<{
+    id: string;
+    integration_type: string;
+    config_encrypted: string;
+    iv: string;
+    auth_tag: string;
+  }>(
+    `SELECT id, integration_type, config_encrypted, iv, auth_tag
+     FROM tenant_integrations
+     WHERE tenant_id = $1 AND integration_type IN ('zalo_oa', 'zalo_bot', 'zalo_zns') AND status = 'active'
+     FOR UPDATE`,
+    [tenantId]
+  );
+
+  for (const row of rows.rows) {
+    try {
+      const currentCfg = decryptTenantSecret<ZaloIntegrationConfig>(
+        tenantId,
+        row.config_encrypted,
+        row.iv,
+        row.auth_tag
+      );
+
+      let nextTokens: { access_token: string; refresh_token: string; expires_in: number };
+      const activeFetcher = mockOAuthFetcher || customZaloOAuthFetcher;
+      const secretKey = String(currentCfg.oa_secret || currentCfg.secret_key || '').trim();
+      const appId = String(currentCfg.app_id || '').trim();
+      const refreshToken = String(currentCfg.refresh_token || '').trim();
+
+      if (activeFetcher) {
+        nextTokens = await activeFetcher(currentCfg);
+      } else if (!isOutboundSilentMode() && refreshToken && appId && secretKey) {
+        const formBody = new URLSearchParams({
+          refresh_token: refreshToken,
+          app_id: appId,
+          grant_type: 'refresh_token',
+        });
+        const oauthResp = await fetch('https://oauth.zaloapp.com/v4/oa/access_token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            secret_key: secretKey,
+          },
+          body: formBody.toString(),
+          signal: AbortSignal.timeout(8000),
+        });
+        const oauthData = (await oauthResp.json().catch(() => null)) as {
+          access_token?: string;
+          refresh_token?: string;
+          expires_in?: number | string;
+          error?: number;
+          error_description?: string;
+          error_name?: string;
+        } | null;
+        if (!oauthResp.ok || !oauthData?.access_token) {
+          throw new Error(
+            oauthData?.error_description ||
+              oauthData?.error_name ||
+              `Zalo OAuth refresh failed (HTTP ${oauthResp.status})`
+          );
+        }
+        const parsedExpires = Number(oauthData.expires_in || tenantCfg.zalo_token_ttl_hours * 3600);
+        nextTokens = {
+          access_token: String(oauthData.access_token),
+          refresh_token: String(oauthData.refresh_token || refreshToken),
+          expires_in: Number.isFinite(parsedExpires) && parsedExpires > 0 ? parsedExpires : 3600,
+        };
+      } else {
+        nextTokens = {
+          access_token: `zalo_oa_tok_${crypto.randomBytes(16).toString('hex')}`,
+          refresh_token: `zalo_oa_ref_${crypto.randomBytes(16).toString('hex')}`,
+          expires_in: tenantCfg.zalo_token_ttl_hours * 3600,
+        };
+      }
+
+      const updatedPayload: ZaloIntegrationConfig = {
+        ...currentCfg,
+        access_token: nextTokens.access_token,
+        refresh_token: nextTokens.refresh_token,
+      };
+
+      // Re-encrypt with brand-new 96-bit CSPRNG IV (Zero IV Reuse)
+      const reEncrypted = encryptTenantSecret(tenantId, updatedPayload as Record<string, unknown>);
+      const nextExpiry = new Date(Date.now() + nextTokens.expires_in * 1000).toISOString();
+
+      await client.query(
+        `UPDATE tenant_integrations
+         SET config_encrypted = $1,
+             iv = $2,
+             auth_tag = $3,
+             token_expires_at = $4,
+             status = 'active',
+             last_synced_at = clock_timestamp()
+         WHERE tenant_id = $5 AND id = $6`,
+        [reEncrypted.configEncrypted, reEncrypted.iv, reEncrypted.authTag, nextExpiry, tenantId, row.id]
+      );
+
+      await tenantRedis.set('zalo:token', nextTokens.access_token, Math.max(60, nextTokens.expires_in - 300), tenantId);
+      refreshedCount += 1;
+      newIvs.push(reEncrypted.iv);
+      latestAccessToken = nextTokens.access_token;
+    } catch {
+      failedCount += 1;
+      await client.query(
+        `UPDATE tenant_integrations
+         SET status = 'refresh_required', updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2`,
+        [tenantId, row.id]
+      );
+    }
+  }
+
+  return { refreshedCount, failedCount, newIvs, latestAccessToken };
+}
+
 export async function refreshExpiringZaloTokens(
   tenantIdFilter?: string,
-  mockOAuthFetcher?: (cfg: ZaloIntegrationConfig) => Promise<{ access_token: string; refresh_token: string; expires_in: number }>
+  mockOAuthFetcher?: ZaloOAuthFetcherFn
 ): Promise<{ refreshedCount: number; failedCount: number; newIvs: string[] }> {
   const candidates = await withSystemPrivilege(async (client) => {
     const sql = tenantIdFilter
@@ -568,7 +2654,7 @@ export async function refreshExpiringZaloTokens(
          FROM tenant_integrations i
          INNER JOIN tenants t ON t.id = i.tenant_id
          WHERE i.tenant_id = $1
-           AND i.integration_type IN ('zalo_oa', 'zalo_bot')
+           AND i.integration_type IN ('zalo_oa', 'zalo_bot', 'zalo_zns')
            AND i.status = 'active'
            AND (
              i.token_expires_at IS NULL
@@ -577,7 +2663,7 @@ export async function refreshExpiringZaloTokens(
       : `SELECT DISTINCT i.tenant_id
          FROM tenant_integrations i
          INNER JOIN tenants t ON t.id = i.tenant_id
-         WHERE i.integration_type IN ('zalo_oa', 'zalo_bot')
+         WHERE i.integration_type IN ('zalo_oa', 'zalo_bot', 'zalo_zns')
            AND i.status = 'active'
            AND i.token_expires_at IS NOT NULL
            AND i.token_expires_at <= clock_timestamp() + make_interval(hours => GREATEST(1, LEAST(48, COALESCE((t.settings->>'zalo_token_refresh_window_hours')::int, 4))))`;
@@ -590,78 +2676,12 @@ export async function refreshExpiringZaloTokens(
   const newIvs: string[] = [];
 
   for (const tenantId of candidates) {
-    const tenantCfg = await getTenantSettingsCached(tenantId);
     await tenantRedis.withLock(tenantId, 'integration:zalo_oa:refresh', 10_000, async () => {
       await withTenantTransaction(tenantId, async (client) => {
-        const rows = await client.query<{
-          id: string;
-          integration_type: string;
-          config_encrypted: string;
-          iv: string;
-          auth_tag: string;
-        }>(
-          `SELECT id, integration_type, config_encrypted, iv, auth_tag
-           FROM tenant_integrations
-           WHERE tenant_id = $1 AND integration_type IN ('zalo_oa', 'zalo_bot') AND status = 'active'
-           FOR UPDATE`,
-          [tenantId]
-        );
-
-        for (const row of rows.rows) {
-          try {
-            const currentCfg = decryptTenantSecret<ZaloIntegrationConfig>(
-              tenantId,
-              row.config_encrypted,
-              row.iv,
-              row.auth_tag
-            );
-
-            let nextTokens: { access_token: string; refresh_token: string; expires_in: number };
-            if (mockOAuthFetcher) {
-              nextTokens = await mockOAuthFetcher(currentCfg);
-            } else {
-              nextTokens = {
-                access_token: `zalo_oa_tok_${crypto.randomBytes(16).toString('hex')}`,
-                refresh_token: `zalo_oa_ref_${crypto.randomBytes(16).toString('hex')}`,
-                expires_in: tenantCfg.zalo_token_ttl_hours * 3600,
-              };
-            }
-
-            const updatedPayload: ZaloIntegrationConfig = {
-              ...currentCfg,
-              access_token: nextTokens.access_token,
-              refresh_token: nextTokens.refresh_token,
-            };
-
-            // Re-encrypt with brand-new 96-bit CSPRNG IV (Zero IV Reuse)
-            const reEncrypted = encryptTenantSecret(tenantId, updatedPayload as Record<string, unknown>);
-            const nextExpiry = new Date(Date.now() + nextTokens.expires_in * 1000).toISOString();
-
-            await client.query(
-              `UPDATE tenant_integrations
-               SET config_encrypted = $1,
-                   iv = $2,
-                   auth_tag = $3,
-                   token_expires_at = $4,
-                   status = 'active',
-                   last_synced_at = clock_timestamp()
-               WHERE tenant_id = $5 AND id = $6`,
-              [reEncrypted.configEncrypted, reEncrypted.iv, reEncrypted.authTag, nextExpiry, tenantId, row.id]
-            );
-
-            await tenantRedis.set('zalo:token', nextTokens.access_token, Math.max(60, nextTokens.expires_in - 300), tenantId);
-            refreshedCount += 1;
-            newIvs.push(reEncrypted.iv);
-          } catch {
-            failedCount += 1;
-            await client.query(
-              `UPDATE tenant_integrations
-               SET status = 'refresh_required', updated_at = clock_timestamp()
-               WHERE tenant_id = $1 AND id = $2`,
-              [tenantId, row.id]
-            );
-          }
-        }
+        const out = await refreshTenantZaloIntegrationsOnClient(client, tenantId, mockOAuthFetcher);
+        refreshedCount += out.refreshedCount;
+        failedCount += out.failedCount;
+        newIvs.push(...out.newIvs);
       });
       tenantRedis.invalidateTenantIntegrations(tenantId);
     });
@@ -680,6 +2700,7 @@ export interface ZaloBotCommandInput {
 
 export interface ZaloBotCommandResult {
   handled: boolean;
+  disabled?: boolean;
   command: string;
   replyText: string;
   metadata?: Record<string, unknown>;
@@ -719,11 +2740,21 @@ function buildCommandVariants(
  */
 export async function processZaloBotCommand(input: ZaloBotCommandInput): Promise<ZaloBotCommandResult> {
   // Load tenant settings & Zalo Vault config from hot tenant-isolated cache BEFORE opening any DB transaction
-  const [tenantCfg, botRow, oaRow] = await Promise.all([
-    getTenantSettingsCached(input.tenantId),
+  const [tenantMeta, botRow, oaRow] = await Promise.all([
+    getTenantMetaCached(input.tenantId),
     getTenantIntegrationCached(input.tenantId, 'zalo_bot'),
     getTenantIntegrationCached(input.tenantId, 'zalo_oa'),
   ]);
+  const tenantCfg = tenantMeta?.settings || DEFAULT_TENANT_SETTINGS;
+  if (tenantMeta?.rawSettings?.zalo_bot_disabled === true) {
+    return {
+      handled: false,
+      disabled: true,
+      command: 'zalo_bot_disabled',
+      replyText: 'Zalo Bot chưa được kích hoạt cho không gian làm việc này.',
+      metadata: { disabled: true },
+    };
+  }
 
   const activeZaloRow =
     botRow && botRow.status === 'active'

@@ -159,6 +159,23 @@ export function buildDefaultSystemRoleModulePermission(
     };
   }
 
+  if (r === 'viewer' || r === 'report_viewer' || r === 'guest_viewer') {
+    const viewerReportModules = new Set([
+      'dashboard_marketing',
+      'ads_capi',
+      'dashboard_crm',
+    ]);
+    const canView = viewerReportModules.has(moduleKey);
+    return {
+      data_scope: canView ? 'company' : 'none',
+      actions: {
+        ...buildEmptyActions(false),
+        view: canView,
+        export: moduleKey === 'dashboard_marketing' || moduleKey === 'ads_capi',
+      },
+    };
+  }
+
   if (r === 'manager') {
     const adminOnlyModules = new Set([
       'settings',
@@ -567,6 +584,8 @@ function mirrorModuleAliasesInMatrix(matrix: EffectivePermissionsMatrix): Effect
   return matrix;
 }
 
+export const PUBLIC_DOM_META_VIEWER_USER_ID = '00000000-0000-4000-8000-000000000000';
+
 /**
  * ZERO-SHORT-CIRCUIT GRANULAR RBAC ENGINE
  * Exact Resolution Order:
@@ -580,7 +599,8 @@ export async function resolveUserEffectivePermissions(
   tenantId: string,
   userId: string
 ): Promise<ResolvedUserRbacResult> {
-  if (tenantId && userId) {
+  const isPublicViewer = userId === PUBLIC_DOM_META_VIEWER_USER_ID;
+  if (tenantId && userId && !isPublicViewer) {
     const cached = tenantRedis.getCachedEffectivePermissions<ResolvedUserRbacResult>(tenantId, userId);
     if (cached && cached.screen_access) {
       return cached;
@@ -606,30 +626,46 @@ export async function resolveUserEffectivePermissions(
        LIMIT 1`,
       [tenantId]
     ),
-    client.query<{
-      id: string;
-      role: string;
-      role_id: string | null;
-      branch_id: string | null;
-      department_id: string | null;
-      team_id: string | null;
-      position_id: string | null;
-      reports_to_user_id: string | null;
-      is_tenant_owner: boolean;
-      is_external_agency: boolean;
-      is_system_bot: boolean;
-    }>(
-      `SELECT id, role, role_id, branch_id, department_id, team_id, position_id,
-              reports_to_user_id, is_tenant_owner, is_external_agency, is_system_bot
-       FROM users
-       WHERE tenant_id = $1 AND id = $2
-       LIMIT 1`,
-      [tenantId, userId]
-    ),
+    isPublicViewer
+      ? Promise.resolve({
+          rows: [] as Array<{
+            id: string;
+            role: string;
+            role_id: string | null;
+            branch_id: string | null;
+            department_id: string | null;
+            team_id: string | null;
+            position_id: string | null;
+            reports_to_user_id: string | null;
+            is_tenant_owner: boolean;
+            is_external_agency: boolean;
+            is_system_bot: boolean;
+          }>,
+        })
+      : client.query<{
+          id: string;
+          role: string;
+          role_id: string | null;
+          branch_id: string | null;
+          department_id: string | null;
+          team_id: string | null;
+          position_id: string | null;
+          reports_to_user_id: string | null;
+          is_tenant_owner: boolean;
+          is_external_agency: boolean;
+          is_system_bot: boolean;
+        }>(
+          `SELECT id, role, role_id, branch_id, department_id, team_id, position_id,
+                  reports_to_user_id, is_tenant_owner, is_external_agency, is_system_bot
+           FROM users
+           WHERE tenant_id = $1 AND id = $2
+           LIMIT 1`,
+          [tenantId, userId]
+        ),
   ]);
 
   const tRow = tenantRes.rows[0];
-  const uRow = userRes.rows[0];
+  let uRow = userRes.rows[0];
   if (!tRow) {
     return {
       userOrg: null,
@@ -648,6 +684,22 @@ export async function resolveUserEffectivePermissions(
     any
   >;
   const legacyRolePerms = settingsObj.role_permissions || {};
+
+  if (!uRow && isPublicViewer && settingsObj.dom_meta_public_view === true) {
+    uRow = {
+      id: PUBLIC_DOM_META_VIEWER_USER_ID,
+      role: 'viewer',
+      role_id: null,
+      branch_id: null,
+      department_id: null,
+      team_id: null,
+      position_id: null,
+      reports_to_user_id: null,
+      is_tenant_owner: false,
+      is_external_agency: false,
+      is_system_bot: true,
+    };
+  }
 
   if (!uRow) {
     const emptyMatrix: EffectivePermissionsMatrix = {};
@@ -999,7 +1051,9 @@ export async function resolveUserEffectivePermissions(
     effectivePermissions: matrix,
     ...screenMeta,
   };
-  tenantRedis.setCachedEffectivePermissions(tenantId, userId, resolvedResult, 30);
+  if (!isPublicViewer) {
+    tenantRedis.setCachedEffectivePermissions(tenantId, userId, resolvedResult, 30);
+  }
   return resolvedResult;
 }
 
@@ -1255,7 +1309,16 @@ export async function requireTenantAuth(req: Request, res: Response, next: NextF
     const tenantMeta = await getTenantMetaCached(claims.tenantId);
     const tenantStatus = tenantMeta ? tenantMeta.status : 'missing';
 
-    if (tenantStatus === 'suspended' || tenantStatus === 'cancelled' || tenantStatus === 'missing') {
+    const originalPath = String(req.originalUrl || '').split('?')[0];
+    const effectivePath = `${req.baseUrl || ''}${String(req.path || req.url || '').split('?')[0]}`;
+    const isBillingRecoveryRoute =
+      (tenantStatus === 'suspended' || tenantStatus === 'cancelled') &&
+      (effectivePath.startsWith('/api/v1/billing/') || originalPath.startsWith('/api/v1/billing/'));
+
+    if (
+      tenantStatus === 'missing' ||
+      ((tenantStatus === 'suspended' || tenantStatus === 'cancelled') && !isBillingRecoveryRoute)
+    ) {
       sendApiError(res, 403, 'TENANT_SUSPENDED', 'Tổ chức của bạn hiện đang tạm ngưng hoạt động.');
       return;
     }

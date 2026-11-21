@@ -3,8 +3,9 @@ import { APP_CONFIG } from '../config.ts';
 import { withTenantTransaction, withSystemPrivilege } from '../core/database/transaction.ts';
 import { encryptTenantSecret, decryptTenantSecret } from '../core/crypto/vault.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
-import { getTenantIntegrationCached, getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
+import { getTenantIntegrationCached, getTenantIntegrationsBatchCached, getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
 import { renderTemplateString } from '../core/settings/tenant-settings.ts';
+import { chunkTextForChat } from './zalo-mail.service.ts';
 
 export interface TelegramConfig {
   botToken?: string;
@@ -68,20 +69,39 @@ export function getTelegramTransportForTesting(): TelegramTransportFn | null {
   return customTelegramTransport;
 }
 
+function parseVaultBool(val: unknown): boolean {
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'number') return val !== 0;
+  const low = String(val ?? '').trim().toLowerCase();
+  if (low === 'false' || low === '0' || low === 'no' || low === 'off' || low === '') return false;
+  if (low === 'true' || low === '1' || low === 'yes' || low === 'on') return true;
+  return Boolean(val);
+}
+
 /**
  * Parses and resolves Telegram configuration:
- * Environment variables & APP_CONFIG take precedence, with tenant vault overrides if available.
+ * Global kill-switches (TELEGRAM_SILENT_MODE='true', TELEGRAM_NOTIFY_ENABLED='false') take highest precedence,
+ * followed by tenant Vault config, non-kill-switch env overrides, and APP_CONFIG defaults.
  */
 export function getTelegramConfig(vaultConfig?: TelegramVaultConfig | null): TelegramConfig {
+  const vaultSilent = vaultConfig?.silent_mode ?? vaultConfig?.silentMode;
   const silentMode =
-    process.env.TELEGRAM_SILENT_MODE !== undefined
-      ? process.env.TELEGRAM_SILENT_MODE === 'true'
-      : (vaultConfig?.silent_mode ?? vaultConfig?.silentMode ?? APP_CONFIG.telegramSilentMode);
+    process.env.TELEGRAM_SILENT_MODE === 'true'
+      ? true
+      : vaultSilent !== undefined
+        ? parseVaultBool(vaultSilent)
+        : process.env.TELEGRAM_SILENT_MODE !== undefined
+          ? process.env.TELEGRAM_SILENT_MODE === 'true'
+          : APP_CONFIG.telegramSilentMode;
 
   const enabled =
-    process.env.TELEGRAM_NOTIFY_ENABLED !== undefined
-      ? process.env.TELEGRAM_NOTIFY_ENABLED === 'true'
-      : (vaultConfig?.enabled ?? APP_CONFIG.telegramNotifyEnabled);
+    process.env.TELEGRAM_NOTIFY_ENABLED === 'false'
+      ? false
+      : vaultConfig?.enabled !== undefined
+        ? parseVaultBool(vaultConfig.enabled)
+        : process.env.TELEGRAM_NOTIFY_ENABLED !== undefined
+          ? process.env.TELEGRAM_NOTIFY_ENABLED === 'true'
+          : APP_CONFIG.telegramNotifyEnabled;
 
   const botToken = (
     vaultConfig?.bot_token ||
@@ -107,26 +127,14 @@ export function getTelegramConfig(vaultConfig?: TelegramVaultConfig | null): Tel
   };
 }
 
-/**
- * Sends a Telegram bot notification using native Node.js fetch (zero external dependencies).
- *
- * CRITICAL REQUIREMENT (R2):
- * In silent/mock mode (TELEGRAM_SILENT_MODE=true or TELEGRAM_NOTIFY_ENABLED=false),
- * guarantees 100% silent execution: ZERO outbound HTTP requests to api.telegram.org.
- * Returns { success: true, silent: true, mocked: true }.
- */
-export async function sendTelegramNotification(
-  tenantId: string | null,
-  text: string,
-  options?: { chatId?: string; parseMode?: 'HTML' | 'MarkdownV2'; silentOverride?: boolean }
-): Promise<TelegramNotificationResult> {
-  // 1. Resolve tenant vault token if tenantId provided
+export async function resolveTenantTelegramConfig(
+  tenantId: string | null
+): Promise<{ config: TelegramConfig; vaultConfig: TelegramVaultConfig | null }> {
   let vaultConfig: TelegramVaultConfig | null = null;
   if (tenantId) {
     try {
-      const cachedRow =
-        (await getTenantIntegrationCached(tenantId, 'telegram_bot')) ||
-        (await getTenantIntegrationCached(tenantId, 'telegram'));
+      const tgBatch = await getTenantIntegrationsBatchCached(tenantId, ['telegram_bot', 'telegram']);
+      const cachedRow = tgBatch.telegram_bot || tgBatch.telegram;
       if (cachedRow && cachedRow.status === 'active') {
         vaultConfig = decryptTenantSecret<TelegramVaultConfig>(
           tenantId,
@@ -139,9 +147,32 @@ export async function sendTelegramNotification(
       vaultConfig = null;
     }
   }
+  return {
+    config: getTelegramConfig(vaultConfig),
+    vaultConfig,
+  };
+}
 
-  // 2. Resolve effective Telegram configuration
-  const config = getTelegramConfig(vaultConfig);
+/**
+ * Sends a Telegram bot notification using native Node.js fetch (zero external dependencies).
+ *
+ * CRITICAL REQUIREMENT (R2):
+ * In silent/mock mode (TELEGRAM_SILENT_MODE=true or TELEGRAM_NOTIFY_ENABLED=false),
+ * guarantees 100% silent execution: ZERO outbound HTTP requests to api.telegram.org.
+ * Returns { success: true, silent: true, mocked: true }.
+ */
+export async function sendTelegramNotification(
+  tenantId: string | null,
+  text: string,
+  options?: {
+    chatId?: string;
+    parseMode?: 'HTML' | 'MarkdownV2';
+    silentOverride?: boolean;
+    resolvedConfig?: TelegramConfig;
+  }
+): Promise<TelegramNotificationResult> {
+  // 1-2. Resolve effective Telegram configuration (reuse pre-resolved config if provided)
+  const config = options?.resolvedConfig ?? (await resolveTenantTelegramConfig(tenantId)).config;
   const targetChatId = (options?.chatId || config.chatId || '').trim();
 
   // 3. Determine if silent execution is enforced
@@ -159,17 +190,24 @@ export async function sendTelegramNotification(
     };
   }
 
+  const chunks = chunkTextForChat(text, 4096);
+  const partsToSend = chunks.length > 0 ? chunks : [String(text || '')];
+
   // 4. Test transport interception (if custom transport provided and not in silent mode)
   if (customTelegramTransport) {
     try {
-      const res = await customTelegramTransport({
-        chatId: targetChatId,
-        text,
-        parseMode: options?.parseMode,
-      });
+      let lastMessageId = 1001;
+      for (const chunk of partsToSend) {
+        const res = await customTelegramTransport({
+          chatId: targetChatId,
+          text: chunk,
+          parseMode: options?.parseMode,
+        });
+        lastMessageId = res?.message_id || res?.messageId || lastMessageId;
+      }
       return {
         success: true,
-        messageId: res?.message_id || res?.messageId || 1001,
+        messageId: lastMessageId,
         silent: false,
         mocked: true,
       };
@@ -202,55 +240,61 @@ export async function sendTelegramNotification(
     };
   }
 
-  // 6. Native Node.js fetch outbound call to Telegram Bot API
+  // 6. Native Node.js fetch outbound call to Telegram Bot API (chunked <= 4096 chars per Telegram limit)
   const url = `https://api.telegram.org/bot${config.botToken}/sendMessage`;
-  const payload: Record<string, unknown> = {
-    chat_id: targetChatId,
-    text,
-  };
-  if (options?.parseMode) {
-    payload.parse_mode = options.parseMode;
-  }
+  let lastMessageId: number | undefined;
+  for (const chunk of partsToSend) {
+    const payload: Record<string, unknown> = {
+      chat_id: targetChatId,
+      text: chunk,
+    };
+    if (options?.parseMode) {
+      payload.parse_mode = options.parseMode;
+    }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
 
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
 
-    const data = (await resp.json().catch(() => ({}))) as any;
-    if (!resp.ok || !data.ok) {
+      const data = (await resp.json().catch(() => ({}))) as any;
+      if (!resp.ok || !data.ok) {
+        return {
+          success: false,
+          silent: false,
+          mocked: false,
+          error: data?.description || `Telegram API error: HTTP ${resp.status}`,
+        };
+      }
+      if (data.result?.message_id !== undefined) {
+        lastMessageId = data.result.message_id;
+      }
+    } catch (err: any) {
+      clearTimeout(timeoutId);
       return {
         success: false,
         silent: false,
         mocked: false,
-        error: data?.description || `Telegram API error: HTTP ${resp.status}`,
+        error: err?.message || 'Failed to dispatch Telegram HTTP request',
       };
     }
-
-    return {
-      success: true,
-      messageId: data.result?.message_id,
-      silent: false,
-      mocked: false,
-    };
-  } catch (err: any) {
-    clearTimeout(timeoutId);
-    return {
-      success: false,
-      silent: false,
-      mocked: false,
-      error: err?.message || 'Failed to dispatch Telegram HTTP request',
-    };
   }
+
+  return {
+    success: true,
+    messageId: lastMessageId,
+    silent: false,
+    mocked: false,
+  };
 }
 
 /**

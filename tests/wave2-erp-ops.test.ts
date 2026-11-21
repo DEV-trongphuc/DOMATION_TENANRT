@@ -86,7 +86,13 @@ describe('Wave 2 Phase 4: Enterprise Operations (Projects, WorkChat, Finance, FI
       assert.equal(blocked.json.error.code, 'MODULE_NOT_ENTITLED');
     }
 
-    // Switch Alpha & Beta to Package 4 (`domation_promax`) with `education_addon: false`
+    // Fund & Switch Alpha & Beta to Package 4 (`domation_promax`) with `education_addon: false`
+    await withTenantTransaction(tenantA.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantA.id]);
+    });
+    await withTenantTransaction(tenantB.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantB.id]);
+    });
     const swA = await apiRequest(harness.baseUrl, '/api/v1/workspace/package', {
       method: 'POST',
       token: tenantA.token,
@@ -267,7 +273,7 @@ describe('Wave 2 Phase 4: Enterprise Operations (Projects, WorkChat, Finance, FI
     });
     assert.equal(boot.status, 200);
     assert.equal(boot.json.data.enable_ideas_mascot, false);
-    assert.equal(boot.json.data.sticker_packs.length, 9, 'Must expose all 9 commercial sticker packs');
+    assert.equal(boot.json.data.sticker_packs.length, 10, 'Must expose all 10 commercial sticker packs');
     assert.ok(
       !boot.json.data.sticker_packs.some((p: any) => p.id === 'ideas'),
       'Mascot pack "ideas" MUST be hidden when enable_ideas_mascot is false'

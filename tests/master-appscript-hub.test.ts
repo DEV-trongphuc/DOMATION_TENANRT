@@ -387,10 +387,24 @@ describe('DOMATION Master Google Sheet & Apps Script Hub (All Forms + Registrati
     );
     assert.equal(autoEv.payload.wallet_balance_vnd, 500_000);
 
-    // Case C: Expired WITHOUT enough wallet -> suspended + subscription_expired_suspended
+    // Case C: Expired WITHOUT enough wallet -> grace (expiry_warning), then grace expires -> suspended + subscription_expired_suspended
     await withSystemPrivilege(async (client) => {
       await client.query(
-        `UPDATE tenants SET trial_ends_at = $2::timestamptz, subscription_expires_at = $2::timestamptz, wallet_balance_vnd = 100000, status = 'active' WHERE id = $1`,
+        `UPDATE tenants SET trial_ends_at = $2::timestamptz, subscription_expires_at = $2::timestamptz, grace_ends_at = NULL, wallet_balance_vnd = 100000, status = 'active' WHERE id = $1`,
+        [tid, pastIso]
+      );
+    });
+    const graceCount = await runSubscriptionExpiryManager(tid);
+    assert.equal(graceCount, 1);
+    const graceEv = await waitForCapturedEvent(
+      captured,
+      (p) => p.event_type === 'expiry_warning' && p.tenant_slug === slugCron && p.status === 'grace'
+    );
+    assert.equal(graceEv.payload.status, 'grace');
+
+    await withSystemPrivilege(async (client) => {
+      await client.query(
+        `UPDATE tenants SET grace_ends_at = $2::timestamptz WHERE id = $1`,
         [tid, pastIso]
       );
     });

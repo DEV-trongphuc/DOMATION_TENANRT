@@ -12,14 +12,27 @@ import {
   resolveUserEffectivePermissions,
   sendApiError,
 } from '../../core/security/rbac.ts';
-import { maskContactPiiIfDisallowed } from '../../core/security/pii-masker.ts';
+import {
+  maskContactPiiIfDisallowed,
+  sanitizeAvatarUrl,
+  stripEphemeralAvatarsFromCustomFields,
+} from '../../core/security/pii-masker.ts';
 import { emitDomainEvent } from '../../core/events/event-bus.ts';
 import { runUnassignedLeadDrainer } from '../../cron/subroutines/lead-drainer.ts';
 import { slugifyKeyLower } from '../org-rbac/org-rbac.service.ts';
+import { ensureMarketingSchema } from '../marketing/schema.ts';
+import { ensureErpOpsSchema } from '../erp-ops/schema.ts';
+import { buildDynamicConditionSchemaRegistryInTx } from '../../services/condition-schema.service.ts';
+import {
+  executeSharedGeminiAnalysis,
+  resolveDecryptedSharedAiConfig,
+} from '../../services/dom-meta-report.service.ts';
 import { compileSegmentWhereSql } from './segment-compiler.ts';
 import {
+  computeAudienceAnalyticsInTx,
   evaluateDynamicAudience,
   importRowsIntoAudience,
+  mergeAudiences,
   parseCsvTextToRows,
   promoteLeadsToSaleRoundInTx,
   refreshAudienceCachedCount,
@@ -31,6 +44,83 @@ export const audiencesRouter = Router();
 
 audiencesRouter.use(requireTenantAuth);
 audiencesRouter.use(requireEntitlement('audiences'));
+
+// ============================================================================
+// 0. Full-Field Dynamic Condition Schema (`GET /api/v1/audiences/condition-schema`)
+// ============================================================================
+audiencesRouter.get('/condition-schema', requirePermission('audiences', 'view'), async (_req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await ensureMarketingSchema().catch(() => {});
+    const data = await withTenantTransaction(ctx.tenantId, async (client) =>
+      buildDynamicConditionSchemaRegistryInTx(client, ctx.tenantId)
+    );
+    res.json({ success: true, data });
+  } catch (err: any) {
+    sendApiError(res, 500, 'CONDITION_SCHEMA_FAILED', err?.message || 'Không thể tải danh mục điều kiện phân khúc.');
+  }
+});
+
+// ============================================================================
+// 0b. Meta-Report-Style Audience Analytics (`GET /api/v1/audiences/analytics`)
+// ============================================================================
+audiencesRouter.get('/analytics', requirePermission('audiences', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await ensureMarketingSchema().catch(() => {});
+    const rawAudId = req.query.audience_id ? String(req.query.audience_id).trim() : null;
+    if (rawAudId && !UUID_REGEX.test(rawAudId)) {
+      sendApiError(res, 400, 'INVALID_AUDIENCE_ID', 'ID tệp phân tích không hợp lệ.');
+      return;
+    }
+    const data = await withTenantTransaction(ctx.tenantId, async (client) =>
+      computeAudienceAnalyticsInTx(client, ctx.tenantId, rawAudId)
+    );
+    res.json({ success: true, data });
+  } catch (err: any) {
+    if (err?.message === 'AUDIENCE_NOT_FOUND') {
+      sendApiError(res, 404, 'AUDIENCE_NOT_FOUND', 'Không tìm thấy Tệp khách hàng để phân tích.');
+      return;
+    }
+    sendApiError(res, 500, 'AUDIENCE_ANALYTICS_FAILED', err?.message || 'Không thể tải báo cáo phân tích tệp.');
+  }
+});
+
+// ============================================================================
+// 0c. Idempotent Set-Algebra Audience Merge (`POST /api/v1/audiences/merge`)
+// ============================================================================
+audiencesRouter.post('/merge', requirePermission('audiences', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    await ensureMarketingSchema().catch(() => {});
+    const out = await mergeAudiences(ctx.tenantId, {
+      ...(req.body || {}),
+      actorId: ctx.userId,
+    });
+    res.status(201).json({ success: true, data: out });
+  } catch (err: any) {
+    if (
+      err?.message === 'INVALID_MERGE_TARGET' ||
+      err?.message === 'INVALID_MERGE_SOURCES' ||
+      err?.message === 'MERGE_REQUIRES_AT_LEAST_TWO_SOURCES'
+    ) {
+      sendApiError(
+        res,
+        422,
+        err.message,
+        err.message === 'MERGE_REQUIRES_AT_LEAST_TWO_SOURCES'
+          ? 'Phép giao nhau / loại trừ cần chọn ít nhất 2 tệp nguồn.'
+          : 'Vui lòng chọn đầy đủ tệp nguồn và tệp đích hợp lệ.'
+      );
+      return;
+    }
+    if (err?.message === 'AUDIENCE_NOT_FOUND') {
+      sendApiError(res, 404, 'AUDIENCE_NOT_FOUND', 'Không tìm thấy Tệp khách hàng.');
+      return;
+    }
+    sendApiError(res, 500, 'AUDIENCE_MERGE_FAILED', err?.message || 'Không thể gộp tệp khách hàng.');
+  }
+});
 
 // ============================================================================
 // 1. Dynamic Segment Field Catalog (`/api/v1/audiences/field-catalog`)
@@ -68,6 +158,7 @@ audiencesRouter.get('/field-catalog', async (_req, res) => {
         { group: 'profile', key: 'source', label: 'Nguồn thu thập', type: 'text' },
         { group: 'profile', key: 'campaign', label: 'Chiến dịch', type: 'text' },
         { group: 'profile', key: 'utm_source', label: 'UTM Source', type: 'text' },
+        { group: 'profile', key: 'cf.birthday', label: 'Ngày sinh (Birthday)', type: 'birthday' },
         { group: 'profile', key: 'product_interest', label: 'Sản phẩm / Nhu cầu quan tâm', type: 'text' },
         {
           group: 'profile',
@@ -121,14 +212,77 @@ audiencesRouter.get('/field-catalog', async (_req, res) => {
         { group: 'revenue', key: 'is_won_stage', label: 'Đã chốt thành công (Won)', type: 'boolean' },
       ];
 
+      let globalCfRows: Array<{ field_key: string; field_label: string; field_type: string; options_json: unknown }> = [];
+      try {
+        await client.query('SAVEPOINT sp_field_catalog_global_cf');
+        const gRes = await client.query<{ field_key: string; field_label: string; field_type: string; options_json: unknown }>(
+          `SELECT DISTINCT field_key, field_label, field_type, options_json
+           FROM tenant_custom_fields WHERE tenant_id = $1 AND entity_type IN ('contact', 'lead', 'customer') AND is_active = true
+           ORDER BY field_key ASC`,
+          [ctx.tenantId]
+        );
+        globalCfRows = gRes.rows;
+        await client.query('RELEASE SAVEPOINT sp_field_catalog_global_cf');
+      } catch {
+        await client.query('ROLLBACK TO SAVEPOINT sp_field_catalog_global_cf').catch(() => {});
+      }
+
+      let settingsCustomFields: Array<{ field_key: string; field_label: string; field_type: string; options_json: unknown }> = [];
+      try {
+        const tSetRes = await client.query<{ settings: unknown }>(
+          'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        );
+        const rawSettings = tSetRes.rows[0]?.settings;
+        const parsedSet = typeof rawSettings === 'string' ? JSON.parse(rawSettings) : rawSettings;
+        if (parsedSet && Array.isArray(parsedSet.custom_fields)) {
+          settingsCustomFields = parsedSet.custom_fields
+            .filter((x: any) => x && typeof x === 'object' && (x.key || x.field_key || x.name))
+            .map((x: any) => ({
+              field_key: String(x.key ?? x.field_key ?? x.name),
+              field_label: String(x.label ?? x.field_label ?? x.key ?? x.field_key ?? x.name),
+              field_type: String(x.type ?? x.field_type ?? 'text'),
+              options_json: x.options ?? x.options_json ?? null,
+            }));
+        } else if (parsedSet && parsedSet.custom_fields && typeof parsedSet.custom_fields === 'object') {
+          settingsCustomFields = Object.entries(parsedSet.custom_fields as Record<string, unknown>).map(([k, v]) => {
+            if (v && typeof v === 'object' && !Array.isArray(v)) {
+              const obj = v as Record<string, unknown>;
+              return {
+                field_key: k,
+                field_label: String(obj.label ?? obj.field_label ?? k),
+                field_type: String(obj.type ?? obj.field_type ?? 'text'),
+                options_json: obj.options ?? obj.options_json ?? null,
+              };
+            }
+            return {
+              field_key: k,
+              field_label: typeof v === 'string' && v.trim() ? v.trim() : k,
+              field_type: 'text',
+              options_json: null,
+            };
+          });
+        }
+      } catch {
+        // ignore settings parse error
+      }
+
       const normalizedFields: Array<{
         key: string;
         label: string;
         layer: 'profile' | 'crm' | 'marketing' | 'revenue';
-        valueType: 'text' | 'number' | 'select' | 'boolean';
+        valueType: 'text' | 'number' | 'select' | 'boolean' | 'date' | 'birthday';
         options?: Array<{ value: string; label: string }>;
       }> = standardFields.map((sf) => {
         const layer = sf.group as 'profile' | 'crm' | 'marketing' | 'revenue';
+        if (sf.type === 'birthday') {
+          return {
+            key: sf.key,
+            label: sf.label,
+            layer,
+            valueType: 'birthday',
+          };
+        }
         if (sf.type === 'pipeline') {
           return {
             key: sf.key,
@@ -196,7 +350,15 @@ audiencesRouter.get('/field-catalog', async (_req, res) => {
         };
       });
 
-      for (const cf of customFieldsRes.rows) {
+      const mergedCustomRows = new Map<string, { field_key: string; field_label: string; field_type: string; options_json: unknown }>();
+      for (const cf of [...customFieldsRes.rows, ...globalCfRows, ...settingsCustomFields]) {
+        const cleanKey = String(cf.field_key || '').replace(/^(?:cf|custom_fields|custom)\./i, '').trim();
+        if (!cleanKey || mergedCustomRows.has(cleanKey)) continue;
+        mergedCustomRows.set(cleanKey, { ...cf, field_key: cleanKey });
+      }
+      const allCustomFields = Array.from(mergedCustomRows.values());
+
+      for (const cf of allCustomFields) {
         const cfOptions = Array.isArray(cf.options_json)
           ? cf.options_json.map((o: any) =>
               typeof o === 'object' && o !== null
@@ -204,16 +366,26 @@ audiencesRouter.get('/field-catalog', async (_req, res) => {
                 : { value: String(o), label: String(o) }
             )
           : undefined;
+        const rawCfType = String(cf.field_type || 'text').trim().toLowerCase();
+        const cfKeyLower = cf.field_key.toLowerCase();
+        const valueType: 'text' | 'number' | 'select' | 'boolean' | 'date' | 'birthday' =
+          rawCfType === 'birthday' ||
+          ((rawCfType === 'date' || rawCfType === 'text') && ['birthday', 'dob', 'date_of_birth', 'dateofbirth', 'ngay_sinh'].includes(cfKeyLower))
+            ? 'birthday'
+            : rawCfType === 'number' || rawCfType === 'currency'
+              ? 'number'
+              : rawCfType === 'date'
+                ? 'date'
+                : rawCfType === 'boolean' || rawCfType === 'checkbox'
+                  ? 'boolean'
+                  : cfOptions && cfOptions.length > 0
+                    ? 'select'
+                    : 'text';
         normalizedFields.push({
-          key: `custom_fields.${cf.field_key}`,
+          key: `cf.${cf.field_key}`,
           label: `${cf.field_label || cf.field_key} (Trường tùy chỉnh)`,
           layer: 'profile',
-          valueType:
-            cf.field_type === 'number'
-              ? 'number'
-              : cfOptions && cfOptions.length > 0
-                ? 'select'
-                : 'text',
+          valueType,
           options: cfOptions,
         });
       }
@@ -223,9 +395,9 @@ audiencesRouter.get('/field-catalog', async (_req, res) => {
         standard_fields: standardFields,
         pipelines: pipelinesRes.rows,
         stages: stagesRes.rows,
-        custom_fields: customFieldsRes.rows.map((cf) => ({
+        custom_fields: allCustomFields.map((cf) => ({
           ...cf,
-          filter_key: `custom_fields.${cf.field_key}`,
+          filter_key: `cf.${cf.field_key}`,
         })),
         rounds: roundsRes.rows,
         tags: tagsRes.rows,
@@ -266,10 +438,18 @@ function parseCriteriaInput(raw: unknown): unknown {
 audiencesRouter.post('/preview', requirePermission('audiences', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    await ensureMarketingSchema().catch(() => {});
+    await ensureErpOpsSchema().catch(() => {});
     const cfg = await getTenantSettingsCached(ctx.tenantId);
-    const { filter_branches, criteria, groups, audience_id, exclude_audience_ids, limit = 20 } = req.body || {};
-    const rawBranches = parseCriteriaInput(filter_branches ?? criteria ?? groups ?? []);
+    const { filter_branches, criteria, groups, segment_rules, audience_id, exclude_audience_ids, limit = 20 } =
+      req.body || {};
+    const rawBranches = parseCriteriaInput(filter_branches ?? criteria ?? groups ?? segment_rules ?? []);
     const safeLimit = Math.min(100, Math.max(1, Number(limit || 20)));
+    const cleanedAudienceId = cleanParam(audience_id);
+    if (cleanedAudienceId && !UUID_REGEX.test(cleanedAudienceId)) {
+      sendApiError(res, 400, 'INVALID_AUDIENCE_ID', 'ID tệp không hợp lệ.');
+      return;
+    }
 
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       const rbac = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
@@ -278,9 +458,14 @@ audiencesRouter.post('/preview', requirePermission('audiences', 'view'), async (
           rbac.effectivePermissions.leads?.actions.unmask_phone
       );
 
+      const safeAudienceId = cleanedAudienceId;
+      const safeExcludeAudienceIds = Array.isArray(exclude_audience_ids)
+        ? exclude_audience_ids.map((x) => String(x || '').trim()).filter((x) => UUID_REGEX.test(x))
+        : undefined;
+
       const compiled = compileSegmentWhereSql(ctx.tenantId, rawBranches, {
-        audienceIdForExclusions: audience_id ? String(audience_id) : null,
-        extraExcludeAudienceIds: Array.isArray(exclude_audience_ids) ? exclude_audience_ids : undefined,
+        audienceIdForExclusions: safeAudienceId,
+        extraExcludeAudienceIds: safeExcludeAudienceIds,
       });
 
       const [cntRes, sampleRes] = await Promise.all([
@@ -411,7 +596,9 @@ audiencesRouter.get('/contacts', requirePermission('audiences', 'view'), async (
           where += ' AND 1 = 0';
         } else if (segRow.audience_type === 'dynamic_logic') {
           const parsedBranches = parseCriteriaInput(segRow.filter_branches);
-          const segCompiled = compileSegmentWhereSql(ctx.tenantId, parsedBranches);
+          const segCompiled = compileSegmentWhereSql(ctx.tenantId, parsedBranches, {
+            audienceIdForExclusions: segmentIdFilter,
+          });
           const matchedRes = await client.query<{ id: string }>(
             `SELECT l.id
              FROM leads l
@@ -441,7 +628,7 @@ audiencesRouter.get('/contacts', requirePermission('audiences', 'view'), async (
         sortParam === 'oldest'
           ? 'l.created_at ASC'
           : sortParam === 'score_desc' || sortParam === 'lead_score'
-            ? 'l.lead_score DESC NULLS LAST, l.created_at DESC'
+            ? 'COALESCE(l.lead_score, 0) DESC, l.created_at DESC'
             : 'l.created_at DESC';
 
       const [cntRes, rowsRes] = await Promise.all([
@@ -484,6 +671,9 @@ audiencesRouter.get('/contacts', requirePermission('audiences', 'view'), async (
         maskContactPiiIfDisallowed(
           {
             ...row,
+            ...(row.avatar !== undefined ? { avatar: sanitizeAvatarUrl(row.avatar) } : {}),
+            ...(row.avatar_url !== undefined ? { avatar_url: sanitizeAvatarUrl(row.avatar_url) } : {}),
+            custom_fields: stripEphemeralAvatarsFromCustomFields(row.custom_fields),
             total_revenue_vnd: Number(row.total_revenue_vnd || 0),
             tags: tagsMap.get(row.id) || [],
           },
@@ -526,25 +716,39 @@ audiencesRouter.post('/contacts', requirePermission('audiences', 'create'), asyn
         dialCode: cfg.default_dial_code,
       });
 
+      let enteredAudience: { id: string; name: string; audience_type: string } | null = null;
       if (b.audience_id) {
-        await client.query(
+        const insAud = await client.query(
           `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
            VALUES ($1, $2, $3, $4, 'manual', '{}'::jsonb)
            ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
           [crypto.randomUUID(), ctx.tenantId, b.audience_id, upserted.leadId]
         );
+        if ((insAud.rowCount || 0) > 0) {
+          const audMeta = await client.query<{ id: string; name: string; audience_type: string }>(
+            'SELECT id, name, audience_type FROM tenant_audiences WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+            [ctx.tenantId, String(b.audience_id)]
+          );
+          enteredAudience = audMeta.rows[0] || {
+            id: String(b.audience_id),
+            name: 'Static List',
+            audience_type: 'static_list',
+          };
+        }
         await refreshAudienceCachedCount(client, ctx.tenantId, String(b.audience_id));
       }
 
+      const assignedTagIds: string[] = [];
       if (Array.isArray(b.tag_ids)) {
         for (const tid of b.tag_ids) {
           if (!tid) continue;
-          await client.query(
+          const insTag = await client.query(
             `INSERT INTO lead_tags (id, tenant_id, lead_id, tag_id, assigned_by)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (tenant_id, lead_id, tag_id) DO NOTHING`,
             [crypto.randomUUID(), ctx.tenantId, upserted.leadId, tid, ctx.userId]
           );
+          if ((insTag.rowCount || 0) > 0) assignedTagIds.push(String(tid));
         }
       }
 
@@ -552,7 +756,7 @@ audiencesRouter.post('/contacts', requirePermission('audiences', 'create'), asyn
         ctx.tenantId,
         upserted.leadId,
       ]);
-      return { contact: r.rows[0], created: upserted.created };
+      return { contact: r.rows[0], created: upserted.created, enteredAudience, assignedTagIds };
     });
 
     await emitDomainEvent(out.created ? 'lead.created' : 'lead.updated', {
@@ -563,6 +767,26 @@ audiencesRouter.post('/contacts', requirePermission('audiences', 'create'), asyn
       source: out.contact.source,
       actorId: ctx.userId,
     });
+
+    if (out.enteredAudience) {
+      await emitDomainEvent('audience.entered', {
+        tenantId: ctx.tenantId,
+        audienceId: out.enteredAudience.id,
+        audienceName: out.enteredAudience.name,
+        audienceType: out.enteredAudience.audience_type,
+        leadId: out.contact.id,
+      });
+    }
+
+    if (out.assignedTagIds.length > 0) {
+      await emitDomainEvent('marketing.engaged', {
+        tenantId: ctx.tenantId,
+        leadId: out.contact.id,
+        engagementType: 'tag_added',
+        scoreDelta: 0,
+        metadata: { tagIds: out.assignedTagIds },
+      });
+    }
 
     if (targetStatus === 'unassigned_pending') {
       await runUnassignedLeadDrainer(ctx.tenantId).catch(() => {});
@@ -706,6 +930,7 @@ audiencesRouter.post('/contacts/:leadId/tags', requirePermission('audiences', 'e
       : req.body?.tag_id
         ? [req.body.tag_id]
         : [];
+    const tagNames: string[] = [];
     await withTenantTransaction(ctx.tenantId, async (client) => {
       for (const tid of tagIds) {
         if (!tid) continue;
@@ -716,6 +941,14 @@ audiencesRouter.post('/contacts/:leadId/tags', requirePermission('audiences', 'e
           [crypto.randomUUID(), ctx.tenantId, leadId, String(tid), ctx.userId]
         );
       }
+      if (tagIds.length > 0) {
+        const cleanIds = tagIds.map(String).filter(Boolean);
+        const tRes = await client.query<{ name: string }>(
+          `SELECT name FROM tenant_tags WHERE tenant_id = $1 AND id IN (${cleanIds.map((_, i) => `$${i + 2}`).join(', ')})`,
+          [ctx.tenantId, ...cleanIds]
+        );
+        for (const row of tRes.rows) tagNames.push(row.name);
+      }
     });
     await emitDomainEvent('lead.updated', {
       tenantId: ctx.tenantId,
@@ -723,6 +956,15 @@ audiencesRouter.post('/contacts/:leadId/tags', requirePermission('audiences', 'e
       changedFields: ['tags'],
       actorId: ctx.userId,
     });
+    if (tagIds.length > 0) {
+      await emitDomainEvent('marketing.engaged', {
+        tenantId: ctx.tenantId,
+        leadId,
+        engagementType: 'tag_added',
+        scoreDelta: 0,
+        metadata: { tagIds: tagIds.map(String), tagNames },
+      });
+    }
     res.json({ success: true, data: { lead_id: leadId, tag_ids: tagIds } });
   } catch (err: any) {
     sendApiError(res, 500, 'ASSIGN_TAG_FAILED', err?.message || 'Không thể gắn nhãn cho khách hàng.');
@@ -1079,6 +1321,9 @@ audiencesRouter.get('/:id/members', requirePermission('audiences', 'view'), asyn
         maskContactPiiIfDisallowed(
           {
             ...row,
+            ...(row.avatar !== undefined ? { avatar: sanitizeAvatarUrl(row.avatar) } : {}),
+            ...(row.avatar_url !== undefined ? { avatar_url: sanitizeAvatarUrl(row.avatar_url) } : {}),
+            custom_fields: stripEphemeralAvatarsFromCustomFields(row.custom_fields),
             total_revenue_vnd: Number(row.total_revenue_vnd || 0),
           },
           canUnmask,
@@ -1128,7 +1373,12 @@ audiencesRouter.post('/:id/members', requirePermission('audiences', 'edit'), asy
         }
       }
 
+      const audRes = await client.query<{ name: string; audience_type: string }>(
+        'SELECT name, audience_type FROM tenant_audiences WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, audienceId]
+      );
       let added = 0;
+      const insertedLeadIds: string[] = [];
       for (const lid of Array.from(new Set(leadIds))) {
         if (!lid) continue;
         const ins = await client.query(
@@ -1137,13 +1387,38 @@ audiencesRouter.post('/:id/members', requirePermission('audiences', 'edit'), asy
            ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
           [crypto.randomUUID(), ctx.tenantId, audienceId, String(lid), b.source_type || 'manual']
         );
-        added += ins.rowCount || 0;
+        if ((ins.rowCount || 0) > 0) {
+          added += ins.rowCount || 0;
+          insertedLeadIds.push(String(lid));
+        }
       }
       const total = await refreshAudienceCachedCount(client, ctx.tenantId, audienceId);
-      return { added_count: added, cached_member_count: total };
+      return {
+        added_count: added,
+        cached_member_count: total,
+        insertedLeadIds,
+        audienceName: audRes.rows[0]?.name || 'Audience',
+        audienceType: audRes.rows[0]?.audience_type || 'static_list',
+      };
     });
 
-    res.json({ success: true, data: result });
+    for (const lid of result.insertedLeadIds) {
+      await emitDomainEvent('audience.entered', {
+        tenantId: ctx.tenantId,
+        audienceId,
+        audienceName: result.audienceName,
+        audienceType: result.audienceType,
+        leadId: lid,
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        added_count: result.added_count,
+        cached_member_count: result.cached_member_count,
+      },
+    });
   } catch (err: any) {
     sendApiError(res, 500, 'ADD_AUDIENCE_MEMBERS_FAILED', err?.message || 'Không thể thêm khách hàng vào tệp.');
   }
@@ -1169,6 +1444,8 @@ audiencesRouter.delete('/:id/members/:leadId', requirePermission('audiences', 'e
 audiencesRouter.post('/:id/evaluate', requirePermission('audiences', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    await ensureMarketingSchema().catch(() => {});
+    await ensureErpOpsSchema().catch(() => {});
     const out = await evaluateDynamicAudience(ctx.tenantId, req.params.id);
     res.json({ success: true, data: out });
   } catch (err: any) {
@@ -1215,10 +1492,11 @@ audiencesRouter.post('/:id/import', requirePermission('audiences', 'import'), as
   }
 });
 
-// Random A/B Split (`POST /:id/split` & `POST /:id/ab-split`)
+// Random / Percentage / Count / Round-Robin Split (`POST /:id/split` & `POST /:id/ab-split`)
 audiencesRouter.post(['/:id/split', '/:id/ab-split'], requirePermission('audiences', 'create'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    await ensureMarketingSchema().catch(() => {});
     const out = await splitAudienceIntoParts(ctx.tenantId, req.params.id, {
       ...(req.body || {}),
       actorId: ctx.userId,
@@ -1230,6 +1508,192 @@ audiencesRouter.post(['/:id/split', '/:id/ab-split'], requirePermission('audienc
       return;
     }
     sendApiError(res, 500, 'AUDIENCE_SPLIT_FAILED', err?.message || 'Không thể tách tệp A/B.');
+  }
+});
+
+// AI Segment / Audience Deep Analysis (`POST /:id/ai-analyze`)
+audiencesRouter.post('/:id/ai-analyze', requirePermission('audiences', 'view'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const audienceId = String(req.params.id || '').trim();
+    if (!UUID_REGEX.test(audienceId)) {
+      sendApiError(res, 400, 'INVALID_AUDIENCE_ID', 'ID phân khúc không hợp lệ.');
+      return;
+    }
+    await ensureMarketingSchema().catch(() => {});
+
+    // Read analytics + tenant BYOK AI config strictly inside short DB tx, release before external Gemini call
+    const snapshot = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [analytics, aiCfg, tSetRes] = await Promise.all([
+        computeAudienceAnalyticsInTx(client, ctx.tenantId, audienceId),
+        resolveDecryptedSharedAiConfig(client, ctx.tenantId).catch(() => ({
+          apiKey: '',
+          model: 'gemini-2.5-flash',
+          aiLeadEvalEnabled: true,
+          aiAdsEvalEnabled: true,
+          updatedAt: null,
+        })),
+        client.query<{ settings: Record<string, any> | null }>(
+          'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        ),
+      ]);
+      const rawSettings =
+        tSetRes.rows[0]?.settings && typeof tSetRes.rows[0].settings === 'object'
+          ? tSetRes.rows[0].settings
+          : {};
+      const aiUserBehaviorEnabled =
+        rawSettings.ai_user_behavior_enabled === undefined
+          ? true
+          : Boolean(rawSettings.ai_user_behavior_enabled);
+      return { analytics, aiCfg, aiUserBehaviorEnabled };
+    });
+
+    const { analytics, aiCfg, aiUserBehaviorEnabled } = snapshot;
+    const audName = analytics.audience?.name || 'Phân khúc';
+    const sum = analytics.summary;
+    const total = sum.total_contacts;
+    const hotTier = analytics.engagement_tiers.find((t) => t.tier === 'hot');
+    const supTier = analytics.engagement_tiers.find((t) => t.tier === 'suppressed');
+    const topSrc = analytics.top_sources[0];
+    const topCamp = analytics.top_ad_attribution[0];
+
+    const bestChannel = [...analytics.channel_reach].sort((a, b) => b.count - a.count)[0];
+    const hotPct = hotTier?.pct || 0;
+    const supPct = supTier?.pct || 0;
+    const qualityGrade =
+      total === 0
+        ? 'N/A'
+        : hotPct >= 35 && supPct < 10
+          ? 'A+'
+          : sum.avg_lead_score >= 50 && supPct < 15
+            ? 'A'
+            : sum.avg_lead_score >= 25
+              ? 'B'
+              : 'C';
+
+    const strengths: string[] = [];
+    const risks: string[] = [];
+    const recommendedActions: string[] = [];
+
+    if (total > 0) {
+      if (bestChannel && bestChannel.count > 0) {
+        strengths.push(
+          `Độ phủ kênh tốt nhất: ${bestChannel.channel} đạt ${bestChannel.count.toLocaleString('vi-VN')} khách (${bestChannel.pct}%).`
+        );
+      }
+      if (hotTier && hotTier.count > 0) {
+        strengths.push(
+          `Có ${hotTier.count.toLocaleString('vi-VN')} khách hàng Nóng (${hotPct}%), điểm tương tác trung bình ${sum.avg_lead_score}/100.`
+        );
+      }
+      if (sum.total_revenue_vnd > 0) {
+        strengths.push(
+          `Phân khúc đã tạo ${sum.total_revenue_vnd.toLocaleString('vi-VN')}₫ doanh thu ghi nhận.`
+        );
+      }
+      if (topSrc) {
+        strengths.push(
+          `Nguồn chủ lực: "${topSrc.source}" chiếm ${topSrc.pct}% (${topSrc.count.toLocaleString('vi-VN')} khách).`
+        );
+      }
+      if (supPct >= 10) {
+        risks.push(
+          `Tỷ lệ hủy nhận/bị chặn đạt ${supPct}% (${sum.suppressed_count} khách) — nên dọn dẹp trước khi chạy chiến dịch gửi hàng loạt.`
+        );
+      }
+      if (sum.email_reach === 0 && sum.phone_reach > 0) {
+        risks.push('Phân khúc thiếu Email hợp lệ; nên ưu tiên kịch bản Zalo ZNS hoặc Sale gọi trực tiếp.');
+      }
+      if (hotPct < 15 && total >= 5) {
+        risks.push('Tỷ lệ Lead Nóng còn thấp (<15%); cần chuỗi nuôi dưỡng nội dung hoặc ưu đãi kích hoạt lại.');
+      }
+
+      if (hotTier && hotTier.count > 0) {
+        recommendedActions.push(
+          `Đẩy ngay ${hotTier.count} khách Nóng vào vòng chia Sale hoặc gửi ưu đãi chốt đơn có thời hạn qua ${bestChannel?.channel || 'Email/Zalo'}.`
+        );
+      }
+      if (topCamp && topCamp.campaign_name !== 'Organic / Direct') {
+        recommendedActions.push(
+          `Nhân bản tệp Lookalike / tối ưu ngân sách quanh chiến dịch "${topCamp.campaign_name}" (${topCamp.leads_count} leads).`
+        );
+      }
+      if (supPct > 0) {
+        recommendedActions.push('Chạy chức năng Dọn dẹp phân khúc để loại trừ khách hủy đăng ký/bounced nhằm bảo vệ uy tín tên miền gửi thư.');
+      } else {
+        recommendedActions.push('Thiết lập Automation Flow đa kênh (Email + Zalo ZNS) và chia tách A/B 50/50 để tối ưu tỷ lệ chuyển đổi.');
+      }
+    } else {
+      risks.push('Phân khúc hiện chưa có thành viên nào khớp điều kiện.');
+      recommendedActions.push('Nới rộng tiêu chí lọc hoặc kiểm tra lại đồng bộ dữ liệu CRM/Web Tracking.');
+    }
+
+    let summaryText =
+      total > 0
+        ? `Phân khúc "${audName}" gồm ${total.toLocaleString('vi-VN')} khách hàng (hạng chất lượng ${qualityGrade}, điểm trung bình ${sum.avg_lead_score}/100). Kênh tiếp cận chủ lực là ${bestChannel?.channel || 'Email'} (${bestChannel?.pct || 0}%), dẫn đầu bởi nguồn "${topSrc?.source || 'Direct'}".`
+        : `Phân khúc "${audName}" chưa có thành viên khớp điều kiện hiện tại.`;
+    let aiMarkdown: string | null = null;
+    let sourceMode: 'gemini_byok' | 'statistical_engine' = 'statistical_engine';
+
+    const canCallGemini =
+      Boolean(aiCfg.apiKey) &&
+      aiUserBehaviorEnabled &&
+      aiCfg.aiAdsEvalEnabled !== false &&
+      process.env.OUTBOUND_SILENT_MODE !== 'true';
+
+    if (canCallGemini && total > 0) {
+      try {
+        const aiOut = await executeSharedGeminiAnalysis(
+          aiCfg.apiKey,
+          aiCfg.model || 'gemini-2.5-flash',
+          'workspace',
+          {
+            audience_name: audName,
+            summary: sum,
+            channel_reach: analytics.channel_reach,
+            top_sources: analytics.top_sources,
+            top_ad_attribution: analytics.top_ad_attribution,
+            pipeline_stages: analytics.pipeline_stages,
+            engagement_tiers: analytics.engagement_tiers,
+          },
+          `Hãy phân tích ngắn gọn, sắc bén bằng tiếng Việt cho phân khúc khách hàng "${audName}": (1) Chân dung & chất lượng tệp, (2) Kênh tiếp cận tối ưu (Email/Zalo/Sale), (3) 3 hành động tăng tỷ lệ chuyển đổi ngay lập tức.`
+        );
+        if (aiOut && aiOut.success && aiOut.data?.plain_text && aiOut.data.plain_text.trim().length > 20) {
+          const text = aiOut.data.plain_text.trim();
+          aiMarkdown = text;
+          summaryText = text.split('\n').find((l) => l.trim().length > 20)?.replace(/^#+\s*/, '') || summaryText;
+          sourceMode = 'gemini_byok';
+        }
+      } catch {
+        // Graceful fallback to deterministic statistical insights
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        audience_id: audienceId,
+        audience_name: audName,
+        headline: `Chẩn đoán Tệp "${audName}" — Hạng ${qualityGrade}`,
+        summary: summaryText,
+        ai_markdown: aiMarkdown,
+        quality_grade: qualityGrade,
+        best_send_channel: bestChannel?.channel || 'Email Marketing',
+        strengths,
+        risks,
+        recommended_actions: recommendedActions,
+        source: sourceMode,
+        analyzed_at: new Date().toISOString(),
+        metrics: sum,
+      },
+    });
+  } catch (err: any) {
+    if (err?.message === 'AUDIENCE_NOT_FOUND') {
+      sendApiError(res, 404, 'AUDIENCE_NOT_FOUND', 'Không tìm thấy Phân khúc cần phân tích.');
+      return;
+    }
+    sendApiError(res, 500, 'AUDIENCE_AI_ANALYZE_FAILED', err?.message || 'Không thể phân tích AI phân khúc.');
   }
 });
 

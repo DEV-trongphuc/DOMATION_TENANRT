@@ -69,6 +69,9 @@ describe('Stage 4A Full-Clone Suite: WorkChat (Mascot Gate + Vault + Chat-to-Tas
 
     // Upgrade both tenants to Package 4 (`domation_promax`, `education_addon: false`, default `enable_ideas_mascot: false`)
     for (const t of [tenantA, tenantB]) {
+      await withTenantTransaction(t.id, async (client) => {
+        await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [t.id]);
+      });
       const up = await apiRequest(harness.baseUrl, '/api/v1/billing/switch-package', {
         method: 'POST',
         token: t.ownerToken,
@@ -106,14 +109,14 @@ describe('Stage 4A Full-Clone Suite: WorkChat (Mascot Gate + Vault + Chat-to-Tas
     }
   });
 
-  it('1. WorkChat enforces Mascot Gate (9 general packs + 12 work badges active, ideas pack hidden/403), Media Vault, Chat-to-Task, Multi-Reaction Feed & PersonalAccount', async () => {
+  it('1. WorkChat enforces Mascot Gate (10 general packs + 12 work badges active, ideas pack hidden/403), Media Vault, Chat-to-Task, Multi-Reaction Feed & PersonalAccount', async () => {
     const boot = await apiRequest(harness.baseUrl, '/api/v1/workchat/bootstrap', {
       token: tenantA.ownerToken,
       tenantSlug: tenantA.slug,
     });
     assert.equal(boot.status, 200);
     assert.equal(boot.json.data.enable_ideas_mascot, false);
-    assert.equal(boot.json.data.sticker_packs.length, 9, 'Must expose all 9 commercial sticker packs when enable_ideas_mascot=false');
+    assert.equal(boot.json.data.sticker_packs.length, 10, 'Must expose all 10 commercial sticker packs when enable_ideas_mascot=false');
     assert.ok(!boot.json.data.sticker_packs.some((p: any) => p.id === 'ideas'), 'Must hide ideas mascot pack by default');
     assert.equal(boot.json.data.work_status_badges.length, 12, 'Must expose all 12 corporate work-status badges');
 

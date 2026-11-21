@@ -260,3 +260,45 @@ export function maskContactPiiIfDisallowed<
     pii_masked: true,
   };
 }
+
+const EPHEMERAL_CDN_AVATAR_RE =
+  /(?:lookaside\.fbsbx\.com|platform-lookaside\.fbsbx\.com|\.fbcdn\.net|fbsbx\.com|scontent\.[^/]+\.fna\.fbcdn\.net|graph\.facebook\.com\/[^/]+\/picture|ava-talk\.zadn\.vn|\.zadn\.vn|\.zdn\.vn|avatar\.zaloapp\.com)/i;
+
+export function isEphemeralCdnAvatarUrl(val: unknown): boolean {
+  if (typeof val !== 'string') return false;
+  const trimmed = val.trim();
+  if (!trimmed) return false;
+  return EPHEMERAL_CDN_AVATAR_RE.test(trimmed);
+}
+
+export function sanitizeAvatarUrl(val: unknown): string | null {
+  if (typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!trimmed) return null;
+  if (isEphemeralCdnAvatarUrl(trimmed)) return null;
+  return trimmed;
+}
+
+export function stripEphemeralAvatarsFromCustomFields<T>(input: T, depth = 0): T {
+  if (!input || typeof input !== 'object' || depth > 4) return input;
+  if (Array.isArray(input)) {
+    return input.map((item) => stripEphemeralAvatarsFromCustomFields(item, depth + 1)) as unknown as T;
+  }
+  const obj = input as Record<string, unknown>;
+  let changed = false;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string' && /(avatar|profile_pic|photo_url|picture)/i.test(k) && isEphemeralCdnAvatarUrl(v)) {
+      changed = true;
+      continue;
+    }
+    if (v && typeof v === 'object') {
+      const cleanedChild = stripEphemeralAvatarsFromCustomFields(v, depth + 1);
+      if (cleanedChild !== v) changed = true;
+      out[k] = cleanedChild;
+    } else {
+      out[k] = v;
+    }
+  }
+  return (changed ? out : input) as T;
+}

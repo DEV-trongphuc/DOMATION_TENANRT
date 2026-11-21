@@ -32,6 +32,14 @@ export interface NormalizedFilterAst {
 }
 
 const SAFE_CUSTOM_KEY_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function parseFiniteNonNegInt(rawVal: unknown, max: number): number | null {
+  const rawStr = rawVal === undefined || rawVal === null ? '' : String(rawVal).trim();
+  const parsed = rawStr === '' ? 0 : Number(rawStr);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, Math.min(max, Math.floor(parsed)));
+}
 
 const STRING_COLUMNS_MAP: Record<string, string> = {
   name: 'l.name',
@@ -40,22 +48,24 @@ const STRING_COLUMNS_MAP: Record<string, string> = {
   phonenumber: 'l.phone',
   email: 'l.email',
   source: 'l.source',
-  campaign: 'l.campaign',
-  crm_campaign_name: 'l.campaign',
+  campaign: "COALESCE(NULLIF(l.custom_fields->>'utm_campaign', ''), NULLIF(l.campaign, ''), NULLIF(l.custom_fields->>'campaign_name', ''))",
+  utm_campaign: "COALESCE(NULLIF(l.custom_fields->>'utm_campaign', ''), NULLIF(l.campaign, ''), NULLIF(l.custom_fields->>'campaign_name', ''))",
+  crm_campaign_name: "COALESCE(NULLIF(l.custom_fields->>'utm_campaign', ''), NULLIF(l.campaign, ''), NULLIF(l.custom_fields->>'campaign_name', ''))",
   product_interest: 'l.product_interest',
   crm_program: 'l.product_interest',
   budget_range: 'l.budget_range',
-  utm_source: 'l.utm_source',
-  crm_platform: 'l.utm_source',
-  utm_medium: 'l.utm_medium',
-  utm_content: 'l.utm_content',
-  ad_id: 'l.ad_id',
-  crm_ad_name: 'l.ad_id',
-  adset_id: 'l.adset_id',
-  crm_adset_name: 'l.adset_id',
-  campaign_id: 'l.campaign_id',
-  form_id: 'l.form_id',
-  crm_form_name: 'l.form_id',
+  utm_source: "COALESCE(NULLIF(l.utm_source, ''), NULLIF(l.custom_fields->>'utm_source', ''))",
+  crm_platform: "COALESCE(NULLIF(l.utm_source, ''), NULLIF(l.custom_fields->>'utm_source', ''))",
+  utm_medium: "COALESCE(NULLIF(l.utm_medium, ''), NULLIF(l.custom_fields->>'utm_medium', ''))",
+  utm_content: "COALESCE(NULLIF(l.utm_content, ''), NULLIF(l.custom_fields->>'utm_content', ''))",
+  ad_id: "COALESCE(NULLIF(l.ad_id, ''), NULLIF(l.custom_fields->>'ad_id', ''), NULLIF(l.custom_fields->>'meta_ad_id', ''))",
+  adset_id: "COALESCE(NULLIF(l.adset_id, ''), NULLIF(l.custom_fields->>'adset_id', ''), NULLIF(l.custom_fields->>'meta_adset_id', ''))",
+  crm_adset_name: "COALESCE(NULLIF(l.custom_fields->>'adset_name', ''), NULLIF(l.custom_fields->>'meta_adset_name', ''), NULLIF(l.adset_id, ''))",
+  campaign_id: "COALESCE(NULLIF(l.campaign_id, ''), NULLIF(l.custom_fields->>'campaign_id', ''), NULLIF(l.custom_fields->>'meta_campaign_id', ''))",
+  form_id: "COALESCE(NULLIF(l.form_id, ''), NULLIF(l.custom_fields->>'form_id', ''))",
+  crm_form_name: "COALESCE(NULLIF(l.custom_fields->>'form_name', ''), NULLIF(l.custom_fields->>'meta_form_name', ''), NULLIF(l.form_id, ''))",
+  city: "COALESCE(NULLIF(l.custom_fields->>'city', ''), NULLIF(l.custom_fields->>'province', ''), NULLIF(l.custom_fields->>'tinh_thanh', ''), l.address)",
+  province: "COALESCE(NULLIF(l.custom_fields->>'province', ''), NULLIF(l.custom_fields->>'city', ''), NULLIF(l.custom_fields->>'tinh_thanh', ''), l.address)",
   status: 'l.status',
   lifecycle_stage: 'l.lifecycle_stage',
   email_consent: 'l.email_consent',
@@ -165,7 +175,7 @@ export function normalizeFilterBranchesAst(rawInput: unknown): NormalizedFilterA
               : [];
         const cleanRules = rawList.filter(isRuleLeaf).filter((r) => Boolean(r.field));
         if (cleanRules.length > 0) {
-          const opRaw = String(obj.operator || obj.match_mode || 'AND').toUpperCase();
+          const opRaw = String(obj.join || obj.operator || obj.match_mode || 'AND').toUpperCase();
           branches.push({
             join: opRaw === 'OR' || opRaw === 'ANY' ? 'OR' : 'AND',
             rules: cleanRules,
@@ -179,7 +189,7 @@ export function normalizeFilterBranchesAst(rawInput: unknown): NormalizedFilterA
   // Shape 2: Root Tree Object `{ operator, branches | groups | conditions | rules }`
   if (parsed && typeof parsed === 'object') {
     const obj = parsed as Record<string, unknown>;
-    const rootOpRaw = String(obj.operator || obj.match_mode || 'OR').toUpperCase();
+    const rootOpRaw = String(obj.rootJoin || obj.join || obj.operator || obj.match_mode || 'OR').toUpperCase();
     const rootJoin: 'OR' | 'AND' = rootOpRaw === 'AND' || rootOpRaw === 'ALL' ? 'AND' : 'OR';
 
     if (Array.isArray(obj.branches) || Array.isArray(obj.groups)) {
@@ -237,21 +247,23 @@ export function compileSegmentWhereSql(
     const fieldLower = rawField.toLowerCase();
     const op = String(rule.op || rule.operator || 'equals').trim().toLowerCase();
     const rawVal = rule.val !== undefined ? rule.val : rule.value;
-    const isNegated =
-      Boolean(rule.negate) ||
+    const ruleNegated = Boolean(rule.negate);
+    const baseOpNeg =
       op.startsWith('not_') ||
       op === 'neq' ||
       op === '!=' ||
       op === 'is_not' ||
       op === 'has_not_done';
+    const isNegated = baseOpNeg !== ruleNegated;
 
     // 1. Tag membership (`tag`, `tag_id`, `tag_slug`, `tags`)
     if (fieldLower === 'tag' || fieldLower === 'tag_id' || fieldLower === 'tag_slug' || fieldLower === 'tags') {
-      if (op === 'is_empty' || op === 'empty') {
-        return `NOT EXISTS (SELECT 1 FROM lead_tags lt WHERE lt.tenant_id = ${pTenant} AND lt.lead_id = l.id)`;
-      }
-      if (op === 'is_not_empty' || op === 'not_empty') {
-        return `EXISTS (SELECT 1 FROM lead_tags lt WHERE lt.tenant_id = ${pTenant} AND lt.lead_id = l.id)`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const effectiveEmpty = ruleNegated ? !wantEmpty : wantEmpty;
+        return effectiveEmpty
+          ? `NOT EXISTS (SELECT 1 FROM lead_tags lt WHERE lt.tenant_id = ${pTenant} AND lt.lead_id = l.id)`
+          : `EXISTS (SELECT 1 FROM lead_tags lt WHERE lt.tenant_id = ${pTenant} AND lt.lead_id = l.id)`;
       }
       const values = Array.isArray(rawVal)
         ? rawVal.map((v) => String(v || '').trim()).filter(Boolean)
@@ -273,42 +285,120 @@ export function compileSegmentWhereSql(
       return isNegated ? `NOT (${existsSql})` : existsSql;
     }
 
+    const compileNumericExpr = (numSqlExpr: string): string => {
+      if (op === 'between') {
+        const minVal = Number(rule.min ?? (Array.isArray(rawVal) ? rawVal[0] : 0));
+        const maxVal = Number(rule.max ?? (Array.isArray(rawVal) ? rawVal[1] : 0));
+        if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return '1 = 0';
+        const pMin = pushParam(minVal);
+        const pMax = pushParam(maxVal);
+        const expr = `(${numSqlExpr}) BETWEEN ${pMin} AND ${pMax}`;
+        return ruleNegated ? `NOT (${expr})` : expr;
+      }
+      const num = Number(rawVal);
+      if (!Number.isFinite(num)) return '1 = 0';
+      const pNum = pushParam(num);
+      const isNotEqOp = op === 'neq' || op === '!=' || op === 'not_equals' || op === 'is_not';
+      let baseExpr: string;
+      switch (op) {
+        case 'gt':
+        case '>':
+        case 'greater_than':
+          baseExpr = `(${numSqlExpr}) > ${pNum}`;
+          break;
+        case 'gte':
+        case '>=':
+          baseExpr = `(${numSqlExpr}) >= ${pNum}`;
+          break;
+        case 'lt':
+        case '<':
+        case 'less_than':
+          baseExpr = `(${numSqlExpr}) < ${pNum}`;
+          break;
+        case 'lte':
+        case '<=':
+          baseExpr = `(${numSqlExpr}) <= ${pNum}`;
+          break;
+        default:
+          baseExpr = `(${numSqlExpr}) = ${pNum}`;
+          break;
+      }
+      const wantNot = isNotEqOp !== ruleNegated;
+      return wantNot ? `NOT (${baseExpr})` : baseExpr;
+    };
+
+    const resolveBoolDesired = (): boolean => {
+      let baseBool: boolean;
+      if (op === 'is_false' || op === 'false' || op === 'is_empty' || op === 'empty') {
+        baseBool = false;
+      } else if (op === 'is_true' || op === 'true' || op === 'is_not_empty' || op === 'not_empty') {
+        baseBool = true;
+      } else {
+        const rawStr = rawVal === undefined ? 'true' : String(rawVal).trim().toLowerCase();
+        const valBool = !(rawVal === false || rawStr === 'false' || rawStr === '0' || rawStr === 'no');
+        const isNotEqOp = op === 'not_equals' || op === 'neq' || op === '!=' || op === 'is_not';
+        baseBool = isNotEqOp ? !valBool : valBool;
+      }
+      return ruleNegated ? !baseBool : baseBool;
+    };
+
     // 2. Audience / Static List membership (`in_audience`, `audience_id`, `list`)
     if (fieldLower === 'in_audience' || fieldLower === 'audience_id' || fieldLower === 'list') {
-      const targetAudId = String(rawVal || '').trim();
-      if (!targetAudId) return '1 = 0';
-      const pAud = pushParam(targetAudId);
+      const audIds = Array.isArray(rawVal)
+        ? rawVal.map((v) => String(v || '').trim()).filter(Boolean)
+        : String(rawVal || '')
+            .split(',')
+            .map((v) => v.trim())
+            .filter(Boolean);
+      if (audIds.length === 0) return '1 = 0';
+      const audChecks = audIds.map((aid) => `tam.audience_id::text = ${pushParam(aid)}`).join(' OR ');
       const existsSql = `EXISTS (
         SELECT 1 FROM tenant_audience_members tam
-        WHERE tam.tenant_id = ${pTenant} AND tam.audience_id::text = ${pAud} AND tam.lead_id = l.id
+        WHERE tam.tenant_id = ${pTenant} AND (${audChecks}) AND tam.lead_id = l.id
       )`;
-      return isNegated || op === 'not_in_list' ? `NOT (${existsSql})` : existsSql;
+      return isNegated ? `NOT (${existsSql})` : existsSql;
     }
 
     // 2b. CRM Stage ID / Key / Name (`crm_stage_id`, `crm_stage_is`)
     if (fieldLower === 'crm_stage_id' || fieldLower === 'crm_stage_is') {
-      if (op === 'is_empty' || op === 'empty') return 'l.stage_id IS NULL';
-      if (op === 'is_not_empty' || op === 'not_empty') return 'l.stage_id IS NOT NULL';
-      const strVal = String(rawVal ?? '').trim();
-      if (!strVal) return '1 = 0';
-      const pSt = pushParam(strVal);
-      const matchSql = `(l.stage_id::text = ${pSt} OR LOWER(COALESCE(s.stage_key, '')) = LOWER(${pSt}) OR LOWER(COALESCE(s.stage_name, '')) = LOWER(${pSt}))`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? 'l.stage_id IS NULL' : 'l.stage_id IS NOT NULL';
+      }
+      const items = Array.isArray(rawVal)
+        ? rawVal.map((v) => String(v ?? '').trim()).filter(Boolean)
+        : String(rawVal ?? '')
+            .split(',')
+            .map((v) => v.trim())
+            .filter(Boolean);
+      if (items.length === 0) return '1 = 0';
+      const checks = items
+        .map((stVal) => {
+          const pSt = pushParam(stVal);
+          return `(COALESCE(l.stage_id::text, '') = ${pSt} OR LOWER(COALESCE(s.stage_key, '')) = LOWER(${pSt}) OR LOWER(COALESCE(s.stage_name, '')) = LOWER(${pSt}))`;
+        })
+        .join(' OR ');
+      const matchSql = `(${checks})`;
       return isNegated ? `NOT (${matchSql})` : matchSql;
     }
 
     // 2c. CRM Lead Status (`crm_lead_status`)
     if (fieldLower === 'crm_lead_status') {
-      if (op === 'is_empty' || op === 'empty') return "(l.status IS NULL OR TRIM(l.status) = '')";
-      if (op === 'is_not_empty' || op === 'not_empty') return "(l.status IS NOT NULL AND TRIM(l.status) != '')";
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        return (ruleNegated ? !wantEmpty : wantEmpty)
+          ? "(l.status IS NULL OR TRIM(l.status) = '')"
+          : "(l.status IS NOT NULL AND TRIM(l.status) != '')";
+      }
       const valLower = String(rawVal ?? '').trim().toLowerCase();
       if (!valLower) return '1 = 0';
       let matchSql: string;
       if (valLower === 'active') {
-        matchSql = `l.status IN ('assigned', 'unassigned_pending')`;
+        matchSql = `COALESCE(l.status, '') IN ('assigned', 'unassigned_pending')`;
       } else if (valLower === 'nurture') {
-        matchSql = `l.status = 'marketing_nurture'`;
+        matchSql = `COALESCE(l.status, '') = 'marketing_nurture'`;
       } else if (valLower === 'lost') {
-        matchSql = `(l.status IN ('archived', 'rejected', 'blacklisted') OR COALESCE(s.is_lost_stage, false) = true)`;
+        matchSql = `(COALESCE(l.status, '') IN ('archived', 'rejected', 'blacklisted') OR COALESCE(s.is_lost_stage, false) = true)`;
       } else {
         const pSt = pushParam(valLower);
         matchSql = `(LOWER(COALESCE(l.status, '')) = LOWER(${pSt}) OR LOWER(COALESCE(l.lifecycle_stage, '')) = LOWER(${pSt}))`;
@@ -322,9 +412,9 @@ export function compileSegmentWhereSql(
       if (!valLower) return '1 = 0';
       let matchSql: string;
       if (valLower === 'hot') {
-        matchSql = `(LOWER(COALESCE(l.custom_fields->>'temperature', '')) = 'hot' OR LOWER(COALESCE(l.quality_status, '')) IN ('hot', 'good', 'qualified') OR l.lead_score >= 70)`;
+        matchSql = `(LOWER(COALESCE(l.custom_fields->>'temperature', '')) = 'hot' OR LOWER(COALESCE(l.quality_status, '')) IN ('hot', 'good', 'qualified') OR COALESCE(l.lead_score, 0) >= 70)`;
       } else if (valLower === 'warm') {
-        matchSql = `(LOWER(COALESCE(l.custom_fields->>'temperature', '')) = 'warm' OR LOWER(COALESCE(l.quality_status, '')) IN ('warm', 'pending') OR (l.lead_score >= 30 AND l.lead_score < 70))`;
+        matchSql = `(LOWER(COALESCE(l.custom_fields->>'temperature', '')) = 'warm' OR LOWER(COALESCE(l.quality_status, '')) IN ('warm', 'pending') OR (COALESCE(l.lead_score, 0) >= 30 AND COALESCE(l.lead_score, 0) < 70))`;
       } else if (valLower === 'cold') {
         matchSql = `(LOWER(COALESCE(l.custom_fields->>'temperature', '')) = 'cold' OR LOWER(COALESCE(l.quality_status, '')) IN ('cold', 'bad_timing', 'no_answer', 'disqualified', 'junk'))`;
       } else {
@@ -338,11 +428,11 @@ export function compileSegmentWhereSql(
     if (fieldLower === 'crm_team_id' || fieldLower === 'crm_branch_id') {
       const targetId = String(rawVal ?? '').trim();
       const colName = fieldLower === 'crm_team_id' ? 'team_id' : 'branch_id';
-      if (op === 'is_empty' || op === 'empty') {
-        return `(l.assigned_to IS NULL OR NOT EXISTS (SELECT 1 FROM users u_org WHERE u_org.tenant_id = ${pTenant} AND u_org.id = l.assigned_to AND u_org.${colName} IS NOT NULL))`;
-      }
-      if (op === 'is_not_empty' || op === 'not_empty') {
-        return `EXISTS (SELECT 1 FROM users u_org WHERE u_org.tenant_id = ${pTenant} AND u_org.id = l.assigned_to AND u_org.${colName} IS NOT NULL)`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        return (ruleNegated ? !wantEmpty : wantEmpty)
+          ? `(l.assigned_to IS NULL OR NOT EXISTS (SELECT 1 FROM users u_org WHERE u_org.tenant_id = ${pTenant} AND u_org.id = l.assigned_to AND u_org.${colName} IS NOT NULL))`
+          : `EXISTS (SELECT 1 FROM users u_org WHERE u_org.tenant_id = ${pTenant} AND u_org.id = l.assigned_to AND u_org.${colName} IS NOT NULL)`;
       }
       if (!targetId) return '1 = 0';
       const pOrg = pushParam(targetId);
@@ -356,23 +446,325 @@ export function compileSegmentWhereSql(
     // 2f. Contact Presence Booleans (`has_email`, `has_phone`)
     if (fieldLower === 'has_email' || fieldLower === 'has_phone') {
       const col = fieldLower === 'has_email' ? 'l.email' : 'l.phone';
-      const hasExpr = `(${col} IS NOT NULL AND TRIM(${col}) != '')`;
-      const wantEmpty =
-        op === 'is_empty' ||
-        op === 'empty' ||
-        op === 'is_false' ||
-        rawVal === false ||
-        String(rawVal).toLowerCase() === 'false';
-      const finalEmpty = isNegated ? !wantEmpty : wantEmpty;
-      return finalEmpty ? `NOT ${hasExpr}` : hasExpr;
+      let baseHas: boolean;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_false') {
+        baseHas = false;
+      } else if (op === 'is_not_empty' || op === 'not_empty' || op === 'is_true') {
+        baseHas = true;
+      } else {
+        const valBool =
+          rawVal === undefined
+            ? true
+            : !(rawVal === false || String(rawVal).toLowerCase() === 'false' || String(rawVal) === '0');
+        const isNotEqOp = op === 'not_equals' || op === 'neq' || op === '!=' || op === 'is_not';
+        baseHas = isNotEqOp ? !valBool : valBool;
+      }
+      const finalHas = ruleNegated ? !baseHas : baseHas;
+      return finalHas ? `(${col} IS NOT NULL AND TRIM(${col}) != '')` : `(${col} IS NULL OR TRIM(${col}) = '')`;
     }
 
-    // 2g. Owner convenience empty checks (`crm_owner_id`, `salesperson`, `assigned_to`)
+    // 2g. Owner / Round convenience empty checks (`crm_owner_id`, `salesperson`, `assigned_to`, `round_id`)
     if (
       (fieldLower === 'crm_owner_id' || fieldLower === 'salesperson' || fieldLower === 'assigned_to' || fieldLower === 'crm_assigned_to') &&
       (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty')
     ) {
-      return op === 'is_empty' || op === 'empty' ? 'l.assigned_to IS NULL' : 'l.assigned_to IS NOT NULL';
+      const wantEmpty = op === 'is_empty' || op === 'empty';
+      return (ruleNegated ? !wantEmpty : wantEmpty) ? 'l.assigned_to IS NULL' : 'l.assigned_to IS NOT NULL';
+    }
+    if (fieldLower === 'round_id' && (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty')) {
+      const wantEmpty = op === 'is_empty' || op === 'empty';
+      return (ruleNegated ? !wantEmpty : wantEmpty) ? 'l.round_id IS NULL' : 'l.round_id IS NOT NULL';
+    }
+
+    // 2h. Gender with EN/VI normalization (`gender`)
+    if (fieldLower === 'gender') {
+      const gExpr = `COALESCE(NULLIF(l.custom_fields->>'gender', ''), NULLIF(l.custom_fields->>'gioi_tinh', ''))`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        return (ruleNegated ? !wantEmpty : wantEmpty)
+          ? `(${gExpr} IS NULL OR TRIM(${gExpr}) = '')`
+          : `(${gExpr} IS NOT NULL AND TRIM(${gExpr}) != '')`;
+      }
+      const vLow = String(rawVal ?? '').trim().toLowerCase();
+      if (!vLow) return '1 = 0';
+      let matchSql: string;
+      if (vLow === 'male' || vLow === 'nam' || vLow === 'm') {
+        matchSql = `LOWER(COALESCE(${gExpr}, '')) IN ('male', 'nam', 'm')`;
+      } else if (vLow === 'female' || vLow === 'nu' || vLow === 'nữ' || vLow === 'f') {
+        matchSql = `LOWER(COALESCE(${gExpr}, '')) IN ('female', 'nu', 'nữ', 'f')`;
+      } else if (vLow === 'other' || vLow === 'khac' || vLow === 'khác') {
+        matchSql = `LOWER(COALESCE(${gExpr}, '')) IN ('other', 'khac', 'khác')`;
+      } else {
+        const pG = pushParam(vLow);
+        matchSql = `LOWER(COALESCE(${gExpr}, '')) = LOWER(${pG})`;
+      }
+      return isNegated ? `NOT (${matchSql})` : matchSql;
+    }
+
+    // 2i. Lead Value (`lead_value`) — total_revenue_vnd or numeric custom_fields.lead_value
+    if (fieldLower === 'lead_value') {
+      const valExpr = `GREATEST(COALESCE(l.total_revenue_vnd, 0), CASE WHEN COALESCE(l.custom_fields->>'lead_value', '') ~ '^-?[0-9]+([.][0-9]+)?$' THEN CAST(l.custom_fields->>'lead_value' AS DECIMAL(20,2)) ELSE 0 END)`;
+      return compileNumericExpr(valExpr);
+    }
+
+    // 2j. CRM Deals (`has_deal`, `deal_stage`, `erp_deal_status`, `deal_value`)
+    if (fieldLower === 'has_deal') {
+      const wantHas = resolveBoolDesired();
+      const existsSql = `EXISTS (SELECT 1 FROM tenant_deals d WHERE d.tenant_id = ${pTenant} AND d.lead_id = l.id)`;
+      return wantHas ? existsSql : `NOT (${existsSql})`;
+    }
+    if (fieldLower === 'deal_stage' || fieldLower === 'erp_deal_status') {
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const existsAny = `EXISTS (SELECT 1 FROM tenant_deals d WHERE d.tenant_id = ${pTenant} AND d.lead_id = l.id)`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${existsAny})` : existsAny;
+      }
+      const items = Array.isArray(rawVal)
+        ? rawVal.map((v) => String(v ?? '').trim().toLowerCase()).filter(Boolean)
+        : String(rawVal ?? '')
+            .split(',')
+            .map((v) => v.trim().toLowerCase())
+            .filter(Boolean);
+      if (items.length === 0) return '1 = 0';
+      if (items.length === 1 && items[0] === 'no_deal') {
+        const existsAny = `EXISTS (SELECT 1 FROM tenant_deals d WHERE d.tenant_id = ${pTenant} AND d.lead_id = l.id)`;
+        return isNegated ? existsAny : `NOT (${existsAny})`;
+      }
+      if (items.length === 1 && items[0] === 'open') {
+        const existsOpen = `EXISTS (SELECT 1 FROM tenant_deals d WHERE d.tenant_id = ${pTenant} AND d.lead_id = l.id AND LOWER(d.stage) NOT IN ('won', 'lost'))`;
+        return isNegated ? `NOT (${existsOpen})` : existsOpen;
+      }
+      const pList = items.map((st) => `LOWER(${pushParam(st)})`).join(', ');
+      const existsStage = `EXISTS (SELECT 1 FROM tenant_deals d WHERE d.tenant_id = ${pTenant} AND d.lead_id = l.id AND LOWER(d.stage) IN (${pList}))`;
+      return isNegated ? `NOT (${existsStage})` : existsStage;
+    }
+    if (fieldLower === 'deal_value') {
+      const dealSumExpr = `COALESCE((SELECT SUM(d.amount_vnd) FROM tenant_deals d WHERE d.tenant_id = ${pTenant} AND d.lead_id = l.id AND LOWER(d.stage) != 'lost'), 0)`;
+      return compileNumericExpr(dealSumExpr);
+    }
+
+    // 2k. Meta / Ad Attribution (`ad_name`, `crm_ad_name`, `fbclid_present`)
+    if (fieldLower === 'ad_name' || fieldLower === 'crm_ad_name') {
+      const cfAdName = `COALESCE(NULLIF(l.custom_fields->>'ad_name', ''), NULLIF(l.custom_fields->>'meta_ad_name', ''))`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const hasNameSql = `(${cfAdName} IS NOT NULL OR EXISTS (SELECT 1 FROM meta_ads_insights mai WHERE mai.tenant_id = ${pTenant} AND mai.ad_id = l.ad_id AND mai.ad_name IS NOT NULL AND TRIM(mai.ad_name) != ''))`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${hasNameSql})` : hasNameSql;
+      }
+      const strVal = String(rawVal ?? '').trim();
+      if (!strVal) return '1 = 0';
+      let matchSql: string;
+      if (op === 'contains' || op === 'not_contains' || op === 'notcontains') {
+        const pLike = pushParam(`%${strVal}%`);
+        matchSql = `(COALESCE(${cfAdName}, '') ILIKE ${pLike} OR EXISTS (SELECT 1 FROM meta_ads_insights mai WHERE mai.tenant_id = ${pTenant} AND mai.ad_id = l.ad_id AND COALESCE(mai.ad_name, '') ILIKE ${pLike}))`;
+      } else {
+        const pEq = pushParam(strVal);
+        matchSql = `(LOWER(COALESCE(${cfAdName}, '')) = LOWER(${pEq}) OR EXISTS (SELECT 1 FROM meta_ads_insights mai WHERE mai.tenant_id = ${pTenant} AND mai.ad_id = l.ad_id AND LOWER(COALESCE(mai.ad_name, '')) = LOWER(${pEq})))`;
+      }
+      return isNegated ? `NOT (${matchSql})` : matchSql;
+    }
+    if (fieldLower === 'fbclid_present') {
+      const wantPresent = resolveBoolDesired();
+      const presentSql = `(NULLIF(TRIM(COALESCE(l.fbclid, '')), '') IS NOT NULL OR NULLIF(TRIM(COALESCE(l.fbc, '')), '') IS NOT NULL OR NULLIF(TRIM(COALESCE(l.custom_fields->>'fbclid', '')), '') IS NOT NULL)`;
+      return wantPresent ? presentSql : `NOT (${presentSql})`;
+    }
+
+    // 2l. Email / Campaign / Suppression / Flow Behavior (`opened_campaign`, `clicked_campaign`, `email_open_count`, `email_click_count`, `is_suppressed`, `in_flow`, `completed_flow`)
+    if (fieldLower === 'opened_campaign' || fieldLower === 'clicked_campaign') {
+      const tsCol = fieldLower === 'clicked_campaign' ? 'sc.clicked_at' : 'sc.opened_at';
+      const valStr = String(rawVal ?? '').trim();
+      const hasSpecific = Boolean(valStr) && !['any', 'true', 'false', '1', '0'].includes(valStr.toLowerCase());
+      let campFilter = '';
+      if (hasSpecific) {
+        const pCamp = pushParam(valStr);
+        const pLike = pushParam(`%${valStr}%`);
+        campFilter = ` AND (sc.campaign_id::text = ${pCamp} OR LOWER(COALESCE(c.name, '')) = LOWER(${pCamp}) OR COALESCE(c.name, '') ILIKE ${pLike})`;
+      }
+      const existsSql = `EXISTS (
+        SELECT 1 FROM mkt_send_claims sc
+        LEFT JOIN mkt_campaigns c ON c.tenant_id = sc.tenant_id AND c.id = sc.campaign_id
+        WHERE sc.tenant_id = ${pTenant} AND sc.lead_id = l.id AND ${tsCol} IS NOT NULL${campFilter}
+      )`;
+      const baseNeg = baseOpNeg || rawVal === false || valStr.toLowerCase() === 'false';
+      const wantNeg = baseNeg !== ruleNegated;
+      return wantNeg ? `NOT (${existsSql})` : existsSql;
+    }
+    if (fieldLower === 'email_open_count' || fieldLower === 'email_click_count') {
+      const isClick = fieldLower === 'email_click_count';
+      const tsCol = isClick ? 'sc.clicked_at' : 'sc.opened_at';
+      const evtA = pushParam(isClick ? 'email_clicked' : 'email_opened');
+      const evtB = pushParam(isClick ? 'mkt_email_click' : 'mkt_email_open');
+      const cntExpr = `GREATEST(
+        (SELECT COUNT(*) FROM mkt_send_claims sc WHERE sc.tenant_id = ${pTenant} AND sc.lead_id = l.id AND ${tsCol} IS NOT NULL),
+        (SELECT COUNT(*) FROM lead_timeline_events te WHERE te.tenant_id = ${pTenant} AND te.lead_id = l.id AND te.event_type IN (${evtA}, ${evtB}))
+      )`;
+      return compileNumericExpr(cntExpr);
+    }
+    if (fieldLower === 'is_suppressed') {
+      const wantSuppressed = resolveBoolDesired();
+      const supSql = `(COALESCE(l.email_consent, 'subscribed') IN ('unsubscribed', 'bounced', 'complained') OR EXISTS (
+        SELECT 1 FROM mkt_suppression_list ms
+        WHERE ms.tenant_id = ${pTenant}
+          AND (
+            (l.email IS NOT NULL AND LOWER(ms.recipient) = LOWER(l.email))
+            OR (l.phone IS NOT NULL AND ms.recipient = l.phone)
+          )
+      ))`;
+      return wantSuppressed ? supSql : `NOT (${supSql})`;
+    }
+    if (fieldLower === 'in_flow' || fieldLower === 'completed_flow') {
+      const statusFilter =
+        fieldLower === 'completed_flow'
+          ? `fe.status = 'completed'`
+          : `fe.status IN ('active', 'waiting', 'running')`;
+      const valStr = String(rawVal ?? '').trim();
+      const hasSpecific = Boolean(valStr) && !['any', 'true', 'false', '1', '0'].includes(valStr.toLowerCase());
+      let flowFilter = '';
+      if (hasSpecific) {
+        const pFlow = pushParam(valStr);
+        const pLike = pushParam(`%${valStr}%`);
+        flowFilter = ` AND (fe.flow_id::text = ${pFlow} OR LOWER(COALESCE(f.name, '')) = LOWER(${pFlow}) OR COALESCE(f.name, '') ILIKE ${pLike})`;
+      }
+      const existsSql = `EXISTS (
+        SELECT 1 FROM mkt_flow_enrollments fe
+        LEFT JOIN mkt_flows f ON f.tenant_id = fe.tenant_id AND f.id = fe.flow_id
+        WHERE fe.tenant_id = ${pTenant} AND fe.lead_id = l.id AND ${statusFilter}${flowFilter}
+      )`;
+      const baseNeg = baseOpNeg || rawVal === false || valStr.toLowerCase() === 'false';
+      const wantNeg = baseNeg !== ruleNegated;
+      return wantNeg ? `NOT (${existsSql})` : existsSql;
+    }
+
+    // 2m. Web Behavior Tracking (`web_visited_url`, `web_clicked_cta`, `web_max_scroll_pct`, `web_active_duration_sec`, `web_pricing_intent`, `web_device_type`)
+    if (fieldLower === 'web_visited_url' || fieldLower === 'web_activity') {
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const anyWeb = `(EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id) OR EXISTS (SELECT 1 FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id))`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${anyWeb})` : anyWeb;
+      }
+      const urlVal = String(rawVal ?? '').trim();
+      if (!urlVal) return '1 = 0';
+      const isExact = op === 'equals' || op === 'is' || op === '=' || op === 'not_equals' || op === 'neq' || op === '!=' || op === 'is_not';
+      let matchSql: string;
+      if (isExact) {
+        const pUrl = pushParam(urlVal);
+        matchSql = `(EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id AND LOWER(COALESCE(we.page_url, '')) = LOWER(${pUrl})) OR EXISTS (SELECT 1 FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id AND (LOWER(COALESCE(ws.entry_url, '')) = LOWER(${pUrl}) OR LOWER(COALESCE(ws.last_url, '')) = LOWER(${pUrl}))))`;
+      } else {
+        const pattern = op === 'starts_with' ? `${urlVal}%` : op === 'ends_with' ? `%${urlVal}` : `%${urlVal}%`;
+        const pLike = pushParam(pattern);
+        matchSql = `(EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id AND COALESCE(we.page_url, '') ILIKE ${pLike}) OR EXISTS (SELECT 1 FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id AND (COALESCE(ws.entry_url, '') ILIKE ${pLike} OR COALESCE(ws.last_url, '') ILIKE ${pLike})))`;
+      }
+      return isNegated ? `NOT (${matchSql})` : matchSql;
+    }
+    if (fieldLower === 'web_clicked_cta') {
+      const ctaClickTypes = `we.event_type IN ('click', 'cta_click', 'web_click')`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const anyClick = `EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id AND ${ctaClickTypes})`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${anyClick})` : anyClick;
+      }
+      const ctaVal = String(rawVal ?? '').trim();
+      const isAny = !ctaVal || ['any', 'true', '1'].includes(ctaVal.toLowerCase());
+      let existsSql: string;
+      if (isAny) {
+        existsSql = `EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id AND ${ctaClickTypes})`;
+      } else {
+        const isExact = op === 'equals' || op === 'is' || op === '=' || op === 'not_equals' || op === 'neq' || op === '!=' || op === 'is_not';
+        const pMatch = pushParam(isExact ? ctaVal : `%${ctaVal}%`);
+        const cmpSql = isExact
+          ? `(LOWER(COALESCE(we.element_selector, '')) = LOWER(${pMatch}) OR LOWER(COALESCE(we.metadata->>'cta_text', '')) = LOWER(${pMatch}) OR LOWER(COALESCE(we.metadata->>'text', '')) = LOWER(${pMatch}) OR LOWER(COALESCE(we.metadata->>'label', '')) = LOWER(${pMatch}) OR LOWER(COALESCE(we.metadata->>'element_text', '')) = LOWER(${pMatch}) OR LOWER(COALESCE(we.metadata->>'button_text', '')) = LOWER(${pMatch}))`
+          : `(COALESCE(we.element_selector, '') ILIKE ${pMatch} OR COALESCE(we.metadata->>'cta_text', '') ILIKE ${pMatch} OR COALESCE(we.metadata->>'text', '') ILIKE ${pMatch} OR COALESCE(we.metadata->>'label', '') ILIKE ${pMatch} OR COALESCE(we.metadata->>'element_text', '') ILIKE ${pMatch} OR COALESCE(we.metadata->>'button_text', '') ILIKE ${pMatch} OR COALESCE(we.metadata->>'href', '') ILIKE ${pMatch})`;
+        existsSql = `EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id AND ${ctaClickTypes} AND ${cmpSql})`;
+      }
+      return isNegated ? `NOT (${existsSql})` : existsSql;
+    }
+    if (fieldLower === 'web_max_scroll_pct') {
+      const scrollExpr = `COALESCE((SELECT MAX(COALESCE(we.scroll_depth_pct, CASE WHEN COALESCE(we.metadata->>'max_scroll_pct', '') ~ '^[0-9]+$' THEN CAST(we.metadata->>'max_scroll_pct' AS INTEGER) ELSE NULL END, 0)) FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id), 0)`;
+      return compileNumericExpr(scrollExpr);
+    }
+    if (fieldLower === 'web_active_duration_sec') {
+      const durExpr = `COALESCE((SELECT SUM(COALESCE(ws.duration_seconds, 0)) FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id), 0)`;
+      return compileNumericExpr(durExpr);
+    }
+    if (fieldLower === 'web_pricing_intent') {
+      const wantIntent = resolveBoolDesired();
+      const intentSql = `(EXISTS (SELECT 1 FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id AND ws.pricing_intent_detected = true) OR EXISTS (SELECT 1 FROM mkt_web_events we WHERE we.tenant_id = ${pTenant} AND we.lead_id = l.id AND we.event_type = 'pricing_intent'))`;
+      return wantIntent ? intentSql : `NOT (${intentSql})`;
+    }
+    if (fieldLower === 'web_device_type' || fieldLower === 'device') {
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const hasDev = `EXISTS (SELECT 1 FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id AND ws.device_type IS NOT NULL AND TRIM(ws.device_type) != '')`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${hasDev})` : hasDev;
+      }
+      const items = Array.isArray(rawVal)
+        ? rawVal.map((v) => String(v ?? '').trim().toLowerCase()).filter(Boolean)
+        : String(rawVal ?? '')
+            .split(',')
+            .map((v) => v.trim().toLowerCase())
+            .filter(Boolean);
+      if (items.length === 0) return '1 = 0';
+      const pList = items.map((d) => `LOWER(${pushParam(d)})`).join(', ');
+      const existsSql = `EXISTS (SELECT 1 FROM mkt_web_sessions ws WHERE ws.tenant_id = ${pTenant} AND ws.lead_id = l.id AND LOWER(COALESCE(ws.device_type, '')) IN (${pList}))`;
+      return isNegated ? `NOT (${existsSql})` : existsSql;
+    }
+
+    // 2n. Survey, NPS, Voucher & Social (`survey_score`, `nps_category`, `voucher_claimed`, `social_channel`)
+    if (fieldLower === 'survey_score') {
+      const maxSurveyScoreExpr = `COALESCE((SELECT MAX(sr.quiz_score) FROM mkt_survey_responses sr WHERE sr.tenant_id = ${pTenant} AND sr.lead_id = l.id), 0)`;
+      return compileNumericExpr(maxSurveyScoreExpr);
+    }
+    if (fieldLower === 'nps_category') {
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const hasNps = `EXISTS (SELECT 1 FROM mkt_survey_responses sr WHERE sr.tenant_id = ${pTenant} AND sr.lead_id = l.id AND sr.nps_score IS NOT NULL)`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${hasNps})` : hasNps;
+      }
+      const cat = String(rawVal ?? '').trim().toLowerCase();
+      let rangeSql = '';
+      if (cat === 'promoter' || cat === 'promoters') rangeSql = 'sr.nps_score >= 9';
+      else if (cat === 'passive' || cat === 'passives') rangeSql = 'sr.nps_score BETWEEN 7 AND 8';
+      else if (cat === 'detractor' || cat === 'detractors') rangeSql = 'sr.nps_score <= 6';
+      else return '1 = 0';
+      const existsSql = `EXISTS (SELECT 1 FROM mkt_survey_responses sr WHERE sr.tenant_id = ${pTenant} AND sr.lead_id = l.id AND sr.nps_score IS NOT NULL AND ${rangeSql})`;
+      return isNegated ? `NOT (${existsSql})` : existsSql;
+    }
+    if (fieldLower === 'voucher_claimed') {
+      const valStr = String(rawVal ?? '').trim();
+      const hasSpecific = Boolean(valStr) && !['any', 'true', 'false', '1', '0'].includes(valStr.toLowerCase());
+      let existsSql: string;
+      if (hasSpecific) {
+        const pV = pushParam(valStr);
+        const pLike = pushParam(`%${valStr}%`);
+        existsSql = `EXISTS (
+          SELECT 1 FROM mkt_voucher_codes vc
+          LEFT JOIN mkt_voucher_campaigns vcamp ON vcamp.tenant_id = vc.tenant_id AND vcamp.id = vc.voucher_campaign_id
+          WHERE vc.tenant_id = ${pTenant} AND vc.lead_id = l.id
+            AND (vc.voucher_campaign_id::text = ${pV} OR LOWER(COALESCE(vc.code, '')) = LOWER(${pV}) OR COALESCE(vcamp.name, '') ILIKE ${pLike})
+        )`;
+      } else {
+        existsSql = `(EXISTS (SELECT 1 FROM mkt_voucher_codes vc WHERE vc.tenant_id = ${pTenant} AND vc.lead_id = l.id) OR EXISTS (SELECT 1 FROM lead_timeline_events te WHERE te.tenant_id = ${pTenant} AND te.lead_id = l.id AND te.event_type IN ('voucher_claimed', 'voucher_redeemed', 'voucher_issued')))`;
+      }
+      const baseNeg = baseOpNeg || rawVal === false || valStr.toLowerCase() === 'false';
+      const wantNeg = baseNeg !== ruleNegated;
+      return wantNeg ? `NOT (${existsSql})` : existsSql;
+    }
+    if (fieldLower === 'social_channel') {
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        const hasSoc = `EXISTS (SELECT 1 FROM mkt_social_conversations sc WHERE sc.tenant_id = ${pTenant} AND sc.lead_id = l.id)`;
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `NOT (${hasSoc})` : hasSoc;
+      }
+      const items = Array.isArray(rawVal)
+        ? rawVal.map((v) => String(v ?? '').trim().toLowerCase()).filter(Boolean)
+        : String(rawVal ?? '')
+            .split(',')
+            .map((v) => v.trim().toLowerCase())
+            .filter(Boolean);
+      if (items.length === 0) return '1 = 0';
+      const pList = items.map((ch) => `LOWER(${pushParam(ch)})`).join(', ');
+      const existsSql = `EXISTS (SELECT 1 FROM mkt_social_conversations sc WHERE sc.tenant_id = ${pTenant} AND sc.lead_id = l.id AND LOWER(COALESCE(sc.channel, '')) IN (${pList}))`;
+      return isNegated ? `NOT (${existsSql})` : existsSql;
     }
 
     // 3. Relative Inactivity / Age Days (`inactive_days`, `lastActivityDays`, `days_since_engaged`, `days_since_created`, `crm_hours_uncontacted`)
@@ -383,7 +775,8 @@ export function compileSegmentWhereSql(
       fieldLower === 'days_since_created' ||
       fieldLower === 'crm_hours_uncontacted'
     ) {
-      const safeNum = Math.max(0, Math.min(87_600, Math.floor(Number(rawVal || 0))));
+      const safeNum = parseFiniteNonNegInt(rawVal, 87_600);
+      if (safeNum === null) return '1 = 0';
       const isHours = fieldLower === 'crm_hours_uncontacted';
       const colExpr =
         fieldLower === 'days_since_created'
@@ -394,11 +787,13 @@ export function compileSegmentWhereSql(
       const thresholdExpr = isHours
         ? `(clock_timestamp() - INTERVAL '${safeNum} hours')`
         : `(clock_timestamp() - INTERVAL '${safeNum} days')`;
-      if (op === 'gt' || op === '>' || op === 'greater_than' || op === 'not_in_the_last') return `${colExpr} < ${thresholdExpr}`;
-      if (op === 'gte' || op === '>=') return `${colExpr} <= ${thresholdExpr}`;
-      if (op === 'lt' || op === '<' || op === 'less_than' || op === 'in_the_last') return `${colExpr} > ${thresholdExpr}`;
-      if (op === 'lte' || op === '<=') return `${colExpr} >= ${thresholdExpr}`;
-      return `${colExpr} <= ${thresholdExpr}`;
+      let baseExpr: string;
+      if (op === 'gt' || op === '>' || op === 'greater_than' || op === 'not_in_the_last') baseExpr = `${colExpr} < ${thresholdExpr}`;
+      else if (op === 'gte' || op === '>=') baseExpr = `${colExpr} <= ${thresholdExpr}`;
+      else if (op === 'lt' || op === '<' || op === 'less_than' || op === 'in_the_last') baseExpr = `${colExpr} > ${thresholdExpr}`;
+      else if (op === 'lte' || op === '<=') baseExpr = `${colExpr} >= ${thresholdExpr}`;
+      else baseExpr = `${colExpr} <= ${thresholdExpr}`;
+      return ruleNegated ? `NOT (${baseExpr})` : baseExpr;
     }
 
     // 3b. Date Columns (`created_at`, `crm_created_at`, `joinedAt`, `lastActivity`)
@@ -409,22 +804,30 @@ export function compileSegmentWhereSql(
       fieldLower === 'lastactivity'
     ) {
       const colExpr = fieldLower === 'lastactivity' ? 'COALESCE(l.last_engaged_at, l.updated_at, l.created_at)' : 'l.created_at';
-      if (op === 'is_empty' || op === 'empty') return `${colExpr} IS NULL`;
-      if (op === 'is_not_empty' || op === 'not_empty') return `${colExpr} IS NOT NULL`;
+      if (op === 'is_empty' || op === 'empty' || op === 'is_not_empty' || op === 'not_empty') {
+        const wantEmpty = op === 'is_empty' || op === 'empty';
+        return (ruleNegated ? !wantEmpty : wantEmpty) ? `${colExpr} IS NULL` : `${colExpr} IS NOT NULL`;
+      }
+      const wrapDate = (expr: string): string => (ruleNegated ? `(${colExpr} IS NULL OR NOT (${expr}))` : expr);
       if (op === 'within_days' || op === 'in_the_last') {
-        const d = Math.max(0, Math.min(36_500, Math.floor(Number(rawVal || 0))));
-        return `${colExpr} >= (clock_timestamp() - INTERVAL '${d} days')`;
+        const d = parseFiniteNonNegInt(rawVal, 36_500);
+        if (d === null) return '1 = 0';
+        return wrapDate(`${colExpr} >= (clock_timestamp() - INTERVAL '${d} days')`);
       }
       if (op === 'not_in_the_last') {
-        const d = Math.max(0, Math.min(36_500, Math.floor(Number(rawVal || 0))));
-        return `${colExpr} < (clock_timestamp() - INTERVAL '${d} days')`;
+        const d = parseFiniteNonNegInt(rawVal, 36_500);
+        if (d === null) return '1 = 0';
+        return wrapDate(`${colExpr} < (clock_timestamp() - INTERVAL '${d} days')`);
       }
       const dateStr = String(rawVal ?? '').trim().slice(0, 32);
-      if (!dateStr) return '1 = 0';
+      if (!dateStr || !/^\d{4}-\d{2}-\d{2}/.test(dateStr) || Number.isNaN(Date.parse(dateStr))) return '1 = 0';
       const pDate = pushParam(dateStr);
-      if (op === 'after' || op === 'gt' || op === '>') return `${colExpr}::date > ${pDate}::date`;
-      if (op === 'before' || op === 'lt' || op === '<') return `${colExpr}::date < ${pDate}::date`;
-      return `${colExpr}::date = ${pDate}::date`;
+      if (op === 'after' || op === 'gt' || op === '>') return wrapDate(`CAST(${colExpr} AS DATE) > CAST(${pDate} AS DATE)`);
+      if (op === 'before' || op === 'lt' || op === '<') return wrapDate(`CAST(${colExpr} AS DATE) < CAST(${pDate} AS DATE)`);
+      const isNotEqOp = op === 'not_equals' || op === '!=' || op === 'neq' || op === 'is_not';
+      const wantNot = isNotEqOp !== ruleNegated;
+      const eqExpr = `CAST(${colExpr} AS DATE) = CAST(${pDate} AS DATE)`;
+      return wantNot ? `(${colExpr} IS NULL OR NOT (${eqExpr}))` : eqExpr;
     }
 
     // 3c. Email / Link Stats Counters (`statsOpened`, `stats.emailsOpened`, `statsClicked`, `stats.linksClicked`, `statsSent`)
@@ -445,6 +848,7 @@ export function compileSegmentWhereSql(
             ? ['mkt_email_sent', 'email_sent']
             : ['email_opened', 'mkt_email_open'];
       const evtPh = evtTypes.map((ev) => pushParam(ev)).join(', ');
+      const isNotEqOp = op === 'neq' || op === '!=' || op === 'not_equals' || op === 'is_not';
       const cmp =
         op === 'gt' || op === '>' || op === 'greater_than'
           ? '>'
@@ -452,10 +856,12 @@ export function compileSegmentWhereSql(
             ? '<'
             : op === 'lte' || op === '<='
               ? '<='
-              : op === 'equals' || op === 'is' || op === '='
+              : op === 'equals' || op === 'is' || op === '=' || isNotEqOp
                 ? '='
                 : '>=';
-      return `(SELECT COUNT(*) FROM lead_timeline_events te WHERE te.tenant_id = ${pTenant} AND te.lead_id = l.id AND te.event_type IN (${evtPh})) ${cmp} ${pCnt}`;
+      const countExpr = `(SELECT COUNT(*) FROM lead_timeline_events te WHERE te.tenant_id = ${pTenant} AND te.lead_id = l.id AND te.event_type IN (${evtPh})) ${cmp} ${pCnt}`;
+      const wantNot = isNotEqOp !== ruleNegated;
+      return wantNot ? `NOT (${countExpr})` : countExpr;
     }
 
     // 4. Marketing & Timeline Engagement Events (`timeline_event`, `opened_email`, `clicked_email`, `submitted_form`, etc.)
@@ -488,11 +894,12 @@ export function compileSegmentWhereSql(
         eventMatchSql = `LOWER(te.event_type) = LOWER(${pEvt})`;
       }
 
-      const wantNegate =
-        isNegated ||
+      const baseNeg =
+        baseOpNeg ||
         op === 'not_has_event' ||
         rawVal === false ||
         String(rawVal).toLowerCase() === 'false';
+      const wantNegate = baseNeg !== ruleNegated;
 
       const existsSql = `EXISTS (
         SELECT 1 FROM lead_timeline_events te
@@ -503,73 +910,232 @@ export function compileSegmentWhereSql(
 
     // 5. Quiz Score (`quiz_score`)
     if (fieldLower === 'quiz_score') {
+      const rawQuizExpr = `COALESCE(NULLIF(te.metadata->>'quiz_score', ''), NULLIF(te.metadata->>'score', ''))`;
+      const numExpr = `(CASE WHEN COALESCE(${rawQuizExpr}, '') ~ '^-?[0-9]+([.][0-9]+)?$' THEN CAST(${rawQuizExpr} AS DECIMAL(12,2)) ELSE NULL END)`;
+      if (op === 'between') {
+        const minV = Number(rule.min ?? (Array.isArray(rawVal) ? rawVal[0] : 0));
+        const maxV = Number(rule.max ?? (Array.isArray(rawVal) ? rawVal[1] : 0));
+        if (!Number.isFinite(minV) || !Number.isFinite(maxV)) return '1 = 0';
+        const pMin = pushParam(minV);
+        const pMax = pushParam(maxV);
+        const existsSql = `EXISTS (
+          SELECT 1 FROM lead_timeline_events te
+          WHERE te.tenant_id = ${pTenant}
+            AND te.lead_id = l.id
+            AND te.event_type IN ('survey_completed', 'quiz_completed')
+            AND ${numExpr} IS NOT NULL
+            AND ${numExpr} BETWEEN ${pMin} AND ${pMax}
+        )`;
+        return isNegated ? `NOT (${existsSql})` : existsSql;
+      }
       const targetScore = Number(rawVal || 0);
       if (!Number.isFinite(targetScore)) return '1 = 0';
       const pScore = pushParam(targetScore);
-      const cmp = op === 'gt' || op === '>' ? '>' : op === 'lt' || op === '<' ? '<' : op === 'lte' || op === '<=' ? '<=' : '>=';
-      return `EXISTS (
+      const isNotEqOp = op === 'not_equals' || op === '!=' || op === 'neq' || op === 'is_not';
+      const cmp =
+        op === 'gt' || op === '>' || op === 'greater_than'
+          ? '>'
+          : op === 'lt' || op === '<' || op === 'less_than'
+            ? '<'
+            : op === 'lte' || op === '<='
+              ? '<='
+              : op === 'equals' || op === '=' || op === 'is' || isNotEqOp
+                ? '='
+                : '>=';
+      const existsSql = `EXISTS (
         SELECT 1 FROM lead_timeline_events te
         WHERE te.tenant_id = ${pTenant}
           AND te.lead_id = l.id
           AND te.event_type IN ('survey_completed', 'quiz_completed')
-          AND COALESCE(NULLIF(te.metadata->>'score', '')::numeric, 0) ${cmp} ${pScore}
+          AND ${numExpr} IS NOT NULL
+          AND ${numExpr} ${cmp} ${pScore}
       )`;
+      const wantNegate = isNotEqOp ? !rule.negate : Boolean(rule.negate);
+      return wantNegate ? `NOT (${existsSql})` : existsSql;
     }
 
     // 6. Revenue convenience boolean (`has_revenue`)
     if (fieldLower === 'has_revenue') {
       const truthy = rawVal === undefined || rawVal === true || String(rawVal).toLowerCase() === 'true' || rawVal === 1;
-      return truthy && !isNegated ? 'l.total_revenue_vnd > 0' : 'l.total_revenue_vnd <= 0';
+      const wantPositive = isNegated ? !truthy : truthy;
+      return wantPositive ? 'COALESCE(l.total_revenue_vnd, 0) > 0' : 'COALESCE(l.total_revenue_vnd, 0) <= 0';
     }
 
     // 7. Boolean Columns
     if (fieldLower in BOOLEAN_COLUMNS_MAP) {
       const col = BOOLEAN_COLUMNS_MAP[fieldLower];
+      if (op === 'is_empty' || op === 'empty' || op === 'is_null' || op === 'is_not_empty' || op === 'not_empty' || op === 'is_not_null') {
+        const wantEmpty = op === 'is_empty' || op === 'empty' || op === 'is_null';
+        const effectiveEmpty = ruleNegated ? !wantEmpty : wantEmpty;
+        return effectiveEmpty ? `(${col} IS NULL)` : `(${col} IS NOT NULL)`;
+      }
       const truthy =
         rawVal === undefined
           ? op !== 'is_false' && op !== 'false'
           : rawVal === true || String(rawVal).toLowerCase() === 'true' || String(rawVal) === '1';
       const finalBool = isNegated ? !truthy : truthy;
-      return `${col} = ${finalBool ? 'true' : 'false'}`;
+      return `COALESCE(${col}, false) = ${finalBool ? 'true' : 'false'}`;
     }
 
     // 8. Numeric Columns (`lead_score`, `total_revenue_vnd`)
     if (fieldLower in NUMERIC_COLUMNS_MAP) {
-      const col = NUMERIC_COLUMNS_MAP[fieldLower];
+      const col = `COALESCE(${NUMERIC_COLUMNS_MAP[fieldLower]}, 0)`;
       if (op === 'between') {
         const minVal = Number(rule.min ?? (Array.isArray(rawVal) ? rawVal[0] : 0));
         const maxVal = Number(rule.max ?? (Array.isArray(rawVal) ? rawVal[1] : 0));
         if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return '1 = 0';
         const pMin = pushParam(minVal);
         const pMax = pushParam(maxVal);
-        return `${col} BETWEEN ${pMin} AND ${pMax}`;
+        const expr = `${col} BETWEEN ${pMin} AND ${pMax}`;
+        return ruleNegated ? `NOT (${expr})` : expr;
       }
       const num = Number(rawVal);
       if (!Number.isFinite(num)) return '1 = 0';
       const pNum = pushParam(num);
+      const isNotEqOp = op === 'neq' || op === '!=' || op === 'not_equals' || op === 'is_not';
+      let baseExpr: string;
       switch (op) {
         case 'gt':
         case '>':
         case 'greater_than':
-          return `${col} > ${pNum}`;
+          baseExpr = `${col} > ${pNum}`;
+          break;
         case 'gte':
         case '>=':
-          return `${col} >= ${pNum}`;
+          baseExpr = `${col} >= ${pNum}`;
+          break;
         case 'lt':
         case '<':
         case 'less_than':
-          return `${col} < ${pNum}`;
+          baseExpr = `${col} < ${pNum}`;
+          break;
         case 'lte':
         case '<=':
-          return `${col} <= ${pNum}`;
-        case 'neq':
-        case '!=':
-        case 'not_equals':
-        case 'is_not':
-          return `${col} != ${pNum}`;
+          baseExpr = `${col} <= ${pNum}`;
+          break;
         default:
-          return `${col} = ${pNum}`;
+          baseExpr = `${col} = ${pNum}`;
+          break;
       }
+      const wantNot = isNotEqOp !== ruleNegated;
+      return wantNot ? `NOT (${baseExpr})` : baseExpr;
+    }
+
+    // 8b. Birthday / Anniversary Date Fields & Operators (`is_today`, `is_this_month`, `before_days`, `on`, `before`, `after`)
+    const BIRTHDAY_ALIASES = new Set([
+      'birthday',
+      'dob',
+      'dateofbirth',
+      'date_of_birth',
+      'anniversarydate',
+      'anniversary_date',
+      'ngay_sinh',
+      'cf.birthday',
+      'custom_fields.birthday',
+      'cf.dob',
+      'custom_fields.dob',
+      'cf.dateofbirth',
+      'custom_fields.dateofbirth',
+      'cf.date_of_birth',
+      'custom_fields.date_of_birth',
+      'cf.anniversarydate',
+      'custom_fields.anniversarydate',
+      'cf.anniversary_date',
+      'custom_fields.anniversary_date',
+      'cf.ngay_sinh',
+      'custom_fields.ngay_sinh',
+    ]);
+    const isBirthdayField =
+      BIRTHDAY_ALIASES.has(fieldLower) ||
+      ((fieldLower.startsWith('cf.') || fieldLower.startsWith('custom_fields.') || fieldLower.startsWith('custom.')) &&
+        ['is_today', 'is_this_month', 'before_days'].includes(op));
+
+    if (isBirthdayField) {
+      let dateExpr: string;
+      if (fieldLower.startsWith('cf.') || fieldLower.startsWith('custom_fields.') || fieldLower.startsWith('custom.')) {
+        const rawKey = rawField.replace(/^(?:custom_fields|cf|custom)\./i, '').trim();
+        if (!SAFE_CUSTOM_KEY_REGEX.test(rawKey)) return '1 = 0';
+        const lk = rawKey.toLowerCase();
+        if (lk === 'birthday' || lk === 'dob' || lk === 'dateofbirth' || lk === 'date_of_birth' || lk === 'ngay_sinh') {
+          dateExpr = `COALESCE(NULLIF(l.custom_fields->>'${rawKey}', ''), NULLIF(l.custom_fields->>'birthday', ''), NULLIF(l.custom_fields->>'dob', ''), NULLIF(l.custom_fields->>'dateOfBirth', ''), NULLIF(l.custom_fields->>'date_of_birth', ''), NULLIF(l.custom_fields->>'ngay_sinh', ''))`;
+        } else {
+          dateExpr = `NULLIF(l.custom_fields->>'${rawKey}', '')`;
+        }
+      } else {
+        dateExpr = `COALESCE(NULLIF(l.custom_fields->>'birthday', ''), NULLIF(l.custom_fields->>'dob', ''), NULLIF(l.custom_fields->>'dateOfBirth', ''), NULLIF(l.custom_fields->>'date_of_birth', ''), NULLIF(l.custom_fields->>'anniversaryDate', ''), NULLIF(l.custom_fields->>'anniversary_date', ''), NULLIF(l.custom_fields->>'ngay_sinh', ''))`;
+      }
+
+      if (
+        op === 'is_empty' ||
+        op === 'empty' ||
+        op === 'is_null' ||
+        op === 'is_not_empty' ||
+        op === 'not_empty' ||
+        op === 'is_not_null'
+      ) {
+        const emptyExpr = `(${dateExpr} IS NULL OR TRIM(${dateExpr}) = '')`;
+        const notEmptyExpr = `(${dateExpr} IS NOT NULL AND TRIM(${dateExpr}) != '')`;
+        const wantEmpty = op === 'is_empty' || op === 'empty' || op === 'is_null';
+        const effectiveEmpty = Boolean(rule.negate) ? !wantEmpty : wantEmpty;
+        return effectiveEmpty ? emptyExpr : notEmptyExpr;
+      }
+
+      const now = new Date();
+      const pad2 = (n: number) => String(n).padStart(2, '0');
+      const todayMm = pad2(now.getMonth() + 1);
+      const todayMmDd = `${todayMm}-${pad2(now.getDate())}`;
+
+      const isNotEqOp = op === 'not_equals' || op === '!=' || op === 'neq' || op === 'is_not';
+      const wantNegate = isNotEqOp ? !rule.negate : isNegated;
+      const wrapBday = (matchSql: string): string => (wantNegate ? `NOT (${matchSql})` : matchSql);
+
+      if (op === 'is_today') {
+        const pToday = pushParam(todayMmDd);
+        return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 6, 5) = ${pToday})`);
+      }
+      if (op === 'is_this_month') {
+        const pMonth = pushParam(todayMm);
+        return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 6, 2) = ${pMonth})`);
+      }
+      if (op === 'before_days') {
+        const days = Math.max(0, Math.min(365, Math.floor(Number(rawVal ?? 0))));
+        if (!Number.isFinite(days)) return '1 = 0';
+        const mmDdList: string[] = [];
+        for (let i = 0; i <= days; i++) {
+          const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
+          mmDdList.push(`${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
+        }
+        const uniqueMmDd = Array.from(new Set(mmDdList));
+        const pList = uniqueMmDd.map((item) => pushParam(item)).join(', ');
+        return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 6, 5) IN (${pList}))`);
+      }
+
+      const dateStr = String(rawVal ?? '').trim().slice(0, 32);
+      const mmDdMatch = dateStr.match(/^(\d{2})-(\d{2})$/);
+      if (mmDdMatch) {
+        const mm = Number(mmDdMatch[1]);
+        const dd = Number(mmDdMatch[2]);
+        if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return '1 = 0';
+        const pMmDd = pushParam(dateStr);
+        if (op === 'before' || op === 'lt' || op === '<') {
+          return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 6, 5) < ${pMmDd})`);
+        }
+        if (op === 'after' || op === 'gt' || op === '>') {
+          return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 6, 5) > ${pMmDd})`);
+        }
+        return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 6, 5) = ${pMmDd})`);
+      }
+      if (!dateStr || !/^\d{4}-\d{2}-\d{2}/.test(dateStr) || Number.isNaN(Date.parse(dateStr))) return '1 = 0';
+      if (op === 'before' || op === 'lt' || op === '<') {
+        const pDate = pushParam(dateStr.slice(0, 10));
+        return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 1, 10) < ${pDate})`);
+      }
+      if (op === 'after' || op === 'gt' || op === '>') {
+        const pDate = pushParam(dateStr.slice(0, 10));
+        return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 1, 10) > ${pDate})`);
+      }
+      const pFull = pushParam(dateStr.slice(0, 10));
+      return wrapBday(`(${dateExpr} IS NOT NULL AND SUBSTRING(${dateExpr}, 1, 10) = ${pFull})`);
     }
 
     // 9. Resolve Target Text / ID / Dynamic Custom Field Expression
@@ -577,11 +1143,9 @@ export function compileSegmentWhereSql(
     let customFieldKey: string | null = null;
 
     if (fieldLower === 'firstname' || fieldLower === 'first_name') {
-      const pCf = pushParam('first_name');
-      strExpr = `COALESCE(NULLIF(l.custom_fields->>${pCf}::text, ''), l.name)`;
+      strExpr = `COALESCE(NULLIF(l.custom_fields->>'first_name', ''), NULLIF(l.custom_fields->>'firstName', ''), l.name)`;
     } else if (fieldLower === 'lastname' || fieldLower === 'last_name') {
-      const pCf = pushParam('last_name');
-      strExpr = `COALESCE(NULLIF(l.custom_fields->>${pCf}::text, ''), l.name)`;
+      strExpr = `COALESCE(NULLIF(l.custom_fields->>'last_name', ''), NULLIF(l.custom_fields->>'lastName', ''), l.name)`;
     } else if (fieldLower in ID_COLUMNS_MAP) {
       strExpr = ID_COLUMNS_MAP[fieldLower];
     } else if (fieldLower in STRING_COLUMNS_MAP) {
@@ -596,13 +1160,11 @@ export function compileSegmentWhereSql(
         return '1 = 0';
       }
       customFieldKey = rawKey;
-      const pKey = pushParam(rawKey);
-      strExpr = `(l.custom_fields->>${pKey}::text)`;
+      strExpr = `(l.custom_fields->>'${rawKey}')`;
     } else if (SAFE_CUSTOM_KEY_REGEX.test(rawField)) {
-      // Allow direct custom field key when valid identifier (parameterized)
+      // Allow direct custom field key when valid identifier (whitelist-validated)
       customFieldKey = rawField;
-      const pKey = pushParam(rawField);
-      strExpr = `(l.custom_fields->>${pKey}::text)`;
+      strExpr = `(l.custom_fields->>'${rawField}')`;
     }
 
     if (!strExpr) {
@@ -611,14 +1173,15 @@ export function compileSegmentWhereSql(
 
     // Numeric comparison on a Custom Field (`budget_vnd >= 3000000000`)
     if (customFieldKey && ['gt', '>', 'greater_than', 'gte', '>=', 'lt', '<', 'less_than', 'lte', '<=', 'between'].includes(op)) {
-      const safeNumCast = `CASE WHEN COALESCE(${strExpr}, '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN CAST(${strExpr} AS DECIMAL(20,4)) ELSE NULL END`;
+      const safeNumCast = `CASE WHEN COALESCE(${strExpr}, '') ~ '^-?[0-9]+([.][0-9]+)?$' THEN CAST(${strExpr} AS DECIMAL(20,4)) ELSE NULL END`;
       if (op === 'between') {
         const minV = Number(rule.min ?? (Array.isArray(rawVal) ? rawVal[0] : 0));
         const maxV = Number(rule.max ?? (Array.isArray(rawVal) ? rawVal[1] : 0));
         if (!Number.isFinite(minV) || !Number.isFinite(maxV)) return '1 = 0';
         const pMin = pushParam(minV);
         const pMax = pushParam(maxV);
-        return `(${safeNumCast}) BETWEEN ${pMin} AND ${pMax}`;
+        const expr = `((${safeNumCast}) IS NOT NULL AND (${safeNumCast}) BETWEEN ${pMin} AND ${pMax})`;
+        return ruleNegated ? `((${safeNumCast}) IS NULL OR NOT ((${safeNumCast}) BETWEEN ${pMin} AND ${pMax}))` : expr;
       }
       const numV = Number(rawVal);
       if (!Number.isFinite(numV)) return '1 = 0';
@@ -631,15 +1194,25 @@ export function compileSegmentWhereSql(
             : op === 'lt' || op === '<' || op === 'less_than'
               ? '<'
               : '<=';
-      return `(${safeNumCast}) ${sqlOp} ${pN}`;
+      const matchExpr = `((${safeNumCast}) ${sqlOp} ${pN})`;
+      return ruleNegated ? `((${safeNumCast}) IS NULL OR NOT ${matchExpr})` : matchExpr;
+    }
+
+    // Boolean check on a Custom Field (`custom.vip_flag is_true` / `is_false`)
+    if (customFieldKey && (op === 'is_true' || op === 'is_false')) {
+      const wantTrue = op === 'is_true';
+      const effectiveTrue = ruleNegated ? !wantTrue : wantTrue;
+      const trueSql = `LOWER(TRIM(COALESCE(${strExpr}, ''))) IN ('true', '1', 'yes', 'có', 'co')`;
+      return effectiveTrue ? trueSql : `NOT (${trueSql})`;
     }
 
     // String / ID operators
-    if (op === 'is_empty' || op === 'empty' || op === 'is_null') {
-      return `(${strExpr} IS NULL OR TRIM(${strExpr}) = '')`;
-    }
-    if (op === 'is_not_empty' || op === 'not_empty' || op === 'is_not_null') {
-      return `(${strExpr} IS NOT NULL AND TRIM(${strExpr}) != '')`;
+    if (op === 'is_empty' || op === 'empty' || op === 'is_null' || op === 'is_not_empty' || op === 'not_empty' || op === 'is_not_null') {
+      const wantEmpty = op === 'is_empty' || op === 'empty' || op === 'is_null';
+      const effectiveEmpty = ruleNegated ? !wantEmpty : wantEmpty;
+      return effectiveEmpty
+        ? `(${strExpr} IS NULL OR TRIM(${strExpr}) = '')`
+        : `(${strExpr} IS NOT NULL AND TRIM(${strExpr}) != '')`;
     }
 
     if (op === 'in' || op === 'in_list' || op === 'not_in' || op === 'not_in_list' || op === 'notin') {
@@ -649,7 +1222,8 @@ export function compileSegmentWhereSql(
             .split(',')
             .map((v) => v.trim())
             .filter(Boolean);
-      const wantIn = op === 'in' || op === 'in_list';
+      const baseIn = op === 'in' || op === 'in_list';
+      const wantIn = ruleNegated ? !baseIn : baseIn;
       if (items.length === 0) return wantIn ? '1 = 0' : '1 = 1';
       const pList = items.map((item) => `LOWER(${pushParam(item)})`).join(', ');
       const inSql = `LOWER(COALESCE(${strExpr}, '')) IN (${pList})`;
@@ -657,30 +1231,33 @@ export function compileSegmentWhereSql(
     }
 
     const strVal = String(rawVal ?? '').trim();
-    if (op === 'contains') {
+    if (op === 'contains' || op === 'not_contains' || op === 'notcontains') {
       const p = pushParam(`%${strVal}%`);
-      return `COALESCE(${strExpr}, '') ILIKE ${p}`;
-    }
-    if (op === 'not_contains' || op === 'notcontains') {
-      const p = pushParam(`%${strVal}%`);
-      return `NOT (COALESCE(${strExpr}, '') ILIKE ${p})`;
+      const baseNeg = op !== 'contains';
+      const wantNeg = baseNeg !== ruleNegated;
+      const expr = `COALESCE(${strExpr}, '') ILIKE ${p}`;
+      return wantNeg ? `NOT (${expr})` : expr;
     }
     if (op === 'starts_with' || op === 'startswith') {
       const p = pushParam(`${strVal}%`);
-      return `COALESCE(${strExpr}, '') ILIKE ${p}`;
+      const expr = `COALESCE(${strExpr}, '') ILIKE ${p}`;
+      return ruleNegated ? `NOT (${expr})` : expr;
     }
     if (op === 'ends_with' || op === 'endswith') {
       const p = pushParam(`%${strVal}`);
-      return `COALESCE(${strExpr}, '') ILIKE ${p}`;
+      const expr = `COALESCE(${strExpr}, '') ILIKE ${p}`;
+      return ruleNegated ? `NOT (${expr})` : expr;
     }
     if (op === 'not_equals' || op === 'neq' || op === '!=' || op === 'is_not') {
       const p = pushParam(strVal);
-      return `LOWER(COALESCE(${strExpr}, '')) != LOWER(${p})`;
+      const eqExpr = `LOWER(COALESCE(${strExpr}, '')) = LOWER(${p})`;
+      return ruleNegated ? eqExpr : `NOT (${eqExpr})`;
     }
 
     // Default: case-insensitive exact match
     const pEq = pushParam(strVal);
-    return `LOWER(COALESCE(${strExpr}, '')) = LOWER(${pEq})`;
+    const eqExpr = `LOWER(COALESCE(${strExpr}, '')) = LOWER(${pEq})`;
+    return ruleNegated ? `NOT (${eqExpr})` : eqExpr;
   };
 
   const compiledBranches: string[] = [];
@@ -704,8 +1281,8 @@ export function compileSegmentWhereSql(
   }
 
   // Audience-level exclusions (`tenant_audience_exclusions`)
-  if (options?.audienceIdForExclusions) {
-    const pExAud = pushParam(options.audienceIdForExclusions);
+  if (options?.audienceIdForExclusions && UUID_REGEX.test(String(options.audienceIdForExclusions).trim())) {
+    const pExAud = pushParam(String(options.audienceIdForExclusions).trim());
     whereClause += `
       AND NOT EXISTS (
         SELECT 1 FROM tenant_audience_exclusions ex
@@ -728,7 +1305,9 @@ export function compileSegmentWhereSql(
   }
 
   if (options?.extraExcludeAudienceIds && options.extraExcludeAudienceIds.length > 0) {
-    const cleanIds = options.extraExcludeAudienceIds.map((x) => String(x || '').trim()).filter(Boolean);
+    const cleanIds = options.extraExcludeAudienceIds
+      .map((x) => String(x || '').trim())
+      .filter((x) => UUID_REGEX.test(x));
     if (cleanIds.length > 0) {
       const pIds = cleanIds.map((id) => `${pushParam(id)}::uuid`).join(', ');
       whereClause += `

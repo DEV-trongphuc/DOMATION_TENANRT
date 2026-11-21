@@ -143,6 +143,7 @@ pipelinesRouter.post('/rounds', requireRoundsWrite, async (req, res) => {
       return rRes.rows[0];
     });
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.status(201).json({ success: true, data: created });
   } catch (err: any) {
     const msg = String(err?.message || '');
@@ -201,6 +202,7 @@ pipelinesRouter.patch('/rounds/:roundId', requireRoundsWrite, async (req, res) =
       return;
     }
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: updated });
   } catch (err: any) {
     sendApiError(res, 500, 'UPDATE_ROUND_FAILED', err?.message || 'Không thể cập nhật vòng chia.');
@@ -321,6 +323,7 @@ pipelinesRouter.delete('/rounds/:roundId', requireRoundsWrite, async (req, res) 
       ]);
     });
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: { deleted: true, round_id: roundId } });
   } catch (err: any) {
     if (err?.message === 'CANNOT_DELETE_LAST_ROUND') {
@@ -372,6 +375,7 @@ pipelinesRouter.post('/routing-rules', requireRoutingWrite, async (req, res) => 
       return r.rows[0];
     });
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.status(201).json({ success: true, data: created });
   } catch (err: any) {
     sendApiError(res, 500, 'CREATE_ROUTING_RULE_FAILED', err?.message || 'Không thể tạo quy tắc định tuyến.');
@@ -428,6 +432,7 @@ pipelinesRouter.patch('/routing-rules/:ruleId', requireRoutingWrite, async (req,
       return;
     }
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: updated });
   } catch (err: any) {
     sendApiError(res, 500, 'UPDATE_ROUTING_RULE_FAILED', err?.message || 'Không thể cập nhật quy tắc định tuyến.');
@@ -443,6 +448,7 @@ pipelinesRouter.delete('/routing-rules/:ruleId', requireRoutingWrite, async (req
         req.params.ruleId,
       ]);
     });
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: { deleted: true, rule_id: req.params.ruleId } });
   } catch (err: any) {
     sendApiError(res, 500, 'DELETE_ROUTING_RULE_FAILED', err?.message || 'Không thể xóa quy tắc định tuyến.');
@@ -607,6 +613,7 @@ pipelinesRouter.post('/', requirePipelineConfig, async (req, res) => {
       return { ...pRes.rows[0], stages: insertedStages, custom_fields: [] };
     });
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.status(201).json({ success: true, data: created });
   } catch (err: any) {
     sendApiError(res, 500, 'CREATE_PIPELINE_FAILED', err?.message || 'Không thể tạo Pipeline.');
@@ -649,6 +656,7 @@ pipelinesRouter.patch('/:id', requirePipelineConfig, async (req, res) => {
       return;
     }
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: updated });
   } catch (err: any) {
     sendApiError(res, 500, 'UPDATE_PIPELINE_FAILED', err?.message || 'Không thể cập nhật Pipeline.');
@@ -758,6 +766,7 @@ pipelinesRouter.delete('/:id', requirePipelineConfig, async (req, res) => {
       await tenantRedis.zadd('sla_queue', s.deadlineMs, s.member, ctx.tenantId);
     }
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: out.payload });
   } catch (err: any) {
     if (err?.message === 'CANNOT_DELETE_LAST_PIPELINE') {
@@ -850,6 +859,7 @@ pipelinesRouter.put('/:id/stages/reorder', requirePipelineConfig, async (req, re
       return out;
     });
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: updatedStages });
   } catch (err: any) {
     sendApiError(res, 500, 'REORDER_STAGES_FAILED', err?.message || 'Không thể lưu thứ tự bước Pipeline.');
@@ -940,6 +950,7 @@ pipelinesRouter.delete('/:id/stages/:stageId', requirePipelineConfig, async (req
       await tenantRedis.zadd('sla_queue', s.deadlineMs, s.member, ctx.tenantId);
     }
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: out.payload });
   } catch (err: any) {
     if (err?.message === 'CANNOT_DELETE_LAST_STAGE') {
@@ -1010,6 +1021,7 @@ pipelinesRouter.post('/:id/custom-fields', requirePipelineConfig, async (req, re
       return r.rows[0];
     });
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.status(201).json({ success: true, data: created });
   } catch (err: any) {
     sendApiError(res, 500, 'CREATE_CUSTOM_FIELD_FAILED', err?.message || 'Không thể thêm trường tùy biến.');
@@ -1065,6 +1077,7 @@ pipelinesRouter.patch('/:id/custom-fields/:fieldId', requirePipelineConfig, asyn
       return;
     }
 
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: updated });
   } catch (err: any) {
     sendApiError(res, 500, 'UPDATE_CUSTOM_FIELD_FAILED', err?.message || 'Không thể cập nhật trường tùy biến.');
@@ -1080,6 +1093,7 @@ pipelinesRouter.delete('/:id/custom-fields/:fieldId', requirePipelineConfig, asy
         [ctx.tenantId, req.params.id, req.params.fieldId]
       );
     });
+    tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
     res.json({ success: true, data: { deleted: true } });
   } catch (err: any) {
     sendApiError(res, 500, 'DELETE_CUSTOM_FIELD_FAILED', err?.message || 'Không thể xóa trường tùy biến.');

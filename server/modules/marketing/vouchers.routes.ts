@@ -88,7 +88,7 @@ vouchersRouter.get('/clicks-analytics', requirePermission('mkt_vouchers', 'view'
       const byDevice: Record<string, number> = {};
       const byUtmSource: Record<string, number> = {};
       const byReferrer: Record<string, number> = {};
-      const uniqueIps = new Set<string>();
+      const uniqueVisitors = new Set<string>();
 
       const recentClicks = clicksRes.rows.map((r) => {
         const dev = String(r.device_type || 'desktop');
@@ -98,7 +98,14 @@ vouchersRouter.get('/clicks-analytics', requirePermission('mkt_vouchers', 'view'
         byUtmSource[src] = (byUtmSource[src] || 0) + 1;
         const ref = r.referrer ? String(r.referrer).replace(/^https?:\/\//i, '').split('/')[0] : 'Trực tiếp / QR';
         byReferrer[ref] = (byReferrer[ref] || 0) + 1;
-        if (r.client_ip) uniqueIps.add(String(r.client_ip));
+        const visitorKey = utm.visitor_hash
+          ? `vh:${String(utm.visitor_hash)}`
+          : r.lead_id
+            ? `lead:${String(r.lead_id)}`
+            : r.client_ip
+              ? `ip:${String(r.client_ip)}`
+              : '';
+        if (visitorKey) uniqueVisitors.add(visitorKey);
         return {
           ...r,
           utm,
@@ -107,7 +114,7 @@ vouchersRouter.get('/clicks-analytics', requirePermission('mkt_vouchers', 'view'
 
       return {
         total_clicks: recentClicks.length,
-        unique_visitors: Math.max(uniqueIps.size, recentClicks.length > 0 ? 1 : 0),
+        unique_visitors: Math.max(uniqueVisitors.size, recentClicks.length > 0 ? 1 : 0),
         by_device: Object.entries(byDevice).map(([device, count]) => ({ device, count })),
         by_utm_source: Object.entries(byUtmSource)
           .map(([source, count]) => ({ source, count }))
@@ -162,11 +169,15 @@ vouchersRouter.post('/', requirePermission('mkt_vouchers', 'create'), async (req
     }
 
     const slug = `${slugifyMarketingKey(name, 'voucher')}-${crypto.randomBytes(2).toString('hex')}`;
-    const codePrefix = String(req.body?.code_prefix || 'DOM')
+    const rawPrefix = String(req.body?.code_prefix || 'DOM')
       .trim()
       .toUpperCase()
-      .replace(/[^A-Z0-9]/g, '')
-      .slice(0, 14) || 'DOM';
+      .replace(/[^A-Z0-9]/g, '');
+    if (req.body?.code_prefix !== undefined && rawPrefix.length < 2) {
+      sendApiError(res, 422, 'INVALID_CODE_PREFIX', 'Tiền tố mã Voucher cần tối thiểu 2 ký tự chữ/số (A-Z, 0-9).');
+      return;
+    }
+    const codePrefix = rawPrefix.slice(0, 14) || 'DOM';
     const discountType =
       req.body?.discount_type === 'fixed_vnd'
         ? 'fixed_vnd'
@@ -174,9 +185,22 @@ vouchersRouter.post('/', requirePermission('mkt_vouchers', 'create'), async (req
           ? 'gift'
           : 'percentage';
     const discountValue = Math.max(0, Math.round(Number(req.body?.discount_value ?? 10)));
+    if (discountType === 'percentage' && discountValue > 100) {
+      sendApiError(res, 422, 'INVALID_DISCOUNT_PERCENTAGE', 'Mức giảm phần trăm (%) không được vượt quá 100%.');
+      return;
+    }
     const minOrderVnd = Math.max(0, Math.round(Number(req.body?.min_order_vnd ?? 0)));
+    const maxUsesPerCode = Math.min(10000, Math.max(1, Math.round(Number(req.body?.max_uses_per_code ?? 1))));
     const initialBatchCount = Math.min(500, Math.max(0, Math.round(Number(req.body?.auto_generate_count ?? 10))));
-    const expiresAt = req.body?.expires_at ? String(req.body.expires_at) : null;
+    let expiresAt: string | null = null;
+    if (req.body?.expires_at) {
+      const parsedExp = new Date(String(req.body.expires_at));
+      if (Number.isNaN(parsedExp.getTime())) {
+        sendApiError(res, 422, 'INVALID_EXPIRY_DATE', 'Ngày hết hạn Voucher không hợp lệ.');
+        return;
+      }
+      expiresAt = parsedExp.toISOString();
+    }
     const description = req.body?.description ? String(req.body.description).trim() : null;
     const qrDesign =
       req.body?.qr_design && typeof req.body.qr_design === 'object'
@@ -188,16 +212,11 @@ vouchersRouter.post('/', requirePermission('mkt_vouchers', 'create'), async (req
       await client.query(
         `INSERT INTO mkt_voucher_campaigns (
            id, tenant_id, name, slug, description, code_prefix, discount_type,
-           discount_value, min_order_vnd, expires_at, status, total_codes, qr_design_json, created_by
+           discount_value, min_order_vnd, max_uses_per_code, expires_at, status, total_codes, qr_design_json, created_by
          ) VALUES (
            $1, $2, $3, $4, $5, $6, $7,
-           $7_val, $8_min, $9_exp, 'active', 0, $10_qr::jsonb, $11_uid
-         )`
-          .replace('$7_val', '$8')
-          .replace('$8_min', '$9')
-          .replace('$9_exp', '$10')
-          .replace('$10_qr', '$11')
-          .replace('$11_uid', '$12'),
+           $8, $9, $10, $11, 'active', 0, $12::jsonb, $13
+         )`,
         [
           poolId,
           ctx.tenantId,
@@ -208,6 +227,7 @@ vouchersRouter.post('/', requirePermission('mkt_vouchers', 'create'), async (req
           discountType,
           discountValue,
           minOrderVnd,
+          maxUsesPerCode,
           expiresAt,
           JSON.stringify(qrDesign),
           ctx.userId,
@@ -304,17 +324,22 @@ vouchersRouter.post('/:id/generate', requirePermission('mkt_vouchers', 'create')
       const pool = pRes.rows[0];
       if (!pool) return null;
 
-      const prefix = String(pool.code_prefix || 'DOM').toUpperCase();
+      const overridePrefix = req.body?.prefix
+        ? String(req.body.prefix).trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 14)
+        : '';
+      const prefix = overridePrefix || String(pool.code_prefix || 'DOM').toUpperCase();
       const createdCodes: string[] = [];
       for (let i = 0; i < count; i++) {
         const code = `${prefix}-${generateShortCode(6).toUpperCase()}`;
-        await client.query(
+        const ins = await client.query(
           `INSERT INTO mkt_voucher_codes (id, tenant_id, voucher_campaign_id, code, status)
            VALUES ($1, $2, $3, $4, 'available')
            ON CONFLICT (tenant_id, code) DO NOTHING`,
           [crypto.randomUUID(), ctx.tenantId, pool.id, code]
         );
-        createdCodes.push(code);
+        if ((ins.rowCount || 0) > 0) {
+          createdCodes.push(code);
+        }
       }
 
       const cntRes = await client.query<{ cnt: number }>(
@@ -402,7 +427,16 @@ vouchersRouter.post('/redeem', requirePermission('mkt_vouchers', 'edit'), async 
     const ctx = getTenantContext();
     const cfg = await getTenantSettingsCached(ctx.tenantId);
     const code = String(req.body?.code || '').trim().toUpperCase();
-    const orderVnd = Math.max(0, Math.round(Number(req.body?.order_vnd || 0)));
+    const rawOrderVnd = req.body?.order_vnd;
+    let orderVnd = 0;
+    if (rawOrderVnd !== undefined && rawOrderVnd !== null && String(rawOrderVnd).trim() !== '') {
+      const parsedOrder = Number(rawOrderVnd);
+      if (!Number.isFinite(parsedOrder) || parsedOrder < 0) {
+        sendApiError(res, 422, 'INVALID_ORDER_AMOUNT', 'Giá trị đơn hàng không hợp lệ.');
+        return;
+      }
+      orderVnd = Math.round(parsedOrder);
+    }
     const note = req.body?.note ? String(req.body.note).trim() : 'Gạch mã trực tiếp tại quầy POS';
 
     if (!code) {
@@ -423,13 +457,16 @@ vouchersRouter.post('/redeem', requirePermission('mkt_vouchers', 'edit'), async 
       if (!vc) {
         return { errorCode: 'CODE_NOT_FOUND', errorMessage: 'Mã Voucher không tồn tại trong hệ thống của doanh nghiệp.' };
       }
+      if (String(vc.pool_status || '') !== 'active') {
+        return { errorCode: 'POOL_INACTIVE', errorMessage: 'Chiến dịch Voucher này đã tạm dừng hoặc kết thúc.' };
+      }
       if (vc.status === 'redeemed') {
         return { errorCode: 'CODE_ALREADY_REDEEMED', errorMessage: 'Mã Voucher này đã được sử dụng trước đó.' };
       }
       if (vc.expires_at && new Date(String(vc.expires_at)).getTime() < Date.now()) {
         return { errorCode: 'CODE_EXPIRED', errorMessage: 'Mã Voucher đã hết hạn hiệu lực.' };
       }
-      if (orderVnd > 0 && Number(vc.min_order_vnd || 0) > orderVnd) {
+      if (Number(vc.min_order_vnd || 0) > 0 && orderVnd < Number(vc.min_order_vnd || 0)) {
         return {
           errorCode: 'MIN_ORDER_NOT_MET',
           errorMessage: `Đơn hàng tối thiểu để áp dụng mã này là ${Number(vc.min_order_vnd).toLocaleString('vi-VN')}₫.`,
@@ -455,7 +492,7 @@ vouchersRouter.post('/redeem', requirePermission('mkt_vouchers', 'edit'), async 
         resolvedLeadId = upserted.leadId;
       }
 
-      await client.query(
+      const updRes = await client.query(
         `UPDATE mkt_voucher_codes
          SET status = 'redeemed',
              lead_id = COALESCE($3, lead_id),
@@ -463,9 +500,12 @@ vouchersRouter.post('/redeem', requirePermission('mkt_vouchers', 'edit'), async 
              redeemed_at = clock_timestamp(),
              redeemed_order_vnd = $4,
              redeemed_by_note = $5
-         WHERE tenant_id = $1 AND id = $2`,
+         WHERE tenant_id = $1 AND id = $2 AND status != 'redeemed'`,
         [ctx.tenantId, vc.id, resolvedLeadId, orderVnd, note]
       );
+      if ((updRes.rowCount || 0) === 0) {
+        return { errorCode: 'CODE_ALREADY_REDEEMED', errorMessage: 'Mã Voucher này đã được sử dụng trước đó.' };
+      }
 
       await client.query(
         `UPDATE mkt_voucher_campaigns
@@ -494,14 +534,26 @@ vouchersRouter.post('/redeem', requirePermission('mkt_vouchers', 'edit'), async 
         );
       }
 
+      const discountValNum = Number(vc.discount_value || 0);
+      const discountAmountVnd =
+        vc.discount_type === 'percentage'
+          ? Math.round((orderVnd * Math.min(100, Math.max(0, discountValNum))) / 100)
+          : vc.discount_type === 'fixed_vnd'
+            ? Math.min(orderVnd > 0 ? orderVnd : discountValNum, discountValNum)
+            : 0;
+      const finalOrderVnd = Math.max(0, orderVnd - discountAmountVnd);
+
       return {
         errorCode: null,
         code,
         pool_name: vc.pool_name,
         discount_type: vc.discount_type,
-        discount_value: Number(vc.discount_value || 0),
+        discount_value: discountValNum,
+        discount_amount_vnd: discountAmountVnd,
+        final_order_vnd: finalOrderVnd,
         lead_id: resolvedLeadId,
         order_vnd: orderVnd,
+        redeemed_at: new Date().toISOString(),
       };
     });
 
@@ -698,6 +750,14 @@ vouchersRouter.post('/shortlinks', requirePermission('mkt_vouchers', 'create'), 
 
 vouchersRouter.put('/shortlinks/:id', requirePermission('mkt_vouchers', 'edit'), async (req, res) => {
   try {
+    if (req.body?.target_url !== undefined && !/^https?:\/\//i.test(String(req.body.target_url || '').trim())) {
+      sendApiError(res, 422, 'INVALID_SHORTLINK', 'Vui lòng nhập tiêu đề và URL đích hợp lệ (bắt đầu bằng http/https).');
+      return;
+    }
+    if (req.body?.title !== undefined && !String(req.body.title || '').trim()) {
+      sendApiError(res, 422, 'INVALID_SHORTLINK', 'Vui lòng nhập tiêu đề và URL đích hợp lệ (bắt đầu bằng http/https).');
+      return;
+    }
     const ctx = getTenantContext();
     const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
       const exRes = await client.query('SELECT * FROM mkt_short_links WHERE tenant_id = $1 AND id = $2 LIMIT 1', [
@@ -709,6 +769,31 @@ vouchersRouter.put('/shortlinks/:id', requirePermission('mkt_vouchers', 'edit'),
 
       const title = req.body?.title !== undefined ? String(req.body.title).trim() : String(ex.title);
       const targetUrl = req.body?.target_url !== undefined ? String(req.body.target_url).trim() : String(ex.target_url);
+      const customDomain =
+        req.body?.custom_domain !== undefined
+          ? req.body.custom_domain
+            ? String(req.body.custom_domain).trim()
+            : null
+          : ex.custom_domain;
+      const utmSource =
+        req.body?.utm_source !== undefined
+          ? req.body.utm_source
+            ? String(req.body.utm_source).trim()
+            : null
+          : ex.utm_source;
+      const utmMedium =
+        req.body?.utm_medium !== undefined
+          ? req.body.utm_medium
+            ? String(req.body.utm_medium).trim()
+            : null
+          : ex.utm_medium;
+      const utmCampaign =
+        req.body?.utm_campaign !== undefined
+          ? req.body.utm_campaign
+            ? String(req.body.utm_campaign).trim()
+            : null
+          : ex.utm_campaign;
+      const isActive = req.body?.is_active !== undefined ? Boolean(req.body.is_active) : Boolean(ex.is_active);
       const qrDesign =
         req.body?.qr_design && typeof req.body.qr_design === 'object'
           ? req.body.qr_design
@@ -719,9 +804,25 @@ vouchersRouter.put('/shortlinks/:id', requirePermission('mkt_vouchers', 'edit'),
          SET title = $3,
              target_url = $4,
              qr_design_json = $5::jsonb,
+             custom_domain = $6,
+             utm_source = $7,
+             utm_medium = $8,
+             utm_campaign = $9,
+             is_active = $10,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
-        [ctx.tenantId, req.params.id, title, targetUrl, JSON.stringify(qrDesign)]
+        [
+          ctx.tenantId,
+          req.params.id,
+          title,
+          targetUrl,
+          JSON.stringify(qrDesign),
+          customDomain,
+          utmSource,
+          utmMedium,
+          utmCampaign,
+          isActive,
+        ]
       );
       const r = await client.query('SELECT * FROM mkt_short_links WHERE tenant_id = $1 AND id = $2', [
         ctx.tenantId,

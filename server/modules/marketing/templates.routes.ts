@@ -1,4 +1,8 @@
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import zlib from 'node:zlib';
 import { Router } from 'express';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
 import { getTenantContext } from '../../core/context/tenant-context.ts';
@@ -7,6 +11,8 @@ import {
   requirePermission,
   sendApiError,
 } from '../../core/security/rbac.ts';
+import { normalizeTenantSettings } from '../../core/settings/tenant-settings.ts';
+import { resolveDecryptedSharedAiConfig } from '../../services/dom-meta-report.service.ts';
 import {
   analyzeEmailSpamScore,
   buildCountdownTimerSvg,
@@ -14,13 +20,53 @@ import {
   parseJsonCol,
   readTenantChannelVault,
   renderMergeTags,
+  stripHtmlTagsForPlainText,
   type EmailBlockDto,
   type EmailBodyStyleDto,
 } from './utils.ts';
+import { dispatchMarketingEmail } from './dispatchers.ts';
 
 export const templatesRouter = Router();
 
 templatesRouter.use(requireEntitlement('mkt_templates'));
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function localUploadFileExists(relPath: string): boolean {
+  const clean = String(relPath || '').replace(/^\/+/, '').split(/[?#]/)[0];
+  if (!clean || clean.includes('..') || clean.includes('\\')) return false;
+  const uploadRoots = [
+    process.env.UPLOADS_PUBLIC_DIR ? path.resolve(process.env.UPLOADS_PUBLIC_DIR) : '',
+    path.resolve(process.cwd(), 'public', 'uploads'),
+    path.resolve(process.cwd(), 'uploads'),
+  ].filter(Boolean);
+  for (const root of uploadRoots) {
+    try {
+      if (!fsSync.existsSync(root)) continue;
+      const rootReal = fsSync.realpathSync(root);
+      const candidate = path.resolve(rootReal, clean);
+      if (candidate !== rootReal && !candidate.startsWith(rootReal + path.sep)) continue;
+      const resolved = fsSync.realpathSync(candidate);
+      if ((resolved === rootReal || resolved.startsWith(rootReal + path.sep)) && fsSync.statSync(resolved).isFile()) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+function resolveTemplateThumbUrl(raw: unknown): string | null {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const uploadMatch = s.match(/^(?:https?:\/\/[^/]+)?(\/uploads\/(.+))$/i);
+  if (uploadMatch && uploadMatch[2]) {
+    const cleanRel = uploadMatch[2].replace(/^\/+/, '');
+    return localUploadFileExists(cleanRel) ? `/uploads/${cleanRel}` : null;
+  }
+  return s;
+}
 
 function mapTemplateRow(row: Record<string, unknown>) {
   const bodyStyleObj = parseJsonCol<EmailBodyStyleDto>(row.body_style, {});
@@ -28,6 +74,7 @@ function mapTemplateRow(row: Record<string, unknown>) {
   const savedBlocks = parseJsonCol<EmailBlockDto[]>(row.saved_blocks_json, []);
   const groupId = row.group_id ? String(row.group_id) : null;
   const groupName = row.group_name ? String(row.group_name) : null;
+  const resolvedThumb = resolveTemplateThumbUrl(row.thumbnail_url);
   return {
     id: String(row.id),
     tenant_id: String(row.tenant_id),
@@ -46,7 +93,8 @@ function mapTemplateRow(row: Record<string, unknown>) {
     bodyStyle: bodyStyleObj,
     compiled_html: compiledHtml,
     htmlContent: compiledHtml,
-    thumbnail_url: row.thumbnail_url ? String(row.thumbnail_url) : null,
+    thumbnail_url: resolvedThumb,
+    thumbnail: resolvedThumb,
     spam_score: Number(row.spam_score || 0),
     merge_tags: parseJsonCol<string[]>(row.merge_tags, []),
     visibility: String(row.visibility || 'company'),
@@ -69,10 +117,34 @@ templatesRouter.get('/countdown.svg', (req, res) => {
   res.send(svg);
 });
 
-// List Templates + Groups + Dynamic Tenant Merge Tags
-templatesRouter.get('/', requirePermission('mkt_templates', 'view'), async (_req, res) => {
+// List Templates + Groups + Dynamic Tenant Merge Tags (also supports `?id=<uuid>` legacy single-fetch)
+templatesRouter.get('/', requirePermission('mkt_templates', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const requestedId = String(req.query?.id || '').trim();
+    if (requestedId) {
+      if (!UUID_REGEX.test(requestedId)) {
+        sendApiError(res, 404, 'TEMPLATE_NOT_FOUND', 'Không tìm thấy mẫu Email trong doanh nghiệp.');
+        return;
+      }
+      const singleRow = await withTenantTransaction(ctx.tenantId, async (client) => {
+        const r = await client.query(
+          `SELECT t.*, g.name AS group_name
+           FROM mkt_email_templates t
+           LEFT JOIN mkt_template_groups g ON g.tenant_id = t.tenant_id AND g.id = t.group_id
+           WHERE t.tenant_id = $1 AND t.id = $2
+           LIMIT 1`,
+          [ctx.tenantId, requestedId]
+        );
+        return r.rows[0] || null;
+      });
+      if (!singleRow) {
+        sendApiError(res, 404, 'TEMPLATE_NOT_FOUND', 'Không tìm thấy mẫu Email trong doanh nghiệp.');
+        return;
+      }
+      res.json({ success: true, data: mapTemplateRow(singleRow) });
+      return;
+    }
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       const [tplRes, grpRes, cfRes, tenantRes] = await Promise.all([
         client.query(
@@ -97,8 +169,8 @@ templatesRouter.get('/', requirePermission('mkt_templates', 'view'), async (_req
            ORDER BY field_key ASC`,
           [ctx.tenantId]
         ),
-        client.query<{ name: string; slug: string }>(
-          'SELECT name, slug FROM tenants WHERE id = $1 LIMIT 1',
+        client.query<{ name: string; slug: string; settings: Record<string, unknown> }>(
+          'SELECT name, slug, settings FROM tenants WHERE id = $1 LIMIT 1',
           [ctx.tenantId]
         ),
       ]);
@@ -119,15 +191,21 @@ templatesRouter.get('/', requirePermission('mkt_templates', 'view'), async (_req
       ];
 
       const sesVault = await readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']);
+      const tSettings = (tenantRes.rows[0]?.settings || {}) as Record<string, unknown>;
+      const hasAppscript = Boolean(String(tSettings.appscript_webhook_url || '').trim());
+      const hasResend = Boolean(String(tSettings.resend_api_key || '').trim());
+      const emailConfigured = sesVault.configured || hasAppscript || hasResend;
+      const emailProvider =
+        sesVault.integrationType || (hasAppscript ? 'appscript' : hasResend ? 'resend' : null);
 
       return {
         items: tplRes.rows.map(mapTemplateRow),
         groups: grpRes.rows,
         merge_tags: mergeTags,
         sender_vault: {
-          configured: sesVault.configured,
-          provider: sesVault.integrationType,
-          from_email: String(sesVault.config.from_email || sesVault.config.fromEmail || ''),
+          configured: emailConfigured,
+          provider: emailProvider,
+          from_email: String(sesVault.config.from_email || sesVault.config.fromEmail || tSettings.resend_from_email || ''),
           from_name: String(sesVault.config.from_name || sesVault.config.fromName || tenantRes.rows[0]?.name || ''),
         },
       };
@@ -227,12 +305,22 @@ templatesRouter.post('/validate', requirePermission('mkt_templates', 'view'), as
 
     const spam = analyzeEmailSpamScore(subject, blocks, compiledHtml);
     const vaultInfo = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const vault = await readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']);
+      const [vault, tRes] = await Promise.all([
+        readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']),
+        client.query<{ settings: Record<string, unknown> }>('SELECT settings FROM tenants WHERE id = $1 LIMIT 1', [
+          ctx.tenantId,
+        ]),
+      ]);
+      const tSettings = (tRes.rows[0]?.settings || {}) as Record<string, unknown>;
+      const hasAppscript = Boolean(String(tSettings.appscript_webhook_url || '').trim());
+      const hasResend = Boolean(String(tSettings.resend_api_key || '').trim());
+      const configured = vault.configured || hasAppscript || hasResend;
+      const provider = vault.integrationType || (hasAppscript ? 'appscript' : hasResend ? 'resend' : null);
       return {
-        configured: vault.configured,
-        provider: vault.integrationType,
-        spf_verified: Boolean(vault.config.spf_verified ?? vault.configured),
-        dkim_verified: Boolean(vault.config.dkim_verified ?? vault.configured),
+        configured,
+        provider,
+        spf_verified: Boolean(vault.config.spf_verified ?? configured),
+        dkim_verified: Boolean(vault.config.dkim_verified ?? configured),
       };
     });
 
@@ -419,7 +507,7 @@ templatesRouter.post('/quick-send', requirePermission('mkt_templates', 'create')
     const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
       const [tenantRes, vault] = await Promise.all([
         client.query<{ name: string }>('SELECT name FROM tenants WHERE id = $1 LIMIT 1', [ctx.tenantId]),
-        readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']),
+        readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp', 'appscript', 'resend']),
       ]);
       const tenantName = tenantRes.rows[0]?.name || 'DOMATION';
 
@@ -433,31 +521,58 @@ templatesRouter.post('/quick-send', requirePermission('mkt_templates', 'create')
         const tpl = tRes.rows[0];
         if (tpl) {
           if (!subject) subject = String(tpl.subject || '');
-          if (!html) html = String(tpl.compiled_html || '');
+          if (!html) {
+            html = String(tpl.compiled_html || '');
+            if (!html) {
+              const b = parseJsonCol<EmailBlockDto[]>(tpl.blocks_json, []);
+              const st = parseJsonCol<EmailBodyStyleDto>(tpl.body_style, {});
+              if (b.length > 0) html = compileEmailBlocksToHtml(b, st, subject || 'DOMATION Email');
+            }
+          }
         }
       }
       if (!html && Array.isArray(req.body?.blocks)) {
         html = compileEmailBlocksToHtml(req.body.blocks, req.body?.body_style || {}, subject || 'DOMATION Email');
       }
 
-      const dispatched: Array<{ email: string; lead_id: string | null; subject: string }> = [];
+      const dispatched: Array<{ email: string; lead_id: string | null; subject: string; provider: string; message_id: string }> = [];
       for (const email of rawRecipients.slice(0, 50)) {
         const lRes = await client.query(
           'SELECT id, name, phone, email, product_interest, custom_fields FROM leads WHERE tenant_id = $1 AND LOWER(email) = $2 AND is_deleted = false LIMIT 1',
           [ctx.tenantId, email]
         );
         const lead = lRes.rows[0];
+        const mergeCtx = {
+          lead: lead
+            ? { ...lead, custom_fields: parseJsonCol(lead.custom_fields, {}) }
+            : { email, name: fallbackVars['lead.name'] || 'Quý khách' },
+          tenant: { name: tenantName },
+          unsubscribe_url: '#unsubscribe',
+        };
         const renderedSubject = renderMergeTags(
           subject || 'Thông báo từ {{tenant.name}}',
-          {
-            lead: lead
-              ? { ...lead, custom_fields: parseJsonCol(lead.custom_fields, {}) }
-              : { email, name: fallbackVars['lead.name'] || 'Quý khách' },
-            tenant: { name: tenantName },
-            unsubscribe_url: '#unsubscribe',
-          },
+          mergeCtx,
           fallbackVars
         );
+        const renderedHtml = renderMergeTags(
+          html || `<div>${renderedSubject}</div>`,
+          mergeCtx,
+          fallbackVars
+        );
+        const mailRes = await dispatchMarketingEmail({
+          tenantId: ctx.tenantId,
+          client,
+          to: email,
+          subject: renderedSubject,
+          text: stripHtmlTagsForPlainText(renderedHtml) || renderedSubject,
+          html: renderedHtml,
+          category: 'system_alert',
+          meta: { quick_send: true, template_id: req.body?.template_id || null },
+          emailVaultConfigured: vault.configured,
+          emailVaultType: vault.integrationType,
+        });
+
+        if (!mailRes.sent) continue;
 
         if (lead?.id) {
           await client.query(
@@ -471,17 +586,23 @@ templatesRouter.post('/quick-send', requirePermission('mkt_templates', 'create')
               ctx.userId,
               ctx.userName || 'Quick Send',
               `Gửi nhanh Email: ${renderedSubject}`,
-              `Kênh gửi: ${vault.integrationType || 'vault_sandbox'}`,
-              JSON.stringify({ quick_send: true, email }),
+              `Kênh gửi: ${mailRes.provider}`,
+              JSON.stringify({ quick_send: true, email, provider: mailRes.provider, message_id: mailRes.messageId }),
             ]
           );
         }
-        dispatched.push({ email, lead_id: lead?.id ? String(lead.id) : null, subject: renderedSubject });
+        dispatched.push({
+          email,
+          lead_id: lead?.id ? String(lead.id) : null,
+          subject: renderedSubject,
+          provider: mailRes.provider,
+          message_id: mailRes.messageId,
+        });
       }
 
       return {
         sent_count: dispatched.length,
-        provider: vault.integrationType || 'vault_sandbox_queue',
+        provider: dispatched[0]?.provider || vault.integrationType || 'vault_sandbox_queue',
         vault_configured: vault.configured,
         dispatched,
       };
@@ -493,47 +614,649 @@ templatesRouter.post('/quick-send', requirePermission('mkt_templates', 'create')
   }
 });
 
-// DOM Agent Email Studio (AI Copy & Multi-Block Layout Generator)
+// ============================================================================
+// Pure-Node PNG Architectural Banner Encoder + Gemini Multimodal Image Studio
+// ============================================================================
+const PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function pngCrc32(buf: Buffer): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c = PNG_CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function makePngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(pngCrc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+
+function parseHexRgb(hex: string, fallback: [number, number, number]): [number, number, number] {
+  const clean = String(hex || '').trim().replace(/^#/, '');
+  if (/^[0-9a-fA-F]{3}$/.test(clean)) {
+    return [
+      parseInt(clean[0] + clean[0], 16),
+      parseInt(clean[1] + clean[1], 16),
+      parseInt(clean[2] + clean[2], 16),
+    ];
+  }
+  if (/^[0-9a-fA-F]{6}$/.test(clean)) {
+    return [
+      parseInt(clean.slice(0, 2), 16),
+      parseInt(clean.slice(2, 4), 16),
+      parseInt(clean.slice(4, 6), 16),
+    ];
+  }
+  return fallback;
+}
+
+function renderArchitecturalFallbackBannerPng(params: {
+  width: number;
+  height: number;
+  brandColor: string;
+  stylePreset: string;
+  hasLogo: boolean;
+  hasReference: boolean;
+}): Buffer {
+  const { width, height, brandColor, stylePreset, hasLogo, hasReference } = params;
+  const [br, bg, bb] = parseHexRgb(brandColor, [30, 64, 255]);
+  // Secondary harmonized color based on style preset
+  const preset = stylePreset.toLowerCase();
+  const [sr, sg, sb]: [number, number, number] =
+    preset.includes('sale') || preset.includes('offer')
+      ? [Math.min(255, br + 65), Math.max(20, Math.round(bg * 0.55)), Math.max(40, Math.round(bb * 0.7))]
+      : preset.includes('minimal') || preset.includes('editorial')
+        ? [241, 245, 249]
+        : preset.includes('event') || preset.includes('vip')
+          ? [15, 23, 42]
+          : [Math.max(12, Math.round(br * 0.35)), Math.min(240, Math.round(bg * 0.85 + 30)), Math.min(255, bb + 25)];
+
+  const stride = width * 4 + 1;
+  const raw = Buffer.alloc(stride * height);
+  const cx = width * 0.78;
+  const cy = height * 0.32;
+  const glowRadius = Math.max(width, height) * 0.55;
+
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * stride;
+    raw[rowOff] = 0; // filter: None
+    const ny = y / Math.max(1, height - 1);
+    for (let x = 0; x < width; x++) {
+      const nx = x / Math.max(1, width - 1);
+      const t = Math.min(1, Math.max(0, nx * 0.72 + ny * 0.28));
+
+      let r = br * (1 - t) + sr * t;
+      let g = bg * (1 - t) + sg * t;
+      let b = bb * (1 - t) + sb * t;
+
+      // Soft executive spotlight glow
+      const dx = x - cx;
+      const dy = y - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < glowRadius) {
+        const glow = Math.pow(1 - dist / glowRadius, 2.2) * 0.32;
+        r = r + (255 - r) * glow;
+        g = g + (255 - g) * glow;
+        b = b + (255 - b) * glow;
+      }
+
+      // Subtle architectural grid lines
+      if (x % 48 === 0 || y % 48 === 0) {
+        r = r * 0.96 + 255 * 0.04;
+        g = g * 0.96 + 255 * 0.04;
+        b = b * 0.96 + 255 * 0.04;
+      }
+
+      // Geometric accent ring on right side
+      const ringDist = Math.abs(dist - Math.min(width, height) * 0.36);
+      if (ringDist < 2.2) {
+        r = r * 0.65 + 255 * 0.35;
+        g = g * 0.65 + 255 * 0.35;
+        b = b * 0.65 + 255 * 0.35;
+      }
+
+      // Left-top brand logo anchor card indicator when logo provided
+      if (hasLogo && x >= 28 && x <= 116 && y >= 24 && y <= 56) {
+        r = r * 0.18 + 255 * 0.82;
+        g = g * 0.18 + 255 * 0.82;
+        b = b * 0.18 + 255 * 0.82;
+      }
+
+      // Subtle reference frame accent bar on bottom edge
+      if (hasReference && y >= height - 6) {
+        r = 255;
+        g = 255;
+        b = 255;
+      }
+
+      const px = rowOff + 1 + x * 4;
+      raw[px] = Math.max(0, Math.min(255, Math.round(r)));
+      raw[px + 1] = Math.max(0, Math.min(255, Math.round(g)));
+      raw[px + 2] = Math.max(0, Math.min(255, Math.round(b)));
+      raw[px + 3] = 255;
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // color type RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const compressed = zlib.deflateSync(raw, { level: 6 });
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  return Buffer.concat([
+    signature,
+    makePngChunk('IHDR', ihdr),
+    makePngChunk('IDAT', compressed),
+    makePngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function resolveAspectDimensions(rawAspect: unknown): {
+  aspectRatio: '16:9' | '3:1' | '4:3' | '1:1';
+  width: number;
+  height: number;
+} {
+  const val = String(rawAspect || '16:9').trim();
+  if (val === '3:1') return { aspectRatio: '3:1', width: 720, height: 240 };
+  if (val === '4:3') return { aspectRatio: '4:3', width: 640, height: 480 };
+  if (val === '1:1') return { aspectRatio: '1:1', width: 512, height: 512 };
+  return { aspectRatio: '16:9', width: 640, height: 360 };
+}
+
+const ALLOWED_INLINE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const MAX_INLINE_IMAGE_BASE64_CHARS = 8_500_000; // ~6 MB decoded cap
+
+function parseDataUrlBase64(input?: string): { mimeType: string; data: string } | null {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed || trimmed.length > MAX_INLINE_IMAGE_BASE64_CHARS) return null;
+  const match = trimmed.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/i);
+  if (match) {
+    const mime = match[1].toLowerCase();
+    if (!ALLOWED_INLINE_IMAGE_MIMES.has(mime)) return null;
+    const data = match[2].replace(/\s+/g, '');
+    if (data.length > MAX_INLINE_IMAGE_BASE64_CHARS) return null;
+    return { mimeType: mime, data };
+  }
+  // Plain base64 payload
+  if (/^[A-Za-z0-9+/=\s]{32,}$/.test(trimmed)) {
+    const data = trimmed.replace(/\s+/g, '');
+    if (data.length > MAX_INLINE_IMAGE_BASE64_CHARS) return null;
+    return { mimeType: 'image/png', data };
+  }
+  return null;
+}
+
+const ALLOWED_LOCAL_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+
+async function resolveImageToInlinePart(
+  base64Input?: string,
+  urlInput?: string,
+  tenantId?: string
+): Promise<{ mimeType: string; data: string } | null> {
+  const parsedB64 = parseDataUrlBase64(base64Input);
+  if (parsedB64) return parsedB64;
+
+  const cleanUrl = String(urlInput || '').trim();
+  if (!cleanUrl || cleanUrl.includes('\0')) return null;
+  // Support local /uploadss/... paths directly from disk without network call (zero SSRF)
+  if (cleanUrl.startsWith('/uploadss/')) {
+    const relRaw = cleanUrl.replace(/^\/uploadss\//, '').replace(/\\/g, '/');
+    if (!relRaw || relRaw.includes('..') || relRaw.startsWith('/')) return null;
+    // Enforce strict tenant isolation when referencing tenant-scoped ai_generated/ directory
+    if (relRaw.startsWith('ai_generated/') && tenantId) {
+      const safeTenantDir = tenantId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (!relRaw.startsWith(`ai_generated/${safeTenantDir}/`)) {
+        return null;
+      }
+    }
+    const ext = path.extname(relRaw).toLowerCase();
+    if (!ALLOWED_LOCAL_IMAGE_EXTS.has(ext)) return null;
+
+    const roots = [
+      process.env.UPLOADS_DIR ? path.resolve(process.env.UPLOADS_DIR) : '',
+      path.resolve(process.cwd(), 'public', 'uploadss'),
+      path.resolve(process.cwd(), 'uploadss'),
+    ].filter(Boolean);
+    for (const root of roots) {
+      const candidate = path.resolve(root, relRaw);
+      const relCheck = path.relative(root, candidate);
+      if (relCheck && !relCheck.startsWith('..') && !path.isAbsolute(relCheck)) {
+        try {
+          const stat = await fs.stat(candidate);
+          if (!stat.isFile() || stat.size > 6 * 1024 * 1024) continue;
+          const bytes = await fs.readFile(candidate);
+          const mimeType =
+            ext === '.jpg' || ext === '.jpeg'
+              ? 'image/jpeg'
+              : ext === '.webp'
+                ? 'image/webp'
+                : 'image/png';
+          return { mimeType, data: bytes.toString('base64') };
+        } catch {
+          // continue
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function generateAndPersistAiBanner(params: {
+  tenantId: string;
+  userId: string;
+  prompt: string;
+  aspectRatio: '16:9' | '3:1' | '4:3' | '1:1';
+  stylePreset: string;
+  brandColor: string;
+  referenceBase64?: string;
+  referenceUrl?: string;
+  logoBase64?: string;
+  logoUrl?: string;
+  saveToLibrary: boolean;
+  geminiApiKey?: string;
+}): Promise<{
+  url: string;
+  asset_id: string | null;
+  width: number;
+  height: number;
+  aspect_ratio: '16:9' | '3:1' | '4:3' | '1:1';
+  provider: string;
+  style_preset: string;
+  used_reference: boolean;
+  used_logo: boolean;
+  saved_to_library: boolean;
+}> {
+  const dims = resolveAspectDimensions(params.aspectRatio);
+  const usedReference = Boolean(String(params.referenceBase64 || params.referenceUrl || '').trim());
+  const usedLogo = Boolean(String(params.logoBase64 || params.logoUrl || '').trim());
+
+  let imageBytes: Buffer | null = null;
+  let provider = 'domation_brand_studio_fallback';
+  const silentMode = process.env.OUTBOUND_SILENT_MODE === 'true' || process.env.NODE_ENV === 'test';
+
+  if (!silentMode && params.geminiApiKey) {
+    try {
+      const [refPart, logoPart] = await Promise.all([
+        resolveImageToInlinePart(params.referenceBase64, params.referenceUrl, params.tenantId),
+        resolveImageToInlinePart(params.logoBase64, params.logoUrl, params.tenantId),
+      ]);
+
+      const promptLines = [
+        `Design an executive-grade email marketing banner image (${dims.aspectRatio}).`,
+        `Prompt: ${params.prompt}`,
+        `Visual style preset: ${params.stylePreset}.`,
+        `Primary brand accent color: ${params.brandColor}.`,
+        usedReference ? 'Follow the visual layout rhythm, lighting mood, and composition cues of the attached reference image.' : '',
+        usedLogo ? 'Cleanly integrate the attached brand logo in a balanced corner with high contrast and crisp breathing room.' : '',
+        'No garbled text, high editorial polish, clean negative space, modern commercial photography / graphic art direction.',
+      ].filter(Boolean);
+
+      const parts: Array<Record<string, unknown>> = [{ text: promptLines.join('\n') }];
+      if (refPart) parts.push({ inlineData: refPart });
+      if (logoPart) parts.push({ inlineData: logoPart });
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 25_000);
+      try {
+        const resp = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${encodeURIComponent(params.geminiApiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts }],
+              generationConfig: {
+                responseModalities: ['IMAGE', 'TEXT'],
+              },
+            }),
+          }
+        );
+        if (resp.ok) {
+          const json = (await resp.json()) as any;
+          const outParts: any[] = json?.candidates?.[0]?.content?.parts || [];
+          const imgPart = outParts.find((p) => p?.inlineData?.data);
+          if (imgPart?.inlineData?.data) {
+            imageBytes = Buffer.from(String(imgPart.inlineData.data), 'base64');
+            provider = 'gemini-2.5-flash-image';
+          }
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      // Secondary fallback to Imagen 3.0 if gemini-2.5-flash-image returned text only
+      if (!imageBytes) {
+        const imgController = new AbortController();
+        const imgTimeout = setTimeout(() => imgController.abort(), 25_000);
+        try {
+          const imagenAspect = dims.aspectRatio === '3:1' ? '16:9' : dims.aspectRatio;
+          const resp2 = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${encodeURIComponent(params.geminiApiKey)}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal: imgController.signal,
+              body: JSON.stringify({
+                instances: [{ prompt: promptLines.join(' ') }],
+                parameters: { sampleCount: 1, aspectRatio: imagenAspect },
+              }),
+            }
+          );
+          if (resp2.ok) {
+            const json2 = (await resp2.json()) as any;
+            const b64 = json2?.predictions?.[0]?.bytesBase64Encoded;
+            if (b64) {
+              imageBytes = Buffer.from(String(b64), 'base64');
+              provider = 'imagen-3.0-generate-002';
+            }
+          }
+        } finally {
+          clearTimeout(imgTimeout);
+        }
+      }
+    } catch {
+      // Fall through cleanly to local architectural PNG fallback
+    }
+  }
+
+  if (!imageBytes || imageBytes.length < 32) {
+    imageBytes = renderArchitecturalFallbackBannerPng({
+      width: dims.width,
+      height: dims.height,
+      brandColor: params.brandColor,
+      stylePreset: params.stylePreset,
+      hasLogo: usedLogo,
+      hasReference: usedReference,
+    });
+    provider = 'domation_brand_studio_fallback';
+  }
+
+  const uploadsRoot = process.env.UPLOADS_DIR
+    ? path.resolve(process.env.UPLOADS_DIR)
+    : path.resolve(process.cwd(), 'public', 'uploadss');
+  const safeTenantDir = params.tenantId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const fileUuid = crypto.randomUUID();
+  const targetDir = path.join(uploadsRoot, 'ai_generated', safeTenantDir);
+  await fs.mkdir(targetDir, { recursive: true });
+  const targetPath = path.join(targetDir, `${fileUuid}.png`);
+  await fs.writeFile(targetPath, imageBytes);
+
+  const publicUrl = `/uploadss/ai_generated/${safeTenantDir}/${fileUuid}.png`;
+  let assetId: string | null = null;
+
+  if (params.saveToLibrary) {
+    assetId = crypto.randomUUID();
+    const safeSlug = params.prompt
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/gi, 'd')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40) || 'ai-banner';
+    const fileName = `${safeSlug}-${fileUuid.slice(0, 6)}.png`;
+    await withTenantTransaction(params.tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO mkt_media_assets (
+           id, tenant_id, folder_name, file_name, mime_type, url,
+           size_bytes, width_px, height_px, alt_text, tags_json, created_by
+         ) VALUES ($1, $2, $3, $4, 'image/png', $5, $6, $7, $8, $9, $10::jsonb, $11)`,
+        [
+          assetId,
+          params.tenantId,
+          'AI Generated',
+          fileName,
+          publicUrl,
+          imageBytes!.length,
+          dims.width,
+          dims.height,
+          params.prompt.slice(0, 180),
+          JSON.stringify(['ai_generated', params.stylePreset, dims.aspectRatio]),
+          params.userId,
+        ]
+      );
+    });
+  }
+
+  return {
+    url: publicUrl,
+    asset_id: assetId,
+    width: dims.width,
+    height: dims.height,
+    aspect_ratio: dims.aspectRatio,
+    provider,
+    style_preset: params.stylePreset,
+    used_reference: usedReference,
+    used_logo: usedLogo,
+    saved_to_library: params.saveToLibrary,
+  };
+}
+
+// AI Email Banner Image Generator (Multimodal Reference + Brand Logo Import)
+templatesRouter.post('/ai-generate-image', requirePermission('mkt_templates', 'create'), async (req, res) => {
+  try {
+    const ctx = getTenantContext();
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const stylePreset = String(body.style_preset || 'hero_sale').trim() || 'hero_sale';
+    const rawPrompt = String(body.prompt || '').trim();
+    const prompt =
+      rawPrompt ||
+      `Executive email marketing hero banner (${stylePreset}) with crisp lighting and modern layout`;
+    const brandColor = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(body.brand_color || '').trim())
+      ? String(body.brand_color).trim()
+      : '#1E40FF';
+    const { aspectRatio } = resolveAspectDimensions(body.aspect_ratio);
+    const saveToLibrary = body.save_to_library !== false;
+
+    // Release PGlite mutex before outbound image generation
+    const tenantGate = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const [tRes, aiCfg] = await Promise.all([
+        client.query<{ settings: Record<string, unknown> }>(
+          'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        ),
+        resolveDecryptedSharedAiConfig(client, ctx.tenantId),
+      ]);
+      const norm = normalizeTenantSettings(tRes.rows[0]?.settings || {});
+      return {
+        enabled: norm.ai_image_generator_enabled,
+        apiKey: aiCfg.apiKey || '',
+        brandColor: norm.brand_primary_color || '#1E40FF',
+      };
+    });
+
+    if (!tenantGate.enabled) {
+      sendApiError(
+        res,
+        403,
+        'AI_IMAGE_GENERATOR_DISABLED',
+        'Công tắc "AI Tạo Ảnh Banner & Sáng tạo Hình ảnh" đang tắt trong Cài đặt Trợ lý AI.'
+      );
+      return;
+    }
+
+    const result = await generateAndPersistAiBanner({
+      tenantId: ctx.tenantId,
+      userId: ctx.userId,
+      prompt,
+      aspectRatio,
+      stylePreset,
+      brandColor: body.brand_color ? brandColor : tenantGate.brandColor,
+      referenceBase64: typeof body.reference_image_base64 === 'string' ? body.reference_image_base64 : undefined,
+      referenceUrl: typeof body.reference_image_url === 'string' ? body.reference_image_url : undefined,
+      logoBase64: typeof body.logo_image_base64 === 'string' ? body.logo_image_base64 : undefined,
+      logoUrl: typeof body.logo_image_url === 'string' ? body.logo_image_url : undefined,
+      saveToLibrary,
+      geminiApiKey: tenantGate.apiKey || undefined,
+    });
+
+    res.status(201).json({ success: true, data: result });
+  } catch (err: any) {
+    sendApiError(res, 500, 'AI_IMAGE_GENERATE_FAILED', err?.message || 'Không thể tạo ảnh Banner AI.');
+  }
+});
+
+// DOM Agent Email Studio (Executive Multi-Block Visual Designer + Optional Auto Hero Banner)
 templatesRouter.post('/ai-generate', requirePermission('mkt_templates', 'create'), async (req, res) => {
   try {
     const ctx = getTenantContext();
-    const goal = String(req.body?.goal || req.body?.prompt || 'Chào mừng khách hàng mới & gửi ưu đãi').trim();
-    const tone = String(req.body?.tone || 'professional').trim();
-    const ctaUrl = String(req.body?.cta_url || 'https://domation.net').trim();
-    const includeVoucher = Boolean(req.body?.include_voucher ?? true);
-    const includeCountdown = Boolean(req.body?.include_countdown ?? true);
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const goal = String(body.goal || body.prompt || 'Chào mừng khách hàng mới & gửi ưu đãi').trim();
+    const tone = String(body.tone || 'professional').trim().toLowerCase();
+    const industry = String(body.industry || '').trim();
+    const brandStyle = String(body.brand_style || 'executive_modern').trim();
+    const referenceCues = String(body.reference_cues || '').trim();
+    const ctaUrl = String(body.cta_url || 'https://domation.net').trim();
+    const includeVoucher = Boolean(body.include_voucher ?? true);
+    const includeCountdown = Boolean(body.include_countdown ?? true);
+    const includeBlocksRaw = Array.isArray(body.include_blocks) ? body.include_blocks.map(String) : [];
+    const autoGenerateBanner = Boolean(body.auto_generate_hero_banner);
+    const logoUrl = String(body.logo_url || '').trim();
+    let heroImageUrl = String(body.hero_image_url || '').trim();
 
     const tenantInfo = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const r = await client.query<{ name: string; industry: string }>(
-        'SELECT name, industry FROM tenants WHERE id = $1 LIMIT 1',
-        [ctx.tenantId]
-      );
-      return r.rows[0] || { name: 'Doanh nghiệp của bạn', industry: 'general' };
+      const [r, aiCfg] = await Promise.all([
+        client.query<{ name: string; industry: string; settings: Record<string, unknown> }>(
+          'SELECT name, industry, settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        ),
+        resolveDecryptedSharedAiConfig(client, ctx.tenantId),
+      ]);
+      const row = r.rows[0] || { name: 'Doanh nghiệp của bạn', industry: 'general', settings: {} };
+      const norm = normalizeTenantSettings(row.settings || {});
+      return {
+        name: norm.brand_display_name || row.name || 'Doanh nghiệp của bạn',
+        industry: industry || row.industry || norm.industry_key || 'general',
+        primaryColor: norm.brand_primary_color || '#1E40FF',
+        brandLogoUrl: logoUrl || norm.brand_logo_url || '',
+        footerText: norm.brand_email_footer_text || 'Hệ thống Marketing Automation & CRM Chuyên nghiệp',
+        aiEmailDesignerEnabled: norm.ai_email_designer_enabled,
+        aiImageGeneratorEnabled: norm.ai_image_generator_enabled,
+        apiKey: aiCfg.apiKey || '',
+      };
     });
+
+    if (!tenantInfo.aiEmailDesignerEnabled) {
+      sendApiError(
+        res,
+        403,
+        'AI_EMAIL_DESIGNER_DISABLED',
+        'Công tắc "AI Thiết kế Email Marketing" đang tắt trong Cài đặt Trợ lý AI.'
+      );
+      return;
+    }
+
+    const rawColor = String(body.brand_color || '').trim();
+    const accentColor =
+      /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(rawColor) ? rawColor : tenantInfo.primaryColor;
+
+    let heroBannerAsset: Awaited<ReturnType<typeof generateAndPersistAiBanner>> | null = null;
+    if (autoGenerateBanner && !heroImageUrl && tenantInfo.aiImageGeneratorEnabled) {
+      heroBannerAsset = await generateAndPersistAiBanner({
+        tenantId: ctx.tenantId,
+        userId: ctx.userId,
+        prompt: `${tenantInfo.name} email hero banner for: ${goal}`,
+        aspectRatio: '16:9',
+        stylePreset: brandStyle === 'luxury' || tone === 'luxury' ? 'event_invite' : 'hero_sale',
+        brandColor: accentColor,
+        logoUrl: tenantInfo.brandLogoUrl || undefined,
+        saveToLibrary: true,
+        geminiApiKey: tenantInfo.apiKey || undefined,
+      });
+      heroImageUrl = heroBannerAsset.url;
+    }
 
     const greeting =
       tone === 'friendly'
         ? 'Chào bạn {{lead.name}},'
-        : tone === 'urgent'
-          ? 'Thông báo đặc quyền dành riêng cho {{lead.name}},'
-          : 'Kính gửi {{lead.name}},';
+        : tone === 'urgent' || tone === 'persuasive'
+          ? 'Thông báo đặc quyền giới hạn dành riêng cho {{lead.name}},'
+          : tone === 'luxury'
+            ? 'Trân trọng kính mời Quý khách {{lead.name}},'
+            : 'Kính gửi {{lead.name}},';
 
-    const generatedBlocks: EmailBlockDto[] = [
+    const toneBadge =
+      tone === 'luxury'
+        ? 'EXECUTIVE EDITION'
+        : tone === 'urgent' || tone === 'persuasive'
+          ? 'ƯU ĐÃI GIỚI HẠN'
+          : tone === 'friendly'
+            ? 'BẢN TIN ĐẶC QUYỀN'
+            : 'THÔNG BÁO CHÍNH THỨC';
+
+    const industryHighlights: Record<string, Array<{ heading: string; body: string }>> = {
+      education: [
+        { heading: 'Lộ trình Chuẩn Quốc tế', body: 'Chương trình thiết kế thực chiến, đồng hành 1:1 cùng chuyên gia đầu ngành.' },
+        { heading: 'Học bổng & Ưu tiên Xét duyệt', body: 'Hỗ trợ hồ sơ nhanh chóng kèm đặc quyền học phí dành riêng cho đợt này.' },
+      ],
+      real_estate: [
+        { heading: 'Pháp lý Minh bạch 100%', body: 'Hồ sơ quy hoạch rõ ràng, tiến độ cam kết và chính sách thanh toán linh hoạt.' },
+        { heading: 'Đặc quyền Tham quan Riêng', body: 'Đặt lịch tư vấn 1:1 cùng chuyên viên cấp cao và nhận bảng hàng mới nhất.' },
+      ],
+      ecommerce: [
+        { heading: 'Thiết kế Tuyển chọn', body: 'Chất liệu cao cấp, số lượng giới hạn cho bộ sưu tập mới nhất mùa này.' },
+        { heading: 'Giao hàng Ưu tiên & Đổi trả Dễ dàng', body: 'Miễn phí vận chuyển toàn quốc và bảo hành chính hãng 30 ngày.' },
+      ],
+    };
+    const featurePair = industryHighlights[tenantInfo.industry.toLowerCase()] || [
+      { heading: 'Triển khai Tức thì & Hiệu quả', body: 'Quy trình chuẩn hóa giúp tối ưu thời gian, nâng cao hiệu suất chuyển đổi rõ rệt.' },
+      { heading: 'Đồng hành Chuyên sâu 1:1', body: 'Đội ngũ chuyên gia luôn sẵn sàng hỗ trợ và tùy biến theo mục tiêu thực tế của bạn.' },
+    ];
+
+    const generatedBlocks: EmailBlockDto[] = [];
+
+    if (heroImageUrl) {
+      generatedBlocks.push({
+        id: crypto.randomUUID(),
+        type: 'image',
+        title: `${tenantInfo.name} — ${goal}`,
+        imageUrl: heroImageUrl,
+        url: ctaUrl,
+        align: 'center',
+      });
+    }
+
+    generatedBlocks.push(
       {
         id: crypto.randomUUID(),
         type: 'hero_banner',
         title: `${tenantInfo.name} — ${goal}`,
-        content: `Giải pháp được cá nhân hóa dành riêng cho nhu cầu {{lead.product_interest}} của Quý khách.`,
-        buttonLabel: 'Xem chi tiết ưu đãi',
+        subtitle: toneBadge,
+        content: referenceCues
+          ? `Giải pháp cá nhân hóa dành cho {{lead.product_interest}} (${referenceCues.slice(0, 90)}).`
+          : `Giải pháp được cá nhân hóa dành riêng cho nhu cầu {{lead.product_interest}} của Quý khách.`,
+        buttonLabel: tone === 'luxury' ? 'Xác nhận Đặc quyền VIP' : 'Khám phá Chi tiết Ngay',
         url: ctaUrl,
         align: 'center',
-        accentColor: '#1E40FF',
+        accentColor,
       },
       {
         id: crypto.randomUUID(),
         type: 'text',
         title: 'Điểm nhấn giá trị thực tiễn',
-        content: `${greeting}\n\nĐội ngũ ${tenantInfo.name} trân trọng cảm ơn sự quan tâm của bạn đối với "${goal}". Chúng tôi đã chuẩn bị lộ trình triển khai tối ưu giúp tiết kiệm thời gian và gia tăng hiệu quả chuyển đổi rõ rệt.`,
+        content: `${greeting}\n\nĐội ngũ ${tenantInfo.name} trân trọng gửi tới bạn thông tin nổi bật về "${goal}". Chúng tôi thiết kế lộ trình tinh gọn giúp bạn đạt kết quả tối ưu ngay từ tuần đầu tiên triển khai.`,
         align: 'left',
       },
       {
@@ -541,39 +1264,47 @@ templatesRouter.post('/ai-generate', requirePermission('mkt_templates', 'create'
         type: 'columns',
         columns: [
           {
-            heading: 'Triển khai Tức thì',
-            body: 'Đồng bộ dữ liệu khách hàng 360° tự động, không mất thời gian nhập liệu thủ công.',
+            heading: featurePair[0].heading,
+            body: featurePair[0].body,
             ctaLabel: 'Tìm hiểu thêm',
             ctaUrl,
           },
           {
-            heading: 'Bảo mật Đa tầng',
-            body: 'Cô lập dữ liệu chuẩn doanh nghiệp kèm theo dõi hiệu suất chuyển đổi theo thời gian thực.',
-            ctaLabel: 'Xem bảng giá',
+            heading: featurePair[1].heading,
+            body: featurePair[1].body,
+            ctaLabel: 'Xem chi tiết',
             ctaUrl,
           },
         ],
       },
-    ];
+      {
+        id: crypto.randomUUID(),
+        type: 'text',
+        title: 'Khách hàng nói gì về chúng tôi',
+        content: `"Trải nghiệm cùng ${tenantInfo.name} vượt xa kỳ vọng — đội ngũ phản hồi cực nhanh, quy trình rõ ràng và mang lại tăng trưởng thực chất chỉ sau 30 ngày." — Đại diện Khách hàng Doanh nghiệp`,
+        align: 'left',
+        backgroundColor: '#F8FAFC',
+      }
+    );
 
-    if (includeVoucher) {
+    if (includeVoucher || includeBlocksRaw.includes('voucher')) {
       generatedBlocks.push({
         id: crypto.randomUUID(),
         type: 'voucher_box',
         title: 'Mã Ưu Đãi Đặc Quyền Của Bạn',
         voucherCode: '{{lead.voucher_code}}',
-        content: 'Nhập mã khi xác nhận đơn hàng để nhận chiết khấu trực tiếp.',
-        accentColor: '#1E40FF',
+        content: 'Sao chép và nhập mã khi xác nhận đăng ký để nhận ưu đãi trực tiếp.',
+        accentColor,
       });
     }
 
-    if (includeCountdown) {
+    if (includeCountdown || includeBlocksRaw.includes('countdown')) {
       generatedBlocks.push({
         id: crypto.randomUUID(),
         type: 'countdown_timer',
-        title: 'Thời hạn hiệu lực của ưu đãi',
+        title: 'Thời hạn hiệu lực của chương trình',
         countdownIso: new Date(Date.now() + 72 * 3600_000).toISOString(),
-        accentColor: '#1E40FF',
+        accentColor,
       });
     }
 
@@ -581,10 +1312,10 @@ templatesRouter.post('/ai-generate', requirePermission('mkt_templates', 'create'
       {
         id: crypto.randomUUID(),
         type: 'button',
-        buttonLabel: 'Kích hoạt quyền lợi ngay',
+        buttonLabel: tone === 'urgent' ? 'Nhận Ưu Đãi Ngay Hôm Nay' : 'Kích hoạt Quyền lợi Ngay',
         url: ctaUrl,
         align: 'center',
-        accentColor: '#1E40FF',
+        accentColor,
       },
       {
         id: crypto.randomUUID(),
@@ -592,13 +1323,178 @@ templatesRouter.post('/ai-generate', requirePermission('mkt_templates', 'create'
         socialLinks: [
           { network: 'Website', url: ctaUrl },
           { network: 'Zalo OA', url: ctaUrl },
+          { network: 'Facebook', url: ctaUrl },
         ],
       }
     );
 
+    // Rich Gmail-Safe Frontend Visual Editor Block Tree (100% compatible with EmailEditor compileHTML)
+    const editorBlocks: Array<Record<string, unknown>> = [];
+    if (tenantInfo.brandLogoUrl) {
+      editorBlocks.push({
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#ffffff', paddingTop: '20px', paddingBottom: '12px', paddingLeft: '24px', paddingRight: '24px', textAlign: 'center' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'image',
+            content: '',
+            url: tenantInfo.brandLogoUrl,
+            altText: tenantInfo.name,
+            style: { width: '140px', maxWidth: '160px', textAlign: 'center', borderRadius: '8px' },
+          },
+        ],
+      });
+    }
+
+    if (heroImageUrl) {
+      editorBlocks.push({
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#ffffff', paddingTop: '0px', paddingBottom: '0px', paddingLeft: '0px', paddingRight: '0px' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'image',
+            content: '',
+            url: heroImageUrl,
+            altText: `${tenantInfo.name} Banner`,
+            style: { width: '100%', borderRadius: '0px' },
+          },
+        ],
+      });
+    }
+
+    editorBlocks.push(
+      {
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: accentColor, paddingTop: '34px', paddingBottom: '34px', paddingLeft: '28px', paddingRight: '28px', textAlign: 'center' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'text',
+            content: `<div style="font-size:11px;font-weight:800;letter-spacing:1.4px;text-transform:uppercase;color:rgba(255,255,255,0.85);margin-bottom:10px;">${toneBadge}</div><h1 style="margin:0 0 12px 0;font-size:26px;line-height:1.25;font-weight:800;color:#ffffff;">${goal}</h1><p style="margin:0;font-size:15px;line-height:1.6;color:rgba(255,255,255,0.92);">${tenantInfo.name} — Giải pháp tối ưu cá nhân hóa cho {{lead.name}}</p>`,
+            style: { color: '#ffffff', textAlign: 'center', paddingTop: '0px', paddingBottom: '16px' },
+          },
+          {
+            id: crypto.randomUUID(),
+            type: 'button',
+            content: tone === 'luxury' ? 'Xác nhận Đặc quyền VIP' : 'Khám phá Chi tiết Ngay',
+            url: ctaUrl,
+            style: { backgroundColor: '#ffffff', color: accentColor, fontWeight: '700', fontSize: '14px', borderRadius: '10px', paddingTop: '12px', paddingBottom: '12px', paddingLeft: '26px', paddingRight: '26px', textAlign: 'center' },
+          },
+        ],
+      },
+      {
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#ffffff', paddingTop: '28px', paddingBottom: '20px', paddingLeft: '28px', paddingRight: '28px' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'text',
+            content: `<p style="margin:0 0 12px 0;font-size:15px;font-weight:700;color:#0f172a;">${greeting}</p><p style="margin:0;font-size:14px;line-height:1.7;color:#334155;">Đội ngũ <strong>${tenantInfo.name}</strong> trân trọng gửi tới bạn bộ thông tin nổi bật dành riêng cho chương trình <strong>${goal}</strong>. Mọi hạng mục đã được tinh gọn để giúp bạn dễ dàng nắm bắt quyền lợi và triển khai hiệu quả ngay hôm nay.</p>`,
+            style: { color: '#334155', fontSize: '14px', lineHeight: '1.7', textAlign: 'left' },
+          },
+        ],
+      },
+      {
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#F8FAFC', paddingTop: '22px', paddingBottom: '22px', paddingLeft: '28px', paddingRight: '28px' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'check_list',
+            content: '',
+            checkListTitle: '3 Giá trị Nổi bật Dành Riêng Cho Bạn',
+            items: [
+              { id: crypto.randomUUID(), title: featurePair[0].heading, description: featurePair[0].body },
+              { id: crypto.randomUUID(), title: featurePair[1].heading, description: featurePair[1].body },
+              { id: crypto.randomUUID(), title: 'Cam kết Đồng hành Trực tiếp', description: 'Tư vấn chuyên sâu theo đúng nhu cầu {{lead.product_interest}} và hỗ trợ nhanh trong 15 phút.' },
+            ],
+            style: { color: '#0f172a', accentColor },
+          },
+        ],
+      },
+      {
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#ffffff', paddingTop: '20px', paddingBottom: '20px', paddingLeft: '28px', paddingRight: '28px' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'review',
+            content: `"Đội ngũ ${tenantInfo.name} làm việc rất chuyên nghiệp, lộ trình rõ ràng và giúp chúng tôi thấy hiệu quả thực tế ngay trong tháng đầu tiên."`,
+            rating: 5,
+            altText: `Khách hàng tiêu biểu của ${tenantInfo.name}`,
+            style: { backgroundColor: '#F8FAFC', borderRadius: '12px', paddingTop: '16px', paddingBottom: '16px', paddingLeft: '18px', paddingRight: '18px', color: '#0f172a' },
+          },
+        ],
+      }
+    );
+
+    if (includeVoucher || includeBlocksRaw.includes('voucher')) {
+      editorBlocks.push({
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#ffffff', paddingTop: '8px', paddingBottom: '20px', paddingLeft: '28px', paddingRight: '28px' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'voucher',
+            content: '{{lead.voucher_code}}',
+            altText: 'Mã ưu đãi đặc quyền — Áp dụng khi xác nhận đăng ký',
+            style: { backgroundColor: '#EFF6FF', color: accentColor, borderColor: accentColor, borderRadius: '12px', textAlign: 'center', paddingTop: '18px', paddingBottom: '18px' },
+          },
+        ],
+      });
+    }
+
+    if (includeCountdown || includeBlocksRaw.includes('countdown')) {
+      editorBlocks.push({
+        id: crypto.randomUUID(),
+        type: 'section',
+        content: '',
+        style: { backgroundColor: '#ffffff', paddingTop: '4px', paddingBottom: '16px', paddingLeft: '28px', paddingRight: '28px', textAlign: 'center' },
+        children: [
+          {
+            id: crypto.randomUUID(),
+            type: 'countdown',
+            content: new Date(Date.now() + 72 * 3600_000).toISOString(),
+            style: { backgroundColor: '#0f172a', color: '#ffffff', borderRadius: '10px', textAlign: 'center', paddingTop: '14px', paddingBottom: '14px' },
+          },
+        ],
+      });
+    }
+
+    editorBlocks.push({
+      id: crypto.randomUUID(),
+      type: 'section',
+      content: '',
+      style: { backgroundColor: '#0F172A', paddingTop: '24px', paddingBottom: '24px', paddingLeft: '28px', paddingRight: '28px', textAlign: 'center' },
+      children: [
+        {
+          id: crypto.randomUUID(),
+          type: 'text',
+          content: `<p style="margin:0 0 8px 0;font-size:13px;font-weight:700;color:#f8fafc;">${tenantInfo.name}</p><p style="margin:0 0 10px 0;font-size:12px;color:#94a3b8;">${tenantInfo.footerText}</p><p style="margin:0;font-size:11px;color:#64748b;">Nếu không muốn tiếp tục nhận tin, bạn có thể <a href="{{unsubscribe_url}}" style="color:#93c5fd;text-decoration:underline;">Hủy đăng ký tại đây</a>.</p>`,
+          style: { color: '#94a3b8', fontSize: '12px', textAlign: 'center' },
+        },
+      ],
+    });
+
     const subject = `[${tenantInfo.name}] ${goal} dành cho {{lead.name}}`;
     const preheader = `Khám phá giải pháp tối ưu từ ${tenantInfo.name} và nhận quyền lợi dành riêng cho bạn.`;
-    const compiledHtml = compileEmailBlocksToHtml(generatedBlocks, { primaryColor: '#1E40FF' }, subject);
+    const compiledHtml = compileEmailBlocksToHtml(generatedBlocks, { primaryColor: accentColor }, subject);
     const spamAnalysis = analyzeEmailSpamScore(subject, generatedBlocks, compiledHtml);
 
     res.json({
@@ -607,9 +1503,12 @@ templatesRouter.post('/ai-generate', requirePermission('mkt_templates', 'create'
         generator: 'DOM Agent Email Studio',
         subject,
         preheader,
+        brand_color: accentColor,
         blocks: generatedBlocks,
+        editor_blocks: editorBlocks,
         compiled_html: compiledHtml,
         spam_analysis: spamAnalysis,
+        ...(heroBannerAsset ? { hero_banner_asset: heroBannerAsset } : {}),
       },
     });
   } catch (err: any) {
@@ -654,15 +1553,18 @@ templatesRouter.post('/', requirePermission('mkt_templates', 'create'), async (r
       )
     );
 
+    const rawThumbCreate = req.body?.thumbnail_url ?? req.body?.thumbnailUrl ?? req.body?.thumbnail;
+    const thumbnailUrl = rawThumbCreate ? String(rawThumbCreate).trim() || null : null;
+
     const id = crypto.randomUUID();
     const saved = await withTenantTransaction(ctx.tenantId, async (client) => {
       await client.query(
         `INSERT INTO mkt_email_templates (
            id, tenant_id, group_id, name, subject, preheader, category,
-           blocks_json, body_style, compiled_html, spam_score, merge_tags, visibility, status, created_by
+           blocks_json, body_style, compiled_html, thumbnail_url, spam_score, merge_tags, visibility, status, created_by
          ) VALUES (
            $1, $2, $3, $4, $5, $6, $7,
-           $8::jsonb, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15
+           $8::jsonb, $9::jsonb, $10, $11, $12, $13::jsonb, $14, $15, $16
          )`,
         [
           id,
@@ -675,6 +1577,7 @@ templatesRouter.post('/', requirePermission('mkt_templates', 'create'), async (r
           JSON.stringify(blocks),
           JSON.stringify(bodyStyle),
           compiledHtml,
+          thumbnailUrl,
           spam.score,
           JSON.stringify(detectedTags),
           visibility,
@@ -760,6 +1663,18 @@ templatesRouter.put('/:id', requirePermission('mkt_templates', 'edit'), async (r
         )
       );
 
+      const status =
+        req.body?.status !== undefined ? String(req.body.status).trim() : String(existing.status || 'active');
+      const visibility =
+        req.body?.visibility !== undefined ? String(req.body.visibility).trim() : String(existing.visibility || 'company');
+      const rawSavedBlocks = req.body?.saved_blocks ?? req.body?.savedBlocks ?? req.body?.saved_blocks_json;
+      const savedBlocks = Array.isArray(rawSavedBlocks)
+        ? rawSavedBlocks
+        : parseJsonCol<EmailBlockDto[]>(existing.saved_blocks_json, []);
+      const rawThumb = req.body?.thumbnail_url !== undefined ? req.body.thumbnail_url : req.body?.thumbnailUrl;
+      const thumbnailUrl =
+        rawThumb !== undefined ? (rawThumb ? String(rawThumb) : null) : existing.thumbnail_url;
+
       await client.query(
         `UPDATE mkt_email_templates
          SET name = $3,
@@ -772,6 +1687,10 @@ templatesRouter.put('/:id', requirePermission('mkt_templates', 'edit'), async (r
              compiled_html = $10,
              spam_score = $11,
              merge_tags = $12::jsonb,
+             status = $13,
+             visibility = $14,
+             saved_blocks_json = $15::jsonb,
+             thumbnail_url = $16,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
         [
@@ -787,6 +1706,10 @@ templatesRouter.put('/:id', requirePermission('mkt_templates', 'edit'), async (r
           compiledHtml,
           spam.score,
           JSON.stringify(detectedTags),
+          status,
+          visibility,
+          JSON.stringify(savedBlocks),
+          thumbnailUrl,
         ]
       );
 
@@ -847,10 +1770,20 @@ templatesRouter.post('/:id/test-send', requirePermission('mkt_templates', 'view'
       const tpl = tplRes.rows[0];
       if (!tpl) return null;
 
-      const tenantRes = await client.query<{ name: string }>('SELECT name FROM tenants WHERE id = $1 LIMIT 1', [
-        ctx.tenantId,
+      const [tenantRes, vault] = await Promise.all([
+        client.query<{ name: string; settings: Record<string, unknown> }>(
+          'SELECT name, settings FROM tenants WHERE id = $1 LIMIT 1',
+          [ctx.tenantId]
+        ),
+        readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']),
       ]);
-      const vault = await readTenantChannelVault(client, ctx.tenantId, ['aws_ses', 'smtp']);
+
+      const tSettings = (tenantRes.rows[0]?.settings || {}) as Record<string, unknown>;
+      const hasAppscript = Boolean(String(tSettings.appscript_webhook_url || '').trim());
+      const hasResend = Boolean(String(tSettings.resend_api_key || '').trim());
+      const emailConfigured = vault.configured || hasAppscript || hasResend;
+      const emailProvider =
+        vault.integrationType || (hasAppscript ? 'appscript' : hasResend ? 'resend' : null);
 
       const sampleCtx = {
         lead: {
@@ -870,12 +1803,36 @@ templatesRouter.post('/:id/test-send', requirePermission('mkt_templates', 'view'
       const renderedSubject = renderMergeTags(String(tpl.subject || tpl.name), sampleCtx);
       const renderedHtml = renderMergeTags(String(tpl.compiled_html || ''), sampleCtx);
 
+      let delivery: { sent: boolean; queued?: boolean; message_id: string; provider: string; error?: string } | null = null;
+      if (req.body?.send_live !== false) {
+        const mailRes = await dispatchMarketingEmail({
+          tenantId: ctx.tenantId,
+          client,
+          to: toEmail,
+          subject: renderedSubject,
+          text: stripHtmlTagsForPlainText(renderedHtml) || renderedSubject,
+          html: renderedHtml || `<div>${renderedSubject}</div>`,
+          category: 'system_alert',
+          meta: { test_send: true, template_id: tpl.id },
+          emailVaultConfigured: emailConfigured,
+          emailVaultType: emailProvider,
+        });
+        delivery = {
+          sent: mailRes.sent,
+          queued: mailRes.queued,
+          message_id: mailRes.messageId,
+          provider: mailRes.provider,
+          ...(mailRes.error ? { error: mailRes.error } : {}),
+        };
+      }
+
       return {
         to_email: toEmail,
-        vault_configured: vault.configured,
-        provider: vault.integrationType || 'vault_sandbox_preview',
+        vault_configured: emailConfigured,
+        provider: delivery?.provider || emailProvider || 'vault_sandbox_preview',
         rendered_subject: renderedSubject,
         rendered_html: renderedHtml,
+        ...(delivery ? { delivery } : {}),
       };
     });
 

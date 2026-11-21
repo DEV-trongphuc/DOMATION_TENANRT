@@ -7,7 +7,7 @@ import {
   type TenantSettings,
 } from '../../core/settings/tenant-settings.ts';
 import {
-  buildLegacyDateFilter,
+  buildLegacyDateFilterFromParams,
   enrichLeadAssigneeAndRound,
   formatDateTimeVnSql,
   mapPgLeadRowToLegacy,
@@ -19,8 +19,12 @@ import {
 import { normalizePhoneE164 } from '../../services/phone.service.ts';
 import { maskPhoneString, maskEmailString } from '../../core/security/pii-masker.ts';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
-import { dispatchStageCapiEventDetached } from '../../services/capi.service.ts';
+import {
+  dispatchStageCapiEventDetached,
+  resolveCapiEventForQualityOrStage,
+} from '../../services/capi.service.ts';
 import { renderEmailHtmlEnvelope, sendTenantEmailNotification } from '../../services/zalo-mail.service.ts';
+import { emitDomainEvent } from '../../core/events/event-bus.ts';
 
 const ADMIN_OR_MANAGER_ROLES = ['admin', 'tenant_admin', 'manager', 'super_admin'];
 
@@ -56,10 +60,113 @@ export async function handleLegacyCrmStandalone(
       },
     });
 
+    await emitDomainEvent('lead.created', {
+      tenantId: ctx.tenantId,
+      leadId: res.leadId,
+      status: res.status,
+      source: rawSource,
+      actorId: ctx.userId,
+    });
+
     return {
       success: true,
       message: `Đã thêm Lead & điều phối (${res.assignedName || res.status}).`,
       data: res,
+    };
+  }
+
+  if (action === 'update_lead_quality') {
+    const leadId = String(body.lead_id || body.id || '').trim();
+    const qualityStatus = String(body.quality_status || 'Pending').trim();
+    const qualityNote = body.quality_note !== undefined ? String(body.quality_note) : null;
+    if (!leadId) return { success: false, message: 'Thiếu ID khách hàng.' };
+
+    const txOutcome = await withTenantTransaction(ctx.tenantId, async (client) => {
+      if (ctx.userRole === 'sale' || ctx.isExternalAgency) {
+        const ownerCheck = await client.query(
+          'SELECT id, assigned_to FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, leadId]
+        );
+        if (!ownerCheck.rows.length) {
+          return { error: { _status: 404, success: false, error: 'Lead not found' } };
+        }
+        if (ownerCheck.rows[0].assigned_to !== ctx.userId) {
+          return { error: { _status: 403, success: false, error: 'Forbidden: you can only update leads assigned to you' } };
+        }
+      }
+
+      const updRes = await client.query(
+        `UPDATE leads
+         SET quality_status = $3,
+             quality_note = COALESCE($4, quality_note),
+             last_engaged_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING *`,
+        [ctx.tenantId, leadId, qualityStatus, qualityNote]
+      );
+      if (!updRes.rows[0]) {
+        return { error: { _status: 404, success: false, error: 'Lead not found' } };
+      }
+      return { lead: updRes.rows[0] };
+    });
+
+    if ('error' in txOutcome && txOutcome.error) {
+      return txOutcome.error;
+    }
+
+    const l = txOutcome.lead;
+    const capiEvent = resolveCapiEventForQualityOrStage({
+      qualityStatus,
+      tenantSettings: cfg,
+    });
+
+    let capiDispatched = null;
+    if (capiEvent) {
+      const capiRes = await dispatchStageCapiEventDetached({
+        tenantId: ctx.tenantId,
+        tenantSlug: ctx.tenantSlug,
+        eventName: capiEvent,
+        tenantSettings: cfg,
+        lead: {
+          leadId: l.id,
+          name: l.name,
+          phone: l.phone,
+          email: l.email,
+          fbc: l.fbc,
+          fbp: l.fbp,
+          fbclid: l.fbclid,
+          metaLeadId: l.meta_lead_id,
+          dealValue: Number(l.total_revenue_vnd || 0) || undefined,
+          customFields: l.custom_fields,
+        },
+        timelineAudit: {
+          actorId: ctx.userId,
+          actorRole: ctx.userRole,
+          stageName: qualityStatus,
+        },
+      });
+      capiDispatched = {
+        event_name: capiRes.event_name,
+        event_id: capiRes.event_id,
+        status: capiRes.status,
+        http_status: capiRes.status,
+        status_label: capiRes.status_label,
+        fbtrace_id: capiRes.fbtrace_id,
+      };
+    }
+
+    await emitDomainEvent('lead.updated', {
+      tenantId: ctx.tenantId,
+      leadId: String(l.id),
+      changedFields: ['quality_status'],
+      actorId: ctx.userId,
+    });
+
+    return {
+      success: true,
+      message: 'Đã cập nhật chất lượng Lead.',
+      capi_dispatched: capiDispatched,
     };
   }
 
@@ -104,6 +211,14 @@ export async function handleLegacyCrmStandalone(
       );
     });
 
+    await emitDomainEvent('lead.created', {
+      tenantId: ctx.tenantId,
+      leadId: ingested.leadId,
+      status: ingested.status,
+      source: held.source || 'AI Pre-screener',
+      actorId: ctx.userId,
+    });
+
     return {
       success: true,
       message: `Đã duyệt Lead và phân bổ cho ${ingested.assignedName || 'Đại lý'}.`,
@@ -126,19 +241,34 @@ export async function handleLegacyCrm(
     const page = Math.max(1, Number(params.get('page') || 1));
     const pageSize = Math.min(250, Math.max(1, Number(params.get('pageSize') || 50)));
     const offset = (page - 1) * pageSize;
-    const dateFilter = buildLegacyDateFilter(params.get('date') || 'Tháng này');
+    const dateFilter = buildLegacyDateFilterFromParams(params, 'Tháng này');
     const statusFilter = String(params.get('status') || 'all');
     const consultantFilter = String(params.get('consultant') || 'all');
     const roundFilter = String(params.get('round') || 'all');
     const searchFilter = String(params.get('search') || '').trim();
+    const leadIdFilter = String(params.get('lead_id') || '').trim();
+    const campaignIdFilter = String(params.get('campaign_id') || '').trim();
     const excludeStatus = String(params.get('exclude_status') || '');
     const qualityFilter = String(params.get('quality_status') || 'all');
 
     const qParams: unknown[] = [ctx.tenantId];
     const conds: string[] = ['l.tenant_id = $1', 'l.is_deleted = false'];
 
-    if (!searchFilter) {
+    if (!searchFilter && !leadIdFilter && !campaignIdFilter) {
       conds.push(`(${dateFilter.bindSql('l.created_at', qParams)})`);
+    }
+
+    if (leadIdFilter) {
+      qParams.push(leadIdFilter);
+      conds.push(`l.id::text = $${qParams.length}`);
+    }
+
+    if (campaignIdFilter) {
+      qParams.push(campaignIdFilter);
+      const cpIdx = qParams.length;
+      conds.push(
+        `(l.campaign_id = $${cpIdx} OR COALESCE(l.custom_fields->>'campaign_id', '') = $${cpIdx} OR COALESCE(l.campaign, '') ILIKE $${cpIdx})`
+      );
     }
 
     if (ctx.userRole === 'sale') {
@@ -185,7 +315,9 @@ export async function handleLegacyCrm(
     if (searchFilter) {
       qParams.push(`%${searchFilter}%`);
       const pIdx = qParams.length;
-      conds.push(`(l.name ILIKE $${pIdx} OR l.phone ILIKE $${pIdx} OR COALESCE(l.email,'') ILIKE $${pIdx})`);
+      conds.push(
+        `(l.name ILIKE $${pIdx} OR l.phone ILIKE $${pIdx} OR COALESCE(l.email,'') ILIKE $${pIdx} OR COALESCE(l.campaign,'') ILIKE $${pIdx} OR COALESCE(l.campaign_id,'') ILIKE $${pIdx} OR COALESCE(l.ad_id,'') ILIKE $${pIdx})`
+      );
     }
 
     const whereSql = conds.join(' AND ');
@@ -204,17 +336,16 @@ export async function handleLegacyCrm(
                 u.full_name AS assigned_to_name, u.avatar_url AS assigned_to_avatar,
                 r.name AS round_name,
                 s.stage_name,
-                COALESCE(mai.thumbnail_url, l.custom_fields->>'ad_thumbnail_url') AS ad_thumbnail_url,
-                COALESCE(mai.image_url, l.custom_fields->>'ad_image_url') AS ad_image_url,
-                COALESCE(mai.creative_title, l.custom_fields->>'ad_creative_title') AS ad_creative_title,
-                COALESCE(mai.creative_body, l.custom_fields->>'ad_creative_body') AS ad_creative_body,
-                COALESCE(mai.story_id, l.custom_fields->>'ad_story_id') AS ad_story_id,
+                l.custom_fields->>'ad_thumbnail_url' AS ad_thumbnail_url,
+                l.custom_fields->>'ad_image_url' AS ad_image_url,
+                l.custom_fields->>'ad_creative_title' AS ad_creative_title,
+                l.custom_fields->>'ad_creative_body' AS ad_creative_body,
+                l.custom_fields->>'ad_story_id' AS ad_story_id,
                 (SELECT dr.status FROM data_reports dr WHERE dr.tenant_id = l.tenant_id AND dr.lead_id = l.id ORDER BY dr.created_at DESC LIMIT 1) AS report_status
          FROM leads l
          LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
          LEFT JOIN distribution_rounds r ON r.tenant_id = l.tenant_id AND r.id = l.round_id
          LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
-         LEFT JOIN meta_ads_insights mai ON mai.tenant_id = l.tenant_id AND mai.ad_id = l.ad_id
          WHERE ${whereSql}
          ORDER BY l.created_at DESC
          LIMIT $${qParams.length + 1} OFFSET $${qParams.length + 2}`,
@@ -227,6 +358,42 @@ export async function handleLegacyCrm(
         qParams
       ),
     ]);
+
+    const adIds = Array.from(
+      new Set(rowsRes.rows.map((row: any) => String(row.ad_id || '').trim()).filter(Boolean))
+    );
+    if (adIds.length > 0) {
+      const adsRes = await client.query<{
+        ad_id: string;
+        thumbnail_url: string | null;
+        image_url: string | null;
+        creative_title: string | null;
+        creative_body: string | null;
+        story_id: string | null;
+      }>(
+        `SELECT ad_id, thumbnail_url, image_url, creative_title, creative_body, story_id
+         FROM meta_ads_insights
+         WHERE tenant_id = $1 AND ad_id = ANY($2::text[])
+         ORDER BY date_stop DESC`,
+        [ctx.tenantId, adIds]
+      );
+      const latestAdById = new Map<string, typeof adsRes.rows[number]>();
+      for (const adRow of adsRes.rows) {
+        if (!latestAdById.has(adRow.ad_id)) {
+          latestAdById.set(adRow.ad_id, adRow);
+        }
+      }
+      for (const row of rowsRes.rows as any[]) {
+        const mai = row.ad_id ? latestAdById.get(String(row.ad_id).trim()) : undefined;
+        if (mai) {
+          row.ad_thumbnail_url = mai.thumbnail_url || row.ad_thumbnail_url;
+          row.ad_image_url = mai.image_url || row.ad_image_url;
+          row.ad_creative_title = mai.creative_title || row.ad_creative_title;
+          row.ad_creative_body = mai.creative_body || row.ad_creative_body;
+          row.ad_story_id = mai.story_id || row.ad_story_id;
+        }
+      }
+    }
 
     await enrichLeadAssigneeAndRound(client, ctx.tenantId, rowsRes.rows);
 
@@ -337,74 +504,6 @@ export async function handleLegacyCrm(
       ]
     );
     return { success: true, message: 'Đã cập nhật thông tin khách hàng.' };
-  }
-
-  if (action === 'update_lead_quality') {
-    const leadId = String(body.lead_id || body.id || '').trim();
-    const qualityStatus = String(body.quality_status || 'Pending').trim();
-    const qualityNote = body.quality_note !== undefined ? String(body.quality_note) : null;
-    if (!leadId) return { success: false, message: 'Thiếu ID khách hàng.' };
-
-    if (ctx.userRole === 'sale' || ctx.isExternalAgency) {
-      const ownerCheck = await client.query(
-        'SELECT id, assigned_to FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
-        [ctx.tenantId, leadId]
-      );
-      if (!ownerCheck.rows.length) {
-        return { _status: 404, success: false, error: 'Lead not found' };
-      }
-      if (ownerCheck.rows[0].assigned_to !== ctx.userId) {
-        return { _status: 403, success: false, error: 'Forbidden: you can only update leads assigned to you' };
-      }
-    }
-
-    await client.query(
-      `UPDATE leads
-       SET quality_status = $3,
-           quality_note = COALESCE($4, quality_note),
-           updated_at = clock_timestamp()
-       WHERE tenant_id = $1 AND id = $2`,
-      [ctx.tenantId, leadId, qualityStatus, qualityNote]
-    );
-
-    const leadRow = await client.query('SELECT * FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1', [ctx.tenantId, leadId]);
-    if (leadRow.rows[0] && cfg.dual_capi_enabled) {
-      const l = leadRow.rows[0];
-      const evMap: Record<string, string> = {
-        Qualified: 'Lead',
-        Booked: 'Schedule',
-        Booking: 'InitiateCheckout',
-        Deposited: 'AddPaymentInfo',
-        Closed: 'Purchase',
-        Notlead: 'DisqualifiedLead',
-      };
-      const capiEvent = evMap[qualityStatus];
-      if (capiEvent) {
-        void dispatchStageCapiEventDetached({
-          tenantId: ctx.tenantId,
-          tenantSlug: ctx.tenantSlug,
-          eventName: capiEvent,
-          lead: {
-            leadId: l.id,
-            name: l.name,
-            phone: l.phone,
-            email: l.email,
-            fbc: l.fbc,
-            fbp: l.fbp,
-            fbclid: l.fbclid,
-            metaLeadId: l.meta_lead_id,
-            customFields: l.custom_fields,
-          },
-          timelineAudit: {
-            actorId: ctx.userId,
-            actorRole: ctx.userRole,
-            stageName: qualityStatus,
-          },
-        });
-      }
-    }
-
-    return { success: true, message: 'Đã cập nhật chất lượng Lead.' };
   }
 
   if (action === 'accept_lead') {
@@ -689,6 +788,24 @@ export async function handleLegacyCrm(
 
     const qParams: unknown[] = [ctx.tenantId, targetUserId];
     let extraWhere = '';
+    const hasPortalDate = Boolean(
+      params.get('since') ||
+        params.get('until') ||
+        params.get('start_date') ||
+        params.get('end_date') ||
+        params.get('date') ||
+        params.get('date_mode')
+    );
+    if (hasPortalDate) {
+      const portalDateFilter = buildLegacyDateFilterFromParams(
+        params,
+        'all',
+        params.get('date') ? 'date' : 'date_mode'
+      );
+      if (portalDateFilter.preset !== 'all') {
+        extraWhere += ` AND (${portalDateFilter.bindSql('l.created_at', qParams)})`;
+      }
+    }
     if (roundId && roundId !== 'all' && isUuid(roundId)) {
       qParams.push(roundId);
       extraWhere += ` AND l.round_id = $${qParams.length}`;
@@ -809,8 +926,20 @@ export async function handleLegacyCrm(
     let searchSql = '';
     if (search) {
       qParams.push(`%${search}%`);
-      searchSql = `AND (h.name ILIKE $3 OR h.phone ILIKE $3 OR COALESCE(h.email,'') ILIKE $3)`;
+      searchSql = `AND (h.name ILIKE $${qParams.length} OR h.phone ILIKE $${qParams.length} OR COALESCE(h.email,'') ILIKE $${qParams.length})`;
     }
+    const hasHeldDate = Boolean(
+      params.get('since') || params.get('until') || params.get('start_date') || params.get('end_date') || params.get('date')
+    );
+    const heldDateFilter = hasHeldDate ? buildLegacyDateFilterFromParams(params, 'all') : null;
+    if (heldDateFilter && heldDateFilter.preset !== 'all' && !search) {
+      searchSql += ` AND (${heldDateFilter.bindSql('h.created_at', qParams)})`;
+    }
+    const countsParams: unknown[] = [ctx.tenantId];
+    const countsDateWhere =
+      heldDateFilter && heldDateFilter.preset !== 'all' && !search
+        ? `AND (${heldDateFilter.bindSql('created_at', countsParams)})`
+        : '';
 
     const [rowsRes, countsRes] = await Promise.all([
       client.query(
@@ -829,8 +958,8 @@ export async function handleLegacyCrm(
            COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS substandard,
            COALESCE(SUM(CASE WHEN status = 'blacklisted' THEN 1 ELSE 0 END), 0) AS blacklisted
          FROM held_leads
-         WHERE tenant_id = $1`,
-        [ctx.tenantId]
+         WHERE tenant_id = $1 ${countsDateWhere}`,
+        countsParams
       ),
     ]);
 
@@ -935,6 +1064,18 @@ export async function handleLegacyCrm(
       qParams.push(roundFilter);
       conds.push(`l.round_id::text = $${qParams.length}`);
     }
+    const hasReportDate = Boolean(
+      params.get('since') || params.get('until') || params.get('start_date') || params.get('end_date') || params.get('date')
+    );
+    const reportDateFilter = hasReportDate ? buildLegacyDateFilterFromParams(params, 'all') : null;
+    if (reportDateFilter && reportDateFilter.preset !== 'all') {
+      conds.push(`(${reportDateFilter.bindSql('dr.created_at', qParams)})`);
+    }
+    const statsParams: unknown[] = [ctx.tenantId];
+    const statsDateWhere =
+      reportDateFilter && reportDateFilter.preset !== 'all'
+        ? `AND (${reportDateFilter.bindSql('created_at', statsParams)})`
+        : '';
 
     const whereSql = conds.join(' AND ');
     const [rowsRes, statsRes] = await Promise.all([
@@ -962,8 +1103,8 @@ export async function handleLegacyCrm(
            COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
            COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected
          FROM data_reports
-         WHERE tenant_id = $1`,
-        [ctx.tenantId]
+         WHERE tenant_id = $1 ${statsDateWhere}`,
+        statsParams
       ),
     ]);
 

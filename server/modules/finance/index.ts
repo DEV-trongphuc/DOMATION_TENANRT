@@ -620,6 +620,8 @@ router.patch('/deals/:id', requirePermission('finance', 'edit'), async (req, res
       if (!curRes.rows[0]) return null;
       const cur = curRes.rows[0];
       const nextStage = body.stage || cur.stage;
+      const nextAmount =
+        body.amount_vnd !== undefined ? Math.max(0, Math.round(Number(body.amount_vnd))) : Number(cur.amount_vnd || 0);
       const nextProb =
         nextStage === 'won'
           ? 100
@@ -644,19 +646,35 @@ router.patch('/deals/:id', requirePermission('finance', 'edit'), async (req, res
           dealId,
           body.title !== undefined ? String(body.title).trim() : cur.title,
           nextStage,
-          body.amount_vnd !== undefined ? Math.max(0, Math.round(Number(body.amount_vnd))) : Number(cur.amount_vnd || 0),
+          nextAmount,
           nextProb,
           body.expected_close_date !== undefined ? body.expected_close_date || null : cur.expected_close_date,
           body.notes !== undefined ? body.notes : cur.notes,
         ]
       );
+
+      const becameWon = cur.stage !== 'won' && nextStage === 'won';
+      if (becameWon && cur.lead_id && nextAmount > 0) {
+        await client.query(
+          `UPDATE leads
+           SET total_revenue_vnd = COALESCE(total_revenue_vnd, 0) + $3,
+               lifecycle_stage = 'customer',
+               updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND id = $2`,
+          [ctx.tenantId, cur.lead_id, nextAmount]
+        );
+      }
+
       const r = await client.query('SELECT * FROM tenant_deals WHERE tenant_id = $1 AND id = $2', [
         ctx.tenantId,
         dealId,
       ]);
       return {
-        ...r.rows[0],
-        amount_vnd: Number(r.rows[0].amount_vnd || 0),
+        deal: {
+          ...r.rows[0],
+          amount_vnd: Number(r.rows[0].amount_vnd || 0),
+        },
+        becameWon,
       };
     });
 
@@ -664,7 +682,19 @@ router.patch('/deals/:id', requirePermission('finance', 'edit'), async (req, res
       sendApiError(res, 404, 'DEAL_NOT_FOUND', 'Không tìm thấy Deal.');
       return;
     }
-    res.json({ success: true, data: updated });
+
+    if (updated.becameWon && updated.deal?.lead_id) {
+      await emitDomainEvent('deal.won', {
+        tenantId: ctx.tenantId,
+        leadId: String(updated.deal.lead_id),
+        dealId,
+        amountVnd: Number(updated.deal.amount_vnd || 0),
+        sourceEntity: 'deal',
+        actorId: ctx.userId,
+      });
+    }
+
+    res.json({ success: true, data: updated.deal });
   } catch (err: any) {
     sendApiError(res, 500, 'UPDATE_DEAL_FAILED', err?.message || 'Không thể cập nhật Deal.');
   }

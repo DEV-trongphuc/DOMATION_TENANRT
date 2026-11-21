@@ -8,6 +8,7 @@ import {
 } from '../../core/security/rbac.ts';
 import { ensureMarketingSchema } from './schema.ts';
 import { registerFlowEventListeners } from './flow-engine.service.ts';
+import { ensureZnsDispatcherRegistered } from '../../services/zalo-zns.service.ts';
 import { templatesRouter } from './templates.routes.ts';
 import { formsRouter } from './forms.routes.ts';
 import { surveysRouter } from './surveys.routes.ts';
@@ -16,6 +17,9 @@ import { flowsRouter } from './flows.routes.ts';
 import { vouchersRouter } from './vouchers.routes.ts';
 import { webTrackingRouter } from './web-tracking.routes.ts';
 import { socialBotRouter } from './social-bot.routes.ts';
+
+ensureZnsDispatcherRegistered();
+registerFlowEventListeners();
 
 export const router = Router();
 

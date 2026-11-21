@@ -1511,6 +1511,7 @@ orgRbacRouter.patch(
         sendApiError(res, 404, 'STAGE_NOT_FOUND', 'Không tìm thấy bước Pipeline.');
         return;
       }
+      tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
       res.json({ success: true, data: updated });
     } catch (err: any) {
       sendApiError(res, 500, 'UPDATE_STAGE_META_FAILED', err?.message || 'Không thể cập nhật thuộc tính bước phễu.');
@@ -2755,6 +2756,13 @@ const CRON_SUBROUTINES_CATALOG = [
   { key: 'billing', name: 'Subscription & Trial Expiry Manager', schedule: '0 0 * * *' },
   { key: 'webhook', name: 'Webhook DLQ Auto-Replay Worker', schedule: '*/5 * * * *' },
   { key: 'capi', name: 'Meta CAPI Retry Queue Worker', schedule: '*/5 * * * *' },
+  { key: 'marketing_flows', name: 'Marketing Automation Flow Wait & Scheduled Triggers', schedule: '*/1 * * * *' },
+  { key: 'marketing_campaigns', name: 'Scheduled Marketing Campaigns Dispatcher', schedule: '*/1 * * * *' },
+  { key: 'audience_reeval', name: 'Dynamic Logic Audiences Re-Evaluator', schedule: '*/5 * * * *' },
+  { key: 'attendance_confirm', name: 'HRM Attendance Auto-Confirm Batch Worker', schedule: '*/5 * * * *' },
+  { key: 'reminders', name: 'Campaign Reminders & Deposit Milestones Sweeper', schedule: '*/5 * * * *' },
+  { key: 'outbox_events', name: 'Domain Events Outbox Drainer', schedule: '*/1 * * * *' },
+  { key: 'daily_report', name: 'Daily/Weekly/Monthly CRM & Meta Ads Report', schedule: '*/5 * * * *' },
 ];
 
 orgRbacRouter.get('/cron-status', requirePermission('settings', 'view'), async (_req, res) => {
@@ -2804,7 +2812,14 @@ orgRbacRouter.post('/cron-status/run', requirePermission('settings', 'manage_con
         runResult.stats.zaloRefreshedCount +
         runResult.stats.subscriptionsProcessed +
         runResult.stats.webhooksReplayedCount +
-        runResult.stats.capiRetriedCount;
+        runResult.stats.capiRetriedCount +
+        runResult.stats.marketingFlowsProcessed +
+        runResult.stats.marketingCampaignsProcessed +
+        runResult.stats.audiencesReevalCount +
+        runResult.stats.attendanceConfirmationsCount +
+        runResult.stats.remindersDispatchedCount +
+        runResult.stats.outboxEventsProcessed +
+        runResult.stats.dailyReportsDispatchedCount;
       await client.query(
         `INSERT INTO tenant_cron_runs (
            id, tenant_id, subroutine_key, status, items_processed, duration_ms,

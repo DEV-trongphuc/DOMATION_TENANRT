@@ -42,6 +42,7 @@ export interface CachedOutboundWebhookItem {
 export interface CachedTenantSlugMeta {
   id: string;
   slug: string;
+  obfuscated_slug?: string;
   status: string;
   expiresAt: number;
 }
@@ -58,6 +59,100 @@ export interface CachedTenantIntegrationRecord {
   iv: string;
   auth_tag: string;
   token_expires_at?: string | Date | null;
+}
+
+export interface CachedGatekeeperConfig {
+  is_enabled: boolean;
+  mode: string;
+  model_name: string | null;
+  manual_action: string;
+  manual_rules: any[];
+  prompt_rules: string | null;
+  target_round_ids: unknown;
+  fallback_enabled: boolean;
+  fallback_round_id: string | null;
+}
+
+export interface CachedGatekeeperSharedAi {
+  apiKey: string;
+  model: string;
+  aiLeadEvalEnabled: boolean;
+  aiAdsEvalEnabled: boolean;
+  updatedAt: string | null;
+}
+
+export interface CachedGatekeeperPreflight {
+  gk: CachedGatekeeperConfig | null;
+  sharedAi: CachedGatekeeperSharedAi | null;
+}
+
+export interface CachedTenantBillingPolicy {
+  plan_tier: string | null;
+  package_code: string | null;
+  status: string | null;
+  auto_renew: boolean | null;
+  cancel_at_period_end: boolean | null;
+  grace_ends_at: string | Date | null;
+  created_at: string | Date | null;
+  trial_ends_at: string | Date | null;
+  subscription_expires_at: string | Date | null;
+  subscription_plan_code: string | null;
+  billing_cycle: string | null;
+  crm_erp_upgrade_status: string | null;
+}
+
+export interface CachedDistributionPipelineStage {
+  id: string;
+  stage_name: string;
+  sla_timeout_minutes: number;
+  capi_event_mapping: string;
+  is_won_stage: boolean;
+  is_lost_stage: boolean;
+}
+
+export interface CachedDistributionCustomFieldDef {
+  field_key: string;
+  field_label: string;
+  field_type: string;
+  is_required: boolean;
+  options_json: string[];
+  config_json: Record<string, unknown>;
+}
+
+export interface CachedDistributionRoutingRule {
+  round_id: string;
+  pipeline_id: string;
+  conditions_json: any;
+  condition_branches: any;
+  connection_scopes: any;
+  inject_fields: Record<string, unknown> | null;
+}
+
+export interface CachedDistributionSnapshot {
+  defaultPipelineId: string;
+  firstStagesByPipeline: Record<string, CachedDistributionPipelineStage>;
+  customFieldsByPipeline: Record<string, CachedDistributionCustomFieldDef[]>;
+  defaultActiveRoundByPipeline: Record<string, string | null>;
+  activeRoundIds: string[];
+  activeRoutingRules: CachedDistributionRoutingRule[];
+}
+
+export interface CachedBlacklistEntry {
+  id: string;
+  entry_type: string;
+  value: string;
+  reason: string | null;
+}
+
+export interface CachedBlacklistSnapshot {
+  overflow: boolean;
+  phoneMap: Map<string, CachedBlacklistEntry>;
+  emailMap: Map<string, CachedBlacklistEntry>;
+  keywordsAndIps: Array<{ entry: CachedBlacklistEntry; needle: string }>;
+}
+
+export function getUtcMonthKey(now: Date = new Date()): string {
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 const MAX_KV_ENTRIES = 250_000;
@@ -86,6 +181,11 @@ class TenantRedisStore {
   private tenantIntegrationCache = new Map<string, { record: CachedTenantIntegrationRecord | null; expiresAt: number }>();
   private inboundWebhookCache = new Map<string, CachedInboundWebhookMeta>();
   private outboundWebhookCache = new Map<string, { webhooks: CachedOutboundWebhookItem[]; expiresAt: number }>();
+  private gatekeeperPreflightCache = new Map<string, { value: CachedGatekeeperPreflight; expiresAt: number }>();
+  private tenantBillingPolicyCache = new Map<string, CachedTenantBillingPolicy & { expiresAt: number }>();
+  private monthlyLeadCountCache = new Map<string, { monthKey: string; count: number; expiresAt: number }>();
+  private distributionSnapshotCache = new Map<string, { value: CachedDistributionSnapshot; expiresAt: number }>();
+  private blacklistCache = new Map<string, { value: CachedBlacklistSnapshot; expiresAt: number }>();
   private platformDefaultsCache: { rawSettings: Record<string, unknown>; expiresAt: number } | null = null;
   private writeOpsSinceSweep = 0;
 
@@ -271,20 +371,33 @@ class TenantRedisStore {
     ttlSeconds = APP_CONFIG.tenantCacheTtlSeconds
   ): void {
     if (!tenantId) return;
-    if (this.tenantMetaCache.size >= MAX_TENANT_META_CACHE && !this.tenantMetaCache.has(tenantId)) {
+    const prevMeta = this.tenantMetaCache.get(tenantId);
+    if (this.tenantMetaCache.size >= MAX_TENANT_META_CACHE && !prevMeta) {
       const oldest = this.tenantMetaCache.keys().next().value;
       if (oldest !== undefined) this.tenantMetaCache.delete(oldest);
     }
     const expiresAt = Date.now() + ttlSeconds * 1000;
+    const resolvedName = meta.name !== undefined ? meta.name : prevMeta?.name;
     this.tenantMetaCache.set(tenantId, {
       slug: meta.slug,
+      name: resolvedName,
       status: meta.status,
       rawSettings: meta.rawSettings,
       normalizedSettings: meta.normalizedSettings,
       expiresAt,
     });
     if (meta.slug) {
-      this.setCachedTenantBySlug(meta.slug, { id: tenantId, slug: meta.slug, status: meta.status }, ttlSeconds);
+      const prevSlugMeta = this.tenantSlugCache.get(meta.slug.trim().toLowerCase());
+      this.setCachedTenantBySlug(
+        meta.slug,
+        {
+          id: tenantId,
+          slug: meta.slug,
+          obfuscated_slug: prevSlugMeta?.obfuscated_slug,
+          status: meta.status,
+        },
+        ttlSeconds
+      );
     }
   }
 
@@ -300,7 +413,7 @@ class TenantRedisStore {
     return {
       id: entry.id,
       slug: entry.slug,
-      obfuscated_slug: (entry as any).obfuscated_slug,
+      obfuscated_slug: entry.obfuscated_slug,
       status: entry.status,
     };
   }
@@ -312,7 +425,8 @@ class TenantRedisStore {
   ): void {
     const clean = slug.trim().toLowerCase();
     if (!clean) return;
-    if (this.tenantSlugCache.size >= MAX_TENANT_META_CACHE && !this.tenantSlugCache.has(clean)) {
+    const prevEntry = this.tenantSlugCache.get(clean);
+    if (this.tenantSlugCache.size >= MAX_TENANT_META_CACHE && !prevEntry) {
       const oldest = this.tenantSlugCache.keys().next().value;
       if (oldest !== undefined) this.tenantSlugCache.delete(oldest);
     }
@@ -320,9 +434,9 @@ class TenantRedisStore {
       id: meta.id,
       slug: meta.slug,
       status: meta.status,
-      obfuscated_slug: meta.obfuscated_slug,
+      obfuscated_slug: meta.obfuscated_slug ?? prevEntry?.obfuscated_slug,
       expiresAt: Date.now() + ttlSeconds * 1000,
-    } as any);
+    });
   }
 
   getCachedUserAuth(
@@ -475,6 +589,9 @@ class TenantRedisStore {
   }
 
   invalidateTenantIntegrations(tenantId?: string, type?: string): void {
+    if (!type || type === 'ai_gemini_byok' || type === 'ai_gemini' || type === 'dom_meta_report') {
+      this.invalidateGatekeeperPreflight(tenantId);
+    }
     if (!tenantId) {
       this.tenantIntegrationCache.clear();
       return;
@@ -491,6 +608,196 @@ class TenantRedisStore {
     }
   }
 
+  getCachedGatekeeperPreflight(tenantId: string): CachedGatekeeperPreflight | null {
+    if (!tenantId) return null;
+    const entry = this.gatekeeperPreflightCache.get(tenantId);
+    if (!entry) return null;
+    if (Date.now() >= entry.expiresAt) {
+      this.gatekeeperPreflightCache.delete(tenantId);
+      return null;
+    }
+    return entry.value;
+  }
+
+  setCachedGatekeeperPreflight(
+    tenantId: string,
+    value: CachedGatekeeperPreflight,
+    ttlSeconds = APP_CONFIG.tenantCacheTtlSeconds
+  ): void {
+    if (!tenantId) return;
+    if (this.gatekeeperPreflightCache.size >= MAX_TENANT_META_CACHE && !this.gatekeeperPreflightCache.has(tenantId)) {
+      const oldest = this.gatekeeperPreflightCache.keys().next().value;
+      if (oldest !== undefined) this.gatekeeperPreflightCache.delete(oldest);
+    }
+    this.gatekeeperPreflightCache.set(tenantId, {
+      value,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+
+  invalidateGatekeeperPreflight(tenantId?: string): void {
+    if (!tenantId) {
+      this.gatekeeperPreflightCache.clear();
+      return;
+    }
+    this.gatekeeperPreflightCache.delete(tenantId);
+  }
+
+  getCachedTenantBillingPolicy(tenantId: string): CachedTenantBillingPolicy | null {
+    if (!tenantId) return null;
+    const entry = this.tenantBillingPolicyCache.get(tenantId);
+    if (!entry) return null;
+    if (Date.now() >= entry.expiresAt) {
+      this.tenantBillingPolicyCache.delete(tenantId);
+      return null;
+    }
+    const { expiresAt: _exp, ...policy } = entry;
+    return policy;
+  }
+
+  setCachedTenantBillingPolicy(
+    tenantId: string,
+    policy: CachedTenantBillingPolicy,
+    ttlSeconds = APP_CONFIG.tenantCacheTtlSeconds
+  ): void {
+    if (!tenantId) return;
+    if (this.tenantBillingPolicyCache.size >= MAX_TENANT_META_CACHE && !this.tenantBillingPolicyCache.has(tenantId)) {
+      const oldest = this.tenantBillingPolicyCache.keys().next().value;
+      if (oldest !== undefined) this.tenantBillingPolicyCache.delete(oldest);
+    }
+    this.tenantBillingPolicyCache.set(tenantId, {
+      ...policy,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+
+  invalidateTenantBillingPolicy(tenantId?: string): void {
+    if (!tenantId) {
+      this.tenantBillingPolicyCache.clear();
+      return;
+    }
+    this.tenantBillingPolicyCache.delete(tenantId);
+  }
+
+  getCachedTenantMonthlyLeadCount(tenantId: string, monthKey: string): number | null {
+    if (!tenantId || !monthKey) return null;
+    const entry = this.monthlyLeadCountCache.get(tenantId);
+    if (!entry) return null;
+    if (entry.monthKey !== monthKey || Date.now() >= entry.expiresAt) {
+      this.monthlyLeadCountCache.delete(tenantId);
+      return null;
+    }
+    return entry.count;
+  }
+
+  setCachedTenantMonthlyLeadCount(
+    tenantId: string,
+    monthKey: string,
+    count: number,
+    ttlSeconds = APP_CONFIG.tenantCacheTtlSeconds
+  ): void {
+    if (!tenantId || !monthKey) return;
+    if (this.monthlyLeadCountCache.size >= MAX_TENANT_META_CACHE && !this.monthlyLeadCountCache.has(tenantId)) {
+      const oldest = this.monthlyLeadCountCache.keys().next().value;
+      if (oldest !== undefined) this.monthlyLeadCountCache.delete(oldest);
+    }
+    this.monthlyLeadCountCache.set(tenantId, {
+      monthKey,
+      count: Math.max(0, count),
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+
+  incrementTenantMonthlyLeadCount(tenantId: string, delta = 1, now: Date = new Date()): void {
+    if (!tenantId || !Number.isFinite(delta) || delta === 0) return;
+    const entry = this.monthlyLeadCountCache.get(tenantId);
+    if (!entry) return;
+    const monthKey = getUtcMonthKey(now);
+    if (entry.monthKey !== monthKey || Date.now() >= entry.expiresAt) {
+      this.monthlyLeadCountCache.delete(tenantId);
+      return;
+    }
+    entry.count = Math.max(0, entry.count + delta);
+  }
+
+  invalidateTenantMonthlyLeadCount(tenantId?: string): void {
+    if (!tenantId) {
+      this.monthlyLeadCountCache.clear();
+      return;
+    }
+    this.monthlyLeadCountCache.delete(tenantId);
+  }
+
+  getCachedDistributionSnapshot(tenantId: string): CachedDistributionSnapshot | null {
+    if (!tenantId) return null;
+    const entry = this.distributionSnapshotCache.get(tenantId);
+    if (!entry) return null;
+    if (Date.now() >= entry.expiresAt) {
+      this.distributionSnapshotCache.delete(tenantId);
+      return null;
+    }
+    return entry.value;
+  }
+
+  setCachedDistributionSnapshot(
+    tenantId: string,
+    value: CachedDistributionSnapshot,
+    ttlSeconds = APP_CONFIG.tenantCacheTtlSeconds
+  ): void {
+    if (!tenantId) return;
+    if (this.distributionSnapshotCache.size >= MAX_TENANT_META_CACHE && !this.distributionSnapshotCache.has(tenantId)) {
+      const oldest = this.distributionSnapshotCache.keys().next().value;
+      if (oldest !== undefined) this.distributionSnapshotCache.delete(oldest);
+    }
+    this.distributionSnapshotCache.set(tenantId, {
+      value,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+
+  invalidateDistributionSnapshot(tenantId?: string): void {
+    if (!tenantId) {
+      this.distributionSnapshotCache.clear();
+      return;
+    }
+    this.distributionSnapshotCache.delete(tenantId);
+  }
+
+  getCachedBlacklist(tenantId: string): CachedBlacklistSnapshot | null {
+    if (!tenantId) return null;
+    const entry = this.blacklistCache.get(tenantId);
+    if (!entry) return null;
+    if (Date.now() >= entry.expiresAt) {
+      this.blacklistCache.delete(tenantId);
+      return null;
+    }
+    return entry.value;
+  }
+
+  setCachedBlacklist(
+    tenantId: string,
+    value: CachedBlacklistSnapshot,
+    ttlSeconds = APP_CONFIG.tenantCacheTtlSeconds
+  ): void {
+    if (!tenantId) return;
+    if (this.blacklistCache.size >= MAX_TENANT_META_CACHE && !this.blacklistCache.has(tenantId)) {
+      const oldest = this.blacklistCache.keys().next().value;
+      if (oldest !== undefined) this.blacklistCache.delete(oldest);
+    }
+    this.blacklistCache.set(tenantId, {
+      value,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+
+  invalidateBlacklistCache(tenantId?: string): void {
+    if (!tenantId) {
+      this.blacklistCache.clear();
+      return;
+    }
+    this.blacklistCache.delete(tenantId);
+  }
+
   invalidateTenantCache(tenantId?: string, tenantSlug?: string): void {
     if (!tenantId && !tenantSlug) {
       this.tenantMetaCache.clear();
@@ -500,6 +807,11 @@ class TenantRedisStore {
       this.tenantIntegrationCache.clear();
       this.inboundWebhookCache.clear();
       this.outboundWebhookCache.clear();
+      this.gatekeeperPreflightCache.clear();
+      this.tenantBillingPolicyCache.clear();
+      this.monthlyLeadCountCache.clear();
+      this.distributionSnapshotCache.clear();
+      this.blacklistCache.clear();
       return;
     }
     const existing = tenantId ? this.tenantMetaCache.get(tenantId) : undefined;
@@ -510,6 +822,11 @@ class TenantRedisStore {
       this.invalidateEffectivePermissions(tenantId);
       this.invalidateDynamicAudienceCount(tenantId);
       this.invalidateTenantIntegrations(tenantId);
+      this.invalidateGatekeeperPreflight(tenantId);
+      this.invalidateTenantBillingPolicy(tenantId);
+      this.invalidateTenantMonthlyLeadCount(tenantId);
+      this.invalidateDistributionSnapshot(tenantId);
+      this.invalidateBlacklistCache(tenantId);
       for (const [slugKey, slugVal] of this.tenantSlugCache.entries()) {
         if (slugVal.id === tenantId) {
           this.tenantSlugCache.delete(slugKey);
@@ -718,6 +1035,11 @@ class TenantRedisStore {
     this.tenantIntegrationCache.clear();
     this.inboundWebhookCache.clear();
     this.outboundWebhookCache.clear();
+    this.gatekeeperPreflightCache.clear();
+    this.tenantBillingPolicyCache.clear();
+    this.monthlyLeadCountCache.clear();
+    this.distributionSnapshotCache.clear();
+    this.blacklistCache.clear();
     this.platformDefaultsCache = null;
     this.writeOpsSinceSweep = 0;
   }

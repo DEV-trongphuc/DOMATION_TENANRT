@@ -5,6 +5,16 @@ import express, { type Express } from 'express';
 import cors from 'cors';
 import { APP_CONFIG } from './config.ts';
 import { executeMasterCron } from './cron/master-cron.ts';
+import {
+  antiAgentGuardMiddleware,
+  applyCommercialIpHeaders,
+  DOMATION_AI_TXT_BODY,
+  DOMATION_LICENSE_POLICY_TXT,
+  DOMATION_LLMS_TXT_BODY,
+  DOMATION_ROBOTS_TXT_BODY,
+  DOMATION_SECURITY_TXT_BODY,
+  DOMATION_TDMREP_JSON,
+} from './middleware/anti-agent-guard.ts';
 import { gzipMiddleware } from './middleware/gzip.ts';
 import { authRouter } from './routes/auth.routes.ts';
 import { adminRouter } from './routes/admin.routes.ts';
@@ -18,14 +28,58 @@ import { operationsRouter } from './routes/operations.routes.ts';
 import { publicRouter } from './routes/public.routes.ts';
 import { legacyRouter } from './routes/legacy.routes.ts';
 import { myerpCompatRouter } from './routes/myerp-compat.routes.ts';
+import { publicMarketingPhpCompatRouter } from './routes/myerp-compat/marketing-php-bridges.ts';
 import { mountEcosystemModules } from './modules/index.ts';
+import { domAiPortalRouter, publicDomAiPortalRouter } from './modules/dom-ai-portal/index.ts';
 import { ensureRbacScreenColumns, requireAnyPermission, requireTenantAuth, sendApiError } from './core/security/rbac.ts';
 import { getTenantContext } from './core/context/tenant-context.ts';
 import { replayWebhookDlqItem } from './services/webhook.service.ts';
+import { ensureZnsDispatcherRegistered } from './services/zalo-zns.service.ts';
 
 export function createApp(): Express {
+  ensureZnsDispatcherRegistered();
   const app = express();
   app.disable('x-powered-by');
+
+  // Commercial IP policy headers + internal-route Anti-Agent Guard (never blocks public SEO/GEO search bots)
+  app.use(antiAgentGuardMiddleware);
+
+  // Authoritative Soft Commercial Copyright, W3C TDM Reservation & AI Agent Policy endpoints (ZERO bot blocking)
+  app.get('/.well-known/tdmrep.json', (_req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json(DOMATION_TDMREP_JSON);
+  });
+
+  app.get('/.well-known/security.txt', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(DOMATION_SECURITY_TXT_BODY);
+  });
+
+  app.get('/ai.txt', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(DOMATION_AI_TXT_BODY);
+  });
+
+  app.get('/license-policy.txt', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(DOMATION_LICENSE_POLICY_TXT);
+  });
+
+  app.get(['/llms.txt', '/llms-full.txt'], (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(DOMATION_LLMS_TXT_BODY);
+  });
+
+  app.get('/robots.txt', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(DOMATION_ROBOTS_TXT_BODY);
+  });
 
   app.use(
     cors({
@@ -35,11 +89,14 @@ export function createApp(): Express {
         'Content-Type',
         'Authorization',
         'X-Tenant-Slug',
+        'X-Portal-Token',
+        'X-Visitor-Id',
         'X-Webhook-Signature',
         'X-Idempotency-Key',
         'X-Auth-Token',
         'X-HTTP-Method-Override',
         'X-Bypass-Cache',
+        'X-Test-Enforce-Rate-Limit',
       ],
     })
   );
@@ -72,6 +129,13 @@ export function createApp(): Express {
     'workspace-overview': '/api/v1/workspace/bootstrap',
     topup: '/api/v1/billing/topup',
     subscribe: '/api/v1/billing/subscribe',
+    renew: '/api/v1/billing/renew',
+    cancel: '/api/v1/billing/cancel',
+    'auto-renew': '/api/v1/billing/auto-renew',
+    'switch-package': '/api/v1/billing/switch-package',
+    'billing-overview': '/api/v1/billing/overview',
+    billing_overview: '/api/v1/billing/overview',
+    'billing-catalog': '/api/v1/billing/catalog',
     'upgrade-request': '/api/v1/billing/upgrade-request',
     'personal-lead': '/api/v1/leads/personal',
     'telegram-config': '/api/v1/integrations/telegram/config',
@@ -132,6 +196,8 @@ export function createApp(): Express {
   app.use('/api/v1/billing', billingRouter);
   app.use('/api/v1/workspace', workspaceRouter);
   app.use('/api/v1/analytics', analyticsRouter);
+  app.use('/api/v1/public/dom-ai', publicDomAiPortalRouter);
+  app.use('/api/v1/dom-ai-portal', domAiPortalRouter);
   app.use('/api/v1/public', publicRouter);
 
   // MYERP Compatibility API for the cloned MYERP frontend (bridges onto AutoData PG schema + Wave-2 modules)
@@ -141,7 +207,7 @@ export function createApp(): Express {
   // Pluggable Multi-Product SaaS Ecosystem Modules (Org-RBAC, Audiences, + Wave 2 Slots)
   mountEcosystemModules(app);
 
-  // Internal Master Cron HTTP endpoint (runs consolidated 6 subroutines inside live Passenger/PGlite process)
+  // Internal Master Cron HTTP endpoint (runs consolidated 13 subroutines inside live Passenger/PGlite process)
   let cronTickInFlight = false;
   app.all('/api/v1/operations/cron/master', async (req, res) => {
     const expectedSecret = (APP_CONFIG.cronSecret || APP_CONFIG.platformJwtSecret || '').trim();
@@ -165,7 +231,20 @@ export function createApp(): Express {
 
     cronTickInFlight = true;
     try {
-      const result = await executeMasterCron();
+      const rawSubs = Array.isArray(req.body?.subroutines)
+        ? req.body.subroutines
+        : typeof req.query?.subroutines === 'string'
+          ? req.query.subroutines
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined;
+      const rawTenantId = req.body?.tenant_id ?? req.body?.tenantId ?? req.query?.tenant_id ?? req.query?.tenantId;
+      const tenantId = typeof rawTenantId === 'string' ? rawTenantId.trim() || undefined : undefined;
+      const result = await executeMasterCron({
+        ...(rawSubs && rawSubs.length > 0 ? { subroutines: rawSubs.map(String) } : {}),
+        ...(tenantId ? { tenantId } : {}),
+      });
       res.json({ success: true, data: result });
     } catch (err: any) {
       sendApiError(res, 500, 'CRON_EXECUTION_FAILED', err?.message || 'Master cron failed.');
@@ -200,6 +279,123 @@ export function createApp(): Express {
   app.use('/api/v1/webhooks', publicWebhooksRouter);
   app.use('/v1/webhooks', publicWebhooksRouter);
 
+  // Legacy migrated media assets (/uploadss/*) served unconditionally before SPA fallback
+  app.use('/uploadss', (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.status(405).end();
+      return;
+    }
+    const rawUrlPath = String(req.url || '/').split('?')[0];
+    if (
+      /%2e/i.test(rawUrlPath) ||
+      rawUrlPath.includes('..') ||
+      rawUrlPath.includes('\\') ||
+      rawUrlPath.includes('\0')
+    ) {
+      res.status(403).end();
+      return;
+    }
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(req.path || '/');
+    } catch {
+      res.status(400).end();
+      return;
+    }
+    if (decodedPath.includes('..') || decodedPath.includes('\\') || decodedPath.includes('\0')) {
+      res.status(403).end();
+      return;
+    }
+    const relPath = decodedPath.replace(/^\/+/, '');
+    if (!relPath) {
+      res.status(404).end();
+      return;
+    }
+    const candidateRoots = [
+      process.env.UPLOADS_DIR ? path.resolve(process.env.UPLOADS_DIR) : '',
+      path.resolve(process.cwd(), 'public', 'uploadss'),
+      path.resolve(process.cwd(), 'uploadss'),
+    ].filter(Boolean);
+
+    for (const rootDir of candidateRoots) {
+      try {
+        if (!fs.existsSync(rootDir)) continue;
+        const realRoot = fs.realpathSync(rootDir);
+        const resolved = path.resolve(realRoot, relPath);
+        if (!resolved.startsWith(realRoot + path.sep)) {
+          res.status(403).end();
+          return;
+        }
+        if (!fs.existsSync(resolved)) continue;
+        const realFile = fs.realpathSync(resolved);
+        if (!realFile.startsWith(realRoot + path.sep)) {
+          res.status(403).end();
+          return;
+        }
+        const stat = fs.statSync(realFile);
+        if (!stat.isFile()) continue;
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=604800');
+        res.sendFile(realFile);
+        return;
+      } catch {
+        continue;
+      }
+    }
+    res.status(404).end();
+  });
+
+  // Public migrated media & template thumbnails (/uploads/*) served read-only before SPA fallback
+  app.use('/uploads', (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.status(405).end();
+      return;
+    }
+    const rawReqPath = (req.path || '').replace(/^\/+/, '');
+    let decodedPath = '';
+    try {
+      decodedPath = decodeURIComponent(rawReqPath);
+    } catch {
+      res.status(400).end();
+      return;
+    }
+    if (
+      !decodedPath ||
+      rawReqPath.includes('..') ||
+      decodedPath.includes('..') ||
+      decodedPath.includes('\\') ||
+      decodedPath.includes('\0')
+    ) {
+      res.status(400).end();
+      return;
+    }
+    const uploadRoots = [
+      process.env.UPLOADS_PUBLIC_DIR ? path.resolve(process.env.UPLOADS_PUBLIC_DIR) : '',
+      path.resolve(process.cwd(), 'public', 'uploads'),
+      path.resolve(process.cwd(), 'uploads'),
+    ].filter(Boolean);
+    for (const root of uploadRoots) {
+      try {
+        if (!fs.existsSync(root)) continue;
+        const rootReal = fs.realpathSync(root);
+        const candidate = path.resolve(rootReal, decodedPath);
+        if (candidate !== rootReal && !candidate.startsWith(rootReal + path.sep)) continue;
+        const resolved = fs.realpathSync(candidate);
+        if (resolved !== rootReal && !resolved.startsWith(rootReal + path.sep)) continue;
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) continue;
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        res.setHeader('Cache-Control', 'public, max-age=604800');
+        res.sendFile(resolved);
+        return;
+      } catch {
+        continue;
+      }
+    }
+    res.status(404).end();
+  });
+
   const distDir = path.resolve(process.cwd(), 'dist');
   const distDataHtml = path.join(distDir, 'data', 'index.html');
   const distRootHtml = path.join(distDir, 'index.html');
@@ -214,6 +410,8 @@ export function createApp(): Express {
         setHeaders(res, filePath) {
           if (filePath.endsWith('.html')) {
             res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          } else if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
+            applyCommercialIpHeaders(res, 'internal_asset');
           }
         },
       })
@@ -239,6 +437,13 @@ export function createApp(): Express {
       version: '2.0.0',
       health: '/api/v1/health',
     });
+  });
+
+  // Public MYERP .php aliases when frontends post directly to /api/*.php
+  app.all(['/api/voucher_claim.php', '/api/survey_public.php', '/api/surveys.php', '/api/track.php'], (req, res, next) => {
+    const subPath = req.path.replace(/^\/api/, '');
+    req.url = req.url.replace(/^\/api/, '') || subPath;
+    publicMarketingPhpCompatRouter(req, res, next);
   });
 
   // Structured JSON 404 handler for unmatched API / Webhook routes

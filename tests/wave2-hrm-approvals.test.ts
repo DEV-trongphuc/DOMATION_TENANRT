@@ -98,7 +98,13 @@ describe('Wave 2 Phase 3: Dynamic N-Step Approvals, HRM 360°, GPS Attendance, P
       assert.equal(blocked.json?.error?.code, 'MODULE_NOT_ENTITLED');
     }
 
-    // Upgrade both Tenant A and Tenant B to Package 4 (`domation_promax`)
+    // Fund & Upgrade both Tenant A and Tenant B to Package 4 (`domation_promax`)
+    await withTenantTransaction(tenantA.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantA.id]);
+    });
+    await withTenantTransaction(tenantB.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantB.id]);
+    });
     const upA = await apiRequest(harness.baseUrl, '/api/v1/billing/switch-package', {
       method: 'POST',
       token: tenantA.ownerToken,

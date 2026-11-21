@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { getTenantContext } from '../core/context/tenant-context.ts';
+import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import { requireTenantAuth, sendApiError } from '../core/security/rbac.ts';
 import { withTenantTransaction } from '../core/database/transaction.ts';
 import { getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
 import {
-  buildLegacyDateFilter,
+  buildLegacyDateFilterFromParams,
   cleanQueryAction,
   formatDateTimeVnSql,
   mapPgLeadRowToLegacy,
@@ -65,17 +66,70 @@ legacyRouter.all('/', async (req, res) => {
 
     // Export CSV directly streaming UTF-8 BOM CSV
     if (action === 'export_csv') {
-      const dateFilter = buildLegacyDateFilter(mergedParams.get('date') || 'Tháng này');
+      const dateFilter = buildLegacyDateFilterFromParams(mergedParams, 'Tháng này');
+      const statusFilter = String(mergedParams.get('status') || 'all').trim();
+      const consultantFilter = String(mergedParams.get('consultant') || 'all').trim();
+      const roundFilter = String(mergedParams.get('round') || 'all').trim();
+      const searchFilter = String(mergedParams.get('search') || '').trim();
+      const qualityFilter = String(mergedParams.get('quality_status') || 'all').trim();
+
       const rows = await withTenantTransaction(ctx.tenantId, async (client) => {
         const qParams: unknown[] = [ctx.tenantId];
-        const dCond = dateFilter.bindSql('l.created_at', qParams);
+        const conds: string[] = ['l.tenant_id = $1', 'l.is_deleted = false'];
+
+        if (!searchFilter) {
+          conds.push(`(${dateFilter.bindSql('l.created_at', qParams)})`);
+        }
+        if (ctx.userRole === 'sale') {
+          qParams.push(ctx.userId);
+          conds.push(`l.assigned_to = $${qParams.length}`);
+        } else if (consultantFilter && consultantFilter !== 'all') {
+          qParams.push(consultantFilter);
+          conds.push(`(l.assigned_to::text = $${qParams.length} OR u.full_name ILIKE $${qParams.length})`);
+        }
+        if (statusFilter && statusFilter !== 'all') {
+          if (statusFilter === 'assigned') conds.push(`l.status = 'assigned'`);
+          else if (statusFilter === 'compensation') {
+            conds.push(`l.status = 'assigned' AND COALESCE(l.custom_fields->>'original_status','') IN ('compensated','compensation')`);
+          } else if (statusFilter === 'duplicate') {
+            conds.push(`(l.is_duplicate_reminder = true OR l.is_duplicated = true)`);
+          } else if (statusFilter === 'silent') {
+            conds.push(`l.status = 'archived'`);
+          } else if (statusFilter === 'pending_work_hours' || statusFilter === 'pending') {
+            conds.push(`l.status = 'unassigned_pending'`);
+          } else if (statusFilter === 'rejected') conds.push(`l.status = 'rejected'`);
+          else if (statusFilter === 'blacklisted') conds.push(`l.status = 'blacklisted'`);
+          else if (statusFilter === 'pending_approval') conds.push(`l.status = 'pending_approval'`);
+          else conds.push(`l.status != 'archived'`);
+        } else {
+          conds.push(`l.status != 'archived'`);
+        }
+        if (roundFilter && roundFilter !== 'all') {
+          qParams.push(roundFilter);
+          conds.push(`(l.round_id::text = $${qParams.length} OR r.name = $${qParams.length})`);
+        }
+        if (qualityFilter && qualityFilter !== 'all') {
+          if (qualityFilter === 'unrated') {
+            conds.push(`(l.quality_status IS NULL OR l.quality_status = '' OR l.quality_status = 'Pending')`);
+          } else {
+            qParams.push(qualityFilter);
+            conds.push(`l.quality_status = $${qParams.length}`);
+          }
+        }
+        if (searchFilter) {
+          qParams.push(`%${searchFilter}%`);
+          const pIdx = qParams.length;
+          conds.push(
+            `(l.name ILIKE $${pIdx} OR l.phone ILIKE $${pIdx} OR COALESCE(l.email,'') ILIKE $${pIdx} OR COALESCE(l.campaign,'') ILIKE $${pIdx})`
+          );
+        }
+
         const r = await client.query(
           `SELECT l.*, u.full_name AS assigned_to_name, r.name AS round_name
            FROM leads l
            LEFT JOIN users u ON u.tenant_id = l.tenant_id AND u.id = l.assigned_to
            LEFT JOIN distribution_rounds r ON r.tenant_id = l.tenant_id AND r.id = l.round_id
-           WHERE l.tenant_id = $1 AND l.is_deleted = false AND l.status != 'archived' AND (${dCond})
-             ${ctx.userRole === 'sale' ? `AND l.assigned_to = '${ctx.userId}'` : ''}
+           WHERE ${conds.join(' AND ')}
            ORDER BY l.created_at DESC
            LIMIT 5000`,
           qParams
@@ -173,6 +227,27 @@ legacyRouter.all('/', async (req, res) => {
       const { _status, ...payload } = result as Record<string, any>;
       res.status(Number(_status)).json(payload);
       return;
+    }
+
+    if ((result as any)?.success !== false) {
+      if (
+        action === 'add_round' ||
+        action === 'edit_round' ||
+        action === 'delete_round' ||
+        action === 'add_rule' ||
+        action === 'edit_rule' ||
+        action === 'delete_rule' ||
+        action === 'reorder_rules'
+      ) {
+        tenantRedis.invalidateDistributionSnapshot(ctx.tenantId);
+      } else if (action === 'block_lead' || action === 'blacklist_held_lead') {
+        tenantRedis.invalidateBlacklistCache(ctx.tenantId);
+      } else if (action === 'batch_import_leads') {
+        const importedCount = Number((result as any)?.imported_count || 0);
+        if (importedCount > 0) {
+          tenantRedis.incrementTenantMonthlyLeadCount(ctx.tenantId, importedCount);
+        }
+      }
     }
 
     res.json(result);

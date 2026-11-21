@@ -65,12 +65,18 @@ CREATE TABLE IF NOT EXISTS tenants (
     industry VARCHAR(100) NOT NULL DEFAULT 'general',
     industry_key VARCHAR(64) NOT NULL DEFAULT 'general',
     package_code VARCHAR(50) NOT NULL DEFAULT 'autodata_crm',
-    plan_tier VARCHAR(50) NOT NULL DEFAULT 'starter' CHECK (plan_tier IN ('starter', 'growth', 'enterprise', 'autodata_crm', 'marketing_standalone', 'growth_combo', 'domation_promax')),
+    plan_tier VARCHAR(50) NOT NULL DEFAULT 'starter' CHECK (plan_tier IN ('starter', 'growth', 'enterprise', 'autodata_standard', 'autodata_growth', 'domation_crm_erp', 'autodata_crm', 'marketing_standalone', 'growth_combo', 'domation_promax')),
     enabled_modules JSONB NOT NULL DEFAULT '["leads","org_rbac","settings","billing","dashboard_crm","crm_dashboard","pipelines","rounds","fair_share","consultants","routing_rules","gatekeeper","tickets_data","ads_capi","sale_portal","appointments","integrations_crm","integrations_autodata","dom_sales_copilot"]'::jsonb,
     entitlements JSONB NOT NULL DEFAULT '{"package_code":"autodata_crm","education_addon":false,"enable_ideas_mascot":false}'::jsonb,
-    status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'trial', 'cancelled')),
+    status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'trial', 'grace', 'cancelled')),
     trial_ends_at TIMESTAMPTZ DEFAULT (clock_timestamp() + INTERVAL '30 days'),
     subscription_expires_at TIMESTAMPTZ,
+    grace_ends_at TIMESTAMPTZ,
+    auto_renew BOOLEAN NOT NULL DEFAULT true,
+    cancel_at_period_end BOOLEAN NOT NULL DEFAULT false,
+    cancelled_at TIMESTAMPTZ,
+    scheduled_plan_code VARCHAR(80),
+    scheduled_billing_cycle VARCHAR(30),
     subscription_plan_code VARCHAR(80) NOT NULL DEFAULT 'trial_1m',
     billing_cycle VARCHAR(30) NOT NULL DEFAULT 'trial',
     wallet_balance_vnd BIGINT NOT NULL DEFAULT 0,
@@ -92,7 +98,7 @@ CREATE INDEX idx_tenants_slug ON tenants(slug);
 CREATE INDEX idx_tenants_obfuscated_slug ON tenants(obfuscated_slug);
 CREATE INDEX idx_tenants_domain ON tenants(domain) WHERE domain IS NOT NULL;
 CREATE INDEX idx_tenants_status ON tenants(status);
-CREATE INDEX idx_tenants_subscription_expiry ON tenants(status, subscription_expires_at, trial_ends_at) WHERE status IN ('active', 'trial');
+CREATE INDEX idx_tenants_subscription_expiry ON tenants(status, subscription_expires_at, trial_ends_at, grace_ends_at) WHERE status IN ('active', 'trial', 'grace');
 
 -- Table: tenant_onboarding_progress (Onboarding Tour & Step Tracking)
 CREATE TABLE IF NOT EXISTS tenant_onboarding_progress (
@@ -382,10 +388,13 @@ CREATE INDEX idx_leads_tenant_stage ON leads(tenant_id, stage_id);
 CREATE INDEX idx_leads_tenant_status ON leads(tenant_id, status);
 CREATE INDEX idx_leads_tenant_assigned ON leads(tenant_id, assigned_to);
 CREATE INDEX idx_leads_tenant_created ON leads(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_leads_tenant_created_at ON leads(tenant_id, created_at DESC);
 CREATE INDEX idx_leads_tenant_active_created ON leads(tenant_id, created_at DESC) WHERE is_deleted = false;
 CREATE INDEX idx_leads_tenant_assigned_status_created ON leads(tenant_id, assigned_to, status, created_at DESC);
 CREATE INDEX idx_leads_tenant_round_created ON leads(tenant_id, round_id, created_at DESC);
 CREATE INDEX idx_leads_tenant_campaign_ad ON leads(tenant_id, campaign_id, ad_id);
+CREATE INDEX idx_leads_tenant_ad_id ON leads(tenant_id, ad_id) WHERE is_deleted = false AND ad_id IS NOT NULL;
+CREATE INDEX idx_leads_tenant_adset_id ON leads(tenant_id, adset_id) WHERE is_deleted = false AND adset_id IS NOT NULL;
 CREATE INDEX idx_leads_tenant_pipeline_created ON leads(tenant_id, pipeline_id, created_at DESC);
 CREATE INDEX idx_leads_tenant_pipeline_stage ON leads(tenant_id, pipeline_id, stage_id);
 CREATE INDEX idx_leads_tenant_assigned_accepted ON leads(tenant_id, assigned_to, is_accepted);
@@ -427,7 +436,7 @@ CREATE INDEX idx_timeline_tenant_metadata ON lead_timeline_events USING gin (ten
 CREATE TABLE IF NOT EXISTS tenant_integrations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    integration_type VARCHAR(50) NOT NULL CHECK (integration_type IN ('telegram', 'telegram_bot', 'zalo_bot', 'zalo_oa', 'zalo_zns', 'meta_capi', 'facebook_ads', 'aws_ses', 'smtp', 'custom_domain_dkim', 'sms_brandname', 'google_sheets', 'misa_einvoice', 'ai_gemini', 'ai_gemini_byok')),
+    integration_type VARCHAR(50) NOT NULL CHECK (integration_type IN ('telegram', 'telegram_bot', 'zalo_bot', 'zalo_oa', 'zalo_zns', 'meta_capi', 'meta_messenger', 'facebook_ads', 'google_ads', 'dom_meta_report', 'aws_ses', 'smtp', 'custom_domain_dkim', 'sms_brandname', 'google_sheets', 'misa_einvoice', 'ai_gemini', 'ai_gemini_byok')),
     config_encrypted TEXT NOT NULL, -- AES-256-GCM cipher payload
     iv VARCHAR(64) NOT NULL,
     auth_tag VARCHAR(64) NOT NULL,
@@ -490,6 +499,8 @@ CREATE TABLE IF NOT EXISTS capi_logs (
     sent_payload JSONB NOT NULL,
     response_status INTEGER NOT NULL,
     response_body JSONB,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ,
     sent_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT fk_capi_logs_lead FOREIGN KEY (tenant_id, lead_id) REFERENCES leads(tenant_id, id) ON DELETE CASCADE
 );
@@ -497,7 +508,9 @@ CREATE TABLE IF NOT EXISTS capi_logs (
 CREATE INDEX idx_capi_logs_lookup ON capi_logs(tenant_id, lead_id, sent_at DESC);
 CREATE INDEX idx_capi_logs_tenant_status_sent ON capi_logs(tenant_id, response_status, sent_at DESC);
 CREATE INDEX idx_capi_logs_tenant_sent ON capi_logs(tenant_id, sent_at DESC);
+CREATE INDEX idx_capi_logs_lead_event_status ON capi_logs(tenant_id, lead_id, event_name, response_status);
 CREATE INDEX idx_capi_retry_sweep ON capi_logs(response_status, sent_at ASC) WHERE response_status IN (429, 500, 502, 503, 504);
+CREATE INDEX idx_capi_logs_retry_next ON capi_logs(response_status, next_retry_at, sent_at ASC) WHERE response_status IN (429, 500, 502, 503, 504);
 
 -- Table: data_reports (Error Tickets, Bogus Number Reports & Replacement Quotas)
 CREATE TABLE IF NOT EXISTS data_reports (
@@ -520,6 +533,7 @@ CREATE TABLE IF NOT EXISTS data_reports (
 
 CREATE INDEX idx_data_reports_tenant ON data_reports(tenant_id, status, created_at DESC);
 CREATE INDEX idx_data_reports_tenant_created ON data_reports(tenant_id, created_at DESC);
+CREATE INDEX idx_data_reports_tenant_lead_created ON data_reports(tenant_id, lead_id, created_at DESC);
 
 -- ============================================================================
 -- 8. KERNEL ROW-LEVEL SECURITY (RLS) POLICIES & ENFORCEMENT
@@ -690,14 +704,18 @@ CREATE POLICY tenant_isolation_data_reports ON data_reports
 CREATE TABLE IF NOT EXISTS tenant_billing_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    tx_type VARCHAR(40) NOT NULL CHECK (tx_type IN ('topup', 'subscription_purchase', 'renewal', 'plan_upgrade', 'crm_erp_upgrade', 'admin_grant')),
+    tx_type VARCHAR(40) NOT NULL CHECK (tx_type IN ('topup', 'subscription_purchase', 'renewal', 'plan_upgrade', 'plan_downgrade', 'plan_switch', 'package_switch', 'refund', 'cancellation', 'proration_credit', 'reactivation', 'webhook_payment', 'crm_erp_upgrade', 'admin_grant')),
     plan_code VARCHAR(80),
     billing_cycle VARCHAR(30),
     months_added INTEGER NOT NULL DEFAULT 0,
     amount_vnd BIGINT NOT NULL DEFAULT 0,
+    proration_credit_vnd BIGINT NOT NULL DEFAULT 0,
     discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
     payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
-    status VARCHAR(30) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'completed')),
+    provider VARCHAR(40) NOT NULL DEFAULT 'manual_bank_transfer',
+    external_tx_id VARCHAR(160),
+    idempotency_key VARCHAR(120),
+    status VARCHAR(30) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'completed', 'failed', 'cancelled', 'refunded', 'expired')),
     reference_code VARCHAR(80),
     note TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -709,6 +727,11 @@ CREATE TABLE IF NOT EXISTS tenant_billing_transactions (
 
 CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_created ON tenant_billing_transactions(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_billing_tx_status_created ON tenant_billing_transactions(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_status_created ON tenant_billing_transactions(tenant_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_type_created ON tenant_billing_transactions(tenant_id, tx_type, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_tx_tenant_idempotency ON tenant_billing_transactions(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_tx_provider_ext ON tenant_billing_transactions(provider, external_tx_id) WHERE provider IS NOT NULL AND external_tx_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_tx_reference_code ON tenant_billing_transactions(reference_code) WHERE reference_code IS NOT NULL;
 
 ALTER TABLE tenant_billing_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_billing_transactions FORCE ROW LEVEL SECURITY;
@@ -839,6 +862,7 @@ CREATE TABLE IF NOT EXISTS meta_ads_insights (
     CONSTRAINT uk_meta_ads_tenant_ad_date UNIQUE (tenant_id, ad_id, date_start, date_stop)
 );
 CREATE INDEX IF NOT EXISTS idx_meta_ads_tenant_date ON meta_ads_insights(tenant_id, date_start DESC);
+CREATE INDEX IF NOT EXISTS idx_meta_ads_tenant_ad_stop ON meta_ads_insights(tenant_id, ad_id, date_stop DESC);
 
 CREATE TABLE IF NOT EXISTS lead_import_batches (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1953,6 +1977,13 @@ ALTER TABLE tenant_branches ADD COLUMN IF NOT EXISTS manager_user_id UUID;
       line_items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       owner_user_id UUID,
       approved_by UUID,
+      unit_code VARCHAR(80),
+      project_name VARCHAR(200),
+      expected_commission_vnd NUMERIC(18,2) NOT NULL DEFAULT 0,
+      total_percentage NUMERIC(6,2) NOT NULL DEFAULT 100,
+      dispute_details TEXT,
+      approved_at TIMESTAMPTZ,
+      metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
     );
@@ -2176,6 +2207,7 @@ CREATE TABLE IF NOT EXISTS mkt_template_groups (
     verified BOOLEAN NOT NULL DEFAULT false,
     expires_at TIMESTAMPTZ NOT NULL,
     verified_at TIMESTAMPTZ,
+    consumed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT uk_mkt_otp_verifications_tenant_id UNIQUE (tenant_id, id)
   );
@@ -3778,14 +3810,17 @@ CREATE TABLE IF NOT EXISTS mkt_template_groups (
       deposit_id UUID,
       company_id UUID,
       lead_id UUID,
+      deal_id UUID,
       supplier_id UUID,
       branch_id UUID,
-      customer_name VARCHAR(200) NOT NULL,
+      customer_name VARCHAR(200) NOT NULL DEFAULT '',
       customer_tax_code VARCHAR(60),
+      tax_code VARCHAR(50),
       customer_address TEXT,
       customer_email VARCHAR(255),
       status VARCHAR(30) NOT NULL DEFAULT 'issued',
       issue_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      issued_at TIMESTAMPTZ DEFAULT clock_timestamp(),
       due_date DATE,
       items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       subtotal_vnd BIGINT NOT NULL DEFAULT 0,
@@ -3805,6 +3840,7 @@ CREATE TABLE IF NOT EXISTS mkt_template_groups (
       CONSTRAINT uk_tenant_invoices_code UNIQUE (tenant_id, invoice_code)
     );
     CREATE INDEX IF NOT EXISTS idx_tenant_invoices_status ON tenant_invoices(tenant_id, status, issue_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_crm360_invoices_lead ON tenant_invoices(tenant_id, lead_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS tenant_invoice_items (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4001,9 +4037,11 @@ CREATE TABLE IF NOT EXISTS mkt_template_groups (
       tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       project_id UUID,
       task_id UUID NOT NULL,
-      predecessor_task_id UUID NOT NULL,
-      dependency_type VARCHAR(10) NOT NULL DEFAULT 'FS',
+      predecessor_task_id UUID,
+      depends_on_task_id UUID,
+      dependency_type VARCHAR(30) NOT NULL DEFAULT 'FS',
       lag_days INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
       created_by UUID,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       CONSTRAINT uk_tenant_task_deps_tenant_id UNIQUE (tenant_id, id),
@@ -4017,10 +4055,11 @@ CREATE TABLE IF NOT EXISTS mkt_template_groups (
       tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       task_id UUID NOT NULL,
       author_user_id UUID,
-      author_name VARCHAR(150) NOT NULL,
+      author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên',
       content TEXT NOT NULL,
       mentions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      edit_history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id),
@@ -4036,6 +4075,7 @@ CREATE TABLE IF NOT EXISTS mkt_template_groups (
       file_url TEXT NOT NULL,
       mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
       size_bytes BIGINT NOT NULL DEFAULT 0,
+      cloud_file_id UUID,
       uploaded_by UUID,
       uploaded_by_name VARCHAR(150),
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -4531,13 +4571,17 @@ CREATE TABLE IF NOT EXISTS tenant_entity_tabs (
       tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       entity_type VARCHAR(40) NOT NULL DEFAULT 'lead',
       tab_key VARCHAR(80) NOT NULL,
-      label VARCHAR(140) NOT NULL,
+      label VARCHAR(140) NOT NULL DEFAULT '',
+      tab_label VARCHAR(150) NOT NULL DEFAULT '',
       icon_name VARCHAR(60) NOT NULL DEFAULT 'Layers',
       tab_type VARCHAR(30) NOT NULL DEFAULT 'fields',
       config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       allowed_role_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      allowed_roles JSONB NOT NULL DEFAULT '[]'::jsonb,
       sort_order INTEGER NOT NULL DEFAULT 0,
       is_active BOOLEAN NOT NULL DEFAULT true,
+      created_by UUID,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       CONSTRAINT uk_tenant_entity_tabs_tenant_id UNIQUE (tenant_id, id),
@@ -4546,8 +4590,9 @@ CREATE TABLE IF NOT EXISTS tenant_entity_tabs (
 
 CREATE TABLE IF NOT EXISTS tenant_cron_runs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
       subroutine_key VARCHAR(80) NOT NULL,
+      run_key VARCHAR(120),
       status VARCHAR(20) NOT NULL DEFAULT 'success',
       items_processed INTEGER NOT NULL DEFAULT 0,
       duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -4563,6 +4608,9 @@ CREATE TABLE IF NOT EXISTS tenant_cron_runs (
 CREATE INDEX IF NOT EXISTS idx_custom_fields_tenant_entity
       ON tenant_custom_fields (tenant_id, entity_type, sort_order);
 
+CREATE INDEX IF NOT EXISTS idx_custom_fields_lookup
+      ON tenant_custom_fields (tenant_id, entity_type, is_active, sort_order ASC);
+
 CREATE INDEX IF NOT EXISTS idx_lead_scoring_tenant_active
       ON tenant_lead_scoring_rules (tenant_id, is_active, priority);
 
@@ -4575,8 +4623,21 @@ CREATE INDEX IF NOT EXISTS idx_email_templates_tenant_cat
 CREATE INDEX IF NOT EXISTS idx_entity_tabs_tenant_entity
       ON tenant_entity_tabs (tenant_id, entity_type, sort_order);
 
+CREATE INDEX IF NOT EXISTS idx_entity_tabs_lookup
+      ON tenant_entity_tabs (tenant_id, entity_type, is_active, sort_order ASC);
+
 CREATE INDEX IF NOT EXISTS idx_cron_runs_tenant_sub
       ON tenant_cron_runs (tenant_id, subroutine_key, started_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_tenant_sub_run_key
+      ON tenant_cron_runs (tenant_id, subroutine_key, run_key)
+      WHERE tenant_id IS NOT NULL AND run_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_cron_runs_tenant_sub_status
+      ON tenant_cron_runs (tenant_id, subroutine_key, status, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cron_runs_sub_started
+      ON tenant_cron_runs (subroutine_key, started_at DESC);
 
 
 DO $$
@@ -4651,49 +4712,23 @@ END $$;
     ALTER TABLE tenant_deal_stage_history ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS idx_deal_stage_hist_lookup ON tenant_deal_stage_history(tenant_id, deal_id, created_at DESC);
 
-    -- 2. Dynamic Entity Tabs (Contact / Company / Deal 360° Custom Sub-Tabs)
-    CREATE TABLE IF NOT EXISTS tenant_entity_tabs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      entity_type VARCHAR(40) NOT NULL DEFAULT 'contact',
-      tab_key VARCHAR(64) NOT NULL,
-      tab_label VARCHAR(150) NOT NULL,
-      icon_name VARCHAR(50) NOT NULL DEFAULT 'Layers',
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      allowed_roles JSONB NOT NULL DEFAULT '[]'::jsonb,
-      is_active BOOLEAN NOT NULL DEFAULT true,
-      created_by UUID,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      CONSTRAINT uk_tenant_entity_tabs_tenant_id UNIQUE (tenant_id, id)
-    );
+    -- 2. Dynamic Entity Tabs (Canonical definition merged into SECTION 11 above; retain additive columns & lookup index)
     ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS entity_type VARCHAR(40) NOT NULL DEFAULT 'contact';
-    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS tab_key VARCHAR(64);
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS tab_key VARCHAR(80);
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS label VARCHAR(150) NOT NULL DEFAULT '';
     ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS tab_label VARCHAR(150);
-    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS icon_name VARCHAR(50) NOT NULL DEFAULT 'Layers';
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS icon_name VARCHAR(60) NOT NULL DEFAULT 'Layers';
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS tab_type VARCHAR(30) NOT NULL DEFAULT 'fields';
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS config_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS allowed_role_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS fields_json JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS allowed_roles JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE tenant_entity_tabs ADD COLUMN IF NOT EXISTS created_by UUID;
     CREATE INDEX IF NOT EXISTS idx_entity_tabs_lookup ON tenant_entity_tabs(tenant_id, entity_type, is_active, sort_order ASC);
 
-    -- 3. Global Custom Fields Studio
-    CREATE TABLE IF NOT EXISTS tenant_custom_fields (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      entity_type VARCHAR(40) NOT NULL DEFAULT 'contact',
-      field_key VARCHAR(64) NOT NULL,
-      field_label VARCHAR(150) NOT NULL,
-      field_type VARCHAR(30) NOT NULL DEFAULT 'text',
-      is_required BOOLEAN NOT NULL DEFAULT false,
-      options_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      is_active BOOLEAN NOT NULL DEFAULT true,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      CONSTRAINT uk_tenant_custom_fields_tenant_id UNIQUE (tenant_id, id)
-    );
+    -- 3. Global Custom Fields Studio (Canonical definition merged into SECTION 11 above; retain additive columns & lookup index)
     ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS entity_type VARCHAR(40) NOT NULL DEFAULT 'contact';
     ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS field_key VARCHAR(64);
     ALTER TABLE tenant_custom_fields ADD COLUMN IF NOT EXISTS field_label VARCHAR(150);
@@ -4735,38 +4770,16 @@ END $$;
     CREATE INDEX IF NOT EXISTS idx_crm_act_deal ON tenant_crm_activities(tenant_id, deal_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_crm_act_company ON tenant_crm_activities(tenant_id, company_id, created_at DESC);
 
-    -- 5. Task Dependencies
-    CREATE TABLE IF NOT EXISTS tenant_task_dependencies (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      task_id UUID NOT NULL,
-      depends_on_task_id UUID NOT NULL,
-      dependency_type VARCHAR(30) NOT NULL DEFAULT 'blocked_by',
-      note TEXT,
-      created_by UUID,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      CONSTRAINT uk_tenant_task_dependencies_tenant_id UNIQUE (tenant_id, id)
-    );
+    -- 5. Task Dependencies (Canonical definition merged into ERP-Ops section above; retain additive columns & lookup index)
+    ALTER TABLE tenant_task_dependencies ADD COLUMN IF NOT EXISTS project_id UUID;
+    ALTER TABLE tenant_task_dependencies ADD COLUMN IF NOT EXISTS predecessor_task_id UUID;
+    ALTER TABLE tenant_task_dependencies ADD COLUMN IF NOT EXISTS depends_on_task_id UUID;
     ALTER TABLE tenant_task_dependencies ADD COLUMN IF NOT EXISTS dependency_type VARCHAR(30) NOT NULL DEFAULT 'blocked_by';
     ALTER TABLE tenant_task_dependencies ADD COLUMN IF NOT EXISTS note TEXT;
     ALTER TABLE tenant_task_dependencies ADD COLUMN IF NOT EXISTS created_by UUID;
     CREATE INDEX IF NOT EXISTS idx_task_deps_lookup ON tenant_task_dependencies(tenant_id, task_id);
 
-    -- 6. Task @Mention Comments
-    CREATE TABLE IF NOT EXISTS tenant_task_comments (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      task_id UUID NOT NULL,
-      author_user_id UUID,
-      author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên',
-      content TEXT NOT NULL,
-      mentions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      edit_history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id)
-    );
+    -- 6. Task @Mention Comments (Canonical definition merged into ERP-Ops section above; retain additive columns & lookup index)
     ALTER TABLE tenant_task_comments ADD COLUMN IF NOT EXISTS author_user_id UUID;
     ALTER TABLE tenant_task_comments ADD COLUMN IF NOT EXISTS author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên';
     ALTER TABLE tenant_task_comments ADD COLUMN IF NOT EXISTS mentions_json JSONB NOT NULL DEFAULT '[]'::jsonb;
@@ -4774,21 +4787,7 @@ END $$;
     ALTER TABLE tenant_task_comments ADD COLUMN IF NOT EXISTS edit_history_json JSONB NOT NULL DEFAULT '[]'::jsonb;
     CREATE INDEX IF NOT EXISTS idx_task_comments_lookup ON tenant_task_comments(tenant_id, task_id, created_at ASC);
 
-    -- 7. Task Attachments
-    CREATE TABLE IF NOT EXISTS tenant_task_attachments (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      task_id UUID NOT NULL,
-      file_name VARCHAR(255) NOT NULL,
-      file_url TEXT NOT NULL,
-      mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
-      size_bytes BIGINT NOT NULL DEFAULT 0,
-      cloud_file_id UUID,
-      uploaded_by UUID,
-      uploaded_by_name VARCHAR(150),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      CONSTRAINT uk_tenant_task_attachments_tenant_id UNIQUE (tenant_id, id)
-    );
+    -- 7. Task Attachments (Canonical definition merged into ERP-Ops section above; retain additive columns & lookup index)
     ALTER TABLE tenant_task_attachments ADD COLUMN IF NOT EXISTS file_name VARCHAR(255) DEFAULT 'attachment';
     ALTER TABLE tenant_task_attachments ADD COLUMN IF NOT EXISTS file_url TEXT DEFAULT '';
     ALTER TABLE tenant_task_attachments ADD COLUMN IF NOT EXISTS mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream';
@@ -4846,36 +4845,12 @@ END $$;
     );
     CREATE INDEX IF NOT EXISTS idx_contact_files_entity ON tenant_contact_files(tenant_id, entity_type, entity_id, created_at DESC);
 
-    -- 10. Invoices (Defensive ensure for Contact 360° & CompanyDrawer commercial rollups)
-    CREATE TABLE IF NOT EXISTS tenant_invoices (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      invoice_code VARCHAR(50) NOT NULL,
-      sales_order_id UUID,
-      quote_id UUID,
-      lead_id UUID,
-      company_id UUID,
-      deal_id UUID,
-      customer_name VARCHAR(200) NOT NULL DEFAULT '',
-      tax_code VARCHAR(50),
-      status VARCHAR(30) NOT NULL DEFAULT 'issued',
-      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
-      discount_vnd BIGINT NOT NULL DEFAULT 0,
-      tax_vnd BIGINT NOT NULL DEFAULT 0,
-      total_vnd BIGINT NOT NULL DEFAULT 0,
-      paid_vnd BIGINT NOT NULL DEFAULT 0,
-      due_date DATE,
-      issued_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-      items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      notes TEXT,
-      created_by UUID,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      CONSTRAINT uk_tenant_invoices_tenant_id UNIQUE (tenant_id, id)
-    );
+    -- 10. Invoices (Canonical definition merged into ERP-Ops section above; retain additive columns & lead index)
     ALTER TABLE tenant_invoices ADD COLUMN IF NOT EXISTS deal_id UUID;
     ALTER TABLE tenant_invoices ADD COLUMN IF NOT EXISTS lead_id UUID;
     ALTER TABLE tenant_invoices ADD COLUMN IF NOT EXISTS company_id UUID;
+    ALTER TABLE tenant_invoices ADD COLUMN IF NOT EXISTS tax_code VARCHAR(50);
+    ALTER TABLE tenant_invoices ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ DEFAULT clock_timestamp();
     ALTER TABLE tenant_invoices ADD COLUMN IF NOT EXISTS items_json JSONB NOT NULL DEFAULT '[]'::jsonb;
     CREATE INDEX IF NOT EXISTS idx_crm360_invoices_lead ON tenant_invoices(tenant_id, lead_id, created_at DESC);
 

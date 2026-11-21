@@ -157,7 +157,10 @@ describe('Wave 2 Phase 5: Multi-Tenant DOM Agent, 72 RBAC Tools, Department-ACL 
     );
     assert.ok(deniedAud, 'Denied package entitlement execution must be recorded in tenant_ai_tool_audit_logs');
 
-    // Upgrade Alpha to Gói 4 (`domation_promax`, `education_addon: false`) -> Marketing, HRM & Finance unlock immediately!
+    // Fund Alpha wallet and upgrade Alpha to Gói 4 (`domation_promax`, `education_addon: false`) -> Marketing, HRM & Finance unlock immediately!
+    await withTenantTransaction(alpha.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [alpha.id]);
+    });
     const swPromax = await apiRequest(harness.baseUrl, '/api/v1/workspace/package', {
       method: 'POST',
       token: alpha.token,

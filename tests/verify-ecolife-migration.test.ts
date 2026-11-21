@@ -1,14 +1,18 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { startTestServer, apiRequest, type TestHarness } from './helpers.ts';
 import {
+  DEFAULT_ECOLIFE_SQL_PATH,
   migrateEcoLifeData,
   ECOLIFE_ADMIN_EMAIL,
   ECOLIFE_ADMIN_PASSWORD,
 } from '../scripts/migrate-ecolife-data.ts';
 import { sendTelegramNotification } from '../server/services/telegram.service.ts';
 
-describe('EcoLife Real Dump — End-to-End API & Analytics Verification', () => {
+const hasEcoLifeDump = fs.existsSync(DEFAULT_ECOLIFE_SQL_PATH);
+
+describe('EcoLife Real Dump — End-to-End API & Analytics Verification', { skip: !hasEcoLifeDump ? 'Optional EcoLife SQL dump not present' : false }, () => {
   let harness: TestHarness;
   let adminToken: string;
   let saleToken: string;

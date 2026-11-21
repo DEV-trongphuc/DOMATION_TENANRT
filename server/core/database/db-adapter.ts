@@ -6,7 +6,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { uuid_ossp } from '@electric-sql/pglite/contrib/uuid_ossp';
 import { btree_gin } from '@electric-sql/pglite/contrib/btree_gin';
 import { APP_CONFIG } from '../../config.ts';
-import { translatePostgresSqlToMariaDb } from './sql-translator.ts';
+import { translatePostgresSqlToMariaDb, type TranslatedQuery } from './sql-translator.ts';
 
 export type DatabaseDialect = 'postgres' | 'mariadb';
 
@@ -103,6 +103,103 @@ function hasMultipleTopLevelStatements(sql: string): boolean {
   return statementCount > 1;
 }
 
+function crc32cCastagnoli(buf: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ ((crc & 1) !== 0 ? 0x82f63b78 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Self-heals `global/pg_control` if an overlapping Passenger worker shutdown wrote an older
+ * evicted `checkPoint` LSN over a newer valid `XLOG_CHECKPOINT_*` record already in `pg_wal`.
+ */
+function repairStalePgliteControlCheckpoint(dataDir: string): void {
+  const ctrlPath = path.join(dataDir, 'global', 'pg_control');
+  const walDir = path.join(dataDir, 'pg_wal');
+  if (!fs.existsSync(ctrlPath) || !fs.existsSync(walDir)) return;
+
+  const ctrl = Buffer.from(fs.readFileSync(ctrlPath));
+  if (ctrl.length < 0x124) return;
+  const storedCrc = ctrl.readUInt32LE(0x120);
+  if (storedCrc !== crc32cCastagnoli(ctrl.subarray(0, 0x120))) return;
+
+  const ckptLsn = ctrl.readBigUInt64LE(0x20);
+  const targetSegPageAddr = ckptLsn & ~0xfffffn;
+
+  const walFiles = fs
+    .readdirSync(walDir)
+    .filter((f) => /^0000[0-9A-Fa-f]{20}$/.test(f))
+    .sort();
+
+  let hasTargetSeg = false;
+  let bestLsn = 0n;
+  let bestCkptBytes: Buffer | null = null;
+
+  for (const wf of walFiles) {
+    const buf = fs.readFileSync(path.join(walDir, wf));
+    if (buf.length < 40) continue;
+    const magic = buf.readUInt16LE(0);
+    if (magic !== 0xd113) continue;
+    const segPageAddr = buf.readBigUInt64LE(8);
+    if (segPageAddr === targetSegPageAddr) {
+      hasTargetSeg = true;
+      break;
+    }
+
+    const pages = Math.floor(buf.length / 8192);
+    for (let p = 0; p < pages; p++) {
+      const poff = p * 8192;
+      if (buf.readUInt16LE(poff) !== 0xd113) continue;
+      const pinfo = buf.readUInt16LE(poff + 2);
+      const pageAddr = buf.readBigUInt64LE(poff + 8);
+      const rem = buf.readUInt32LE(poff + 16);
+      const hdrLen = (pinfo & 0x0002) !== 0 ? 40 : 24;
+      let pos = rem === 0 ? hdrLen : (hdrLen + rem + 7) & ~7;
+      while (pos + 24 <= 8192) {
+        const totLen = buf.readUInt32LE(poff + pos);
+        if (totLen < 24 || totLen > 65536 || pos + totLen > 8192) break;
+        const xinfo = buf[poff + pos + 16];
+        const rmid = buf[poff + pos + 17];
+        if (
+          rmid === 0 &&
+          (xinfo === 0x00 || xinfo === 0x10) &&
+          totLen >= 114 &&
+          buf[poff + pos + 24] === 0xff &&
+          buf[poff + pos + 25] === 0x58
+        ) {
+          const recLsn = pageAddr + BigInt(pos);
+          if (recLsn > ckptLsn && recLsn >= bestLsn) {
+            bestLsn = recLsn;
+            bestCkptBytes = Buffer.from(buf.subarray(poff + pos + 26, poff + pos + 26 + 88));
+          }
+        }
+        pos = (pos + totLen + 7) & ~7;
+      }
+    }
+  }
+
+  if (!hasTargetSeg && bestCkptBytes && bestLsn > ckptLsn) {
+    const origOid = ctrl.readUInt32LE(0x48);
+    const ckptOid = bestCkptBytes.readUInt32LE(0x20);
+    ctrl.writeBigUInt64LE(bestLsn, 0x20);
+    bestCkptBytes.copy(ctrl, 0x28);
+    if (origOid > ckptOid) {
+      ctrl.writeUInt32LE(origOid, 0x48);
+    }
+    const nextCrc = crc32cCastagnoli(ctrl.subarray(0, 0x120));
+    ctrl.writeUInt32LE(nextCrc, 0x120);
+    fs.writeFileSync(ctrlPath, ctrl);
+    console.log(
+      `[db-adapter] Self-healed stale pg_control checkpoint 0x${ckptLsn.toString(16)} -> 0x${bestLsn.toString(16)}`
+    );
+  }
+}
+
 export class PGlitePoolAdapter {
   private pglitePromise: Promise<PGlite> | null = null;
   private checkoutChain: Promise<void> = Promise.resolve();
@@ -117,13 +214,15 @@ export class PGlitePoolAdapter {
     if (!this.pglitePromise) {
       if (this.dataDir) {
         try {
-          const pidPath = path.join(this.dataDir, 'postmaster.pid');
-          if (fs.existsSync(pidPath)) {
-            console.log(`[db-adapter] Removing stale postmaster.pid at: ${pidPath}`);
-            fs.unlinkSync(pidPath);
+          for (const lockName of ['postmaster.pid', '.s.PGSQL.5432.lock', '.s.PGSQL.5432.lock.out']) {
+            const lp = path.join(this.dataDir, lockName);
+            if (fs.existsSync(lp)) {
+              fs.unlinkSync(lp);
+            }
           }
+          repairStalePgliteControlCheckpoint(this.dataDir);
         } catch (err) {
-          console.warn('[db-adapter] Warning removing stale postmaster.pid:', err);
+          console.warn('[db-adapter] Warning preparing PGlite dataDir:', err);
         }
       }
       this.pglitePromise = PGlite.create({
@@ -194,6 +293,18 @@ export class PGlitePoolAdapter {
         }
       } finally {
         this.pglitePromise = null;
+        if (this.dataDir) {
+          for (const lockName of ['postmaster.pid', '.s.PGSQL.5432.lock', '.s.PGSQL.5432.lock.out']) {
+            try {
+              const lp = path.join(this.dataDir, lockName);
+              if (fs.existsSync(lp)) {
+                fs.unlinkSync(lp);
+              }
+            } catch {
+              // ignore cleanup errors if temp dir was already removed
+            }
+          }
+        }
       }
     }
   }
@@ -418,9 +529,11 @@ export interface MinimalMariaDbConnection {
 export async function executeMariaDbQueryWithPolyfill<R extends QueryResultRow = any>(
   conn: MinimalMariaDbConnection,
   sql: string,
-  params?: any[]
+  params?: any[],
+  onTranslated?: (translated: TranslatedQuery) => void
 ): Promise<DbQueryResult<R>> {
   const translated = translatePostgresSqlToMariaDb(sql, params);
+  onTranslated?.(translated);
 
   if (translated.isUpdateReturning && translated.updateMeta) {
     const meta = translated.updateMeta;
@@ -525,6 +638,7 @@ export async function executeMariaDbQueryWithPolyfill<R extends QueryResultRow =
 
 export class MariaDbPoolAdapter {
   private pool: Pool;
+  private initializedConnections = new WeakSet<object>();
   public readonly dialect: DatabaseDialect = 'mariadb';
 
   constructor(options: {
@@ -534,7 +648,12 @@ export class MariaDbPoolAdapter {
     user?: string;
     password?: string;
     database?: string;
+    pool?: Pool;
   }) {
+    if (options.pool) {
+      this.pool = options.pool;
+      return;
+    }
     const poolConfig: mysql.PoolOptions = {
       waitForConnections: true,
       connectionLimit: APP_CONFIG.dbPoolMax,
@@ -577,25 +696,58 @@ export class MariaDbPoolAdapter {
 
   async connect(): Promise<DbClient> {
     const conn: PoolConnection = await this.pool.getConnection();
-    await conn.query("SET sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,ANSI_QUOTES')");
+    const rawConn: object = (conn as any).connection ?? conn;
+    if (!this.initializedConnections.has(rawConn)) {
+      try {
+        await conn.query("SET sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,ANSI_QUOTES')");
+        this.initializedConnections.add(rawConn);
+      } catch (err) {
+        try {
+          conn.release();
+        } catch {
+          // Ignore release error if connection already broken
+        }
+        throw err;
+      }
+    }
     let released = false;
+    let lockAcquired = false;
 
     return {
       dialect: 'mariadb',
       async query<R extends QueryResultRow = any>(sql: string, params?: any[]): Promise<DbQueryResult<R>> {
-        return executeMariaDbQueryWithPolyfill<R>(conn as unknown as MinimalMariaDbConnection, sql, params);
+        if (/\b(?:GET_LOCK|pg_advisory_xact_lock|pg_try_advisory_lock)\b/i.test(sql)) {
+          lockAcquired = true;
+        }
+        return executeMariaDbQueryWithPolyfill<R>(
+          conn as unknown as MinimalMariaDbConnection,
+          sql,
+          params,
+          (translated) => {
+            if (/\bGET_LOCK\b/i.test(translated.sql)) {
+              lockAcquired = true;
+            }
+          }
+        );
       },
 
       async exec(sql: string): Promise<void> {
+        if (/\b(?:GET_LOCK|pg_advisory_xact_lock|pg_try_advisory_lock)\b/i.test(sql)) {
+          lockAcquired = true;
+        }
         await conn.query(sql);
       },
 
       release() {
         if (!released) {
           released = true;
-          conn.query('SELECT RELEASE_ALL_LOCKS()').catch(() => {}).finally(() => {
+          if (lockAcquired) {
+            conn.query('SELECT RELEASE_ALL_LOCKS()').catch(() => {}).finally(() => {
+              conn.release();
+            });
+          } else {
             conn.release();
-          });
+          }
         }
       },
     };

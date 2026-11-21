@@ -63,13 +63,13 @@ export async function withTenantTransaction<T>(
         `BEGIN; SET LOCAL search_path TO public;${hasRole ? ' SET LOCAL ROLE autodata_app;' : ''} SELECT set_config('app.current_tenant_id', '${effectiveTenantId}', true);`
       );
       const result = await operation(client);
-      await client.query('COMMIT');
+      await execBatchSql(client, 'COMMIT');
       txCleanlyClosed = true;
       return result;
     }
   } catch (err) {
     try {
-      await client.query('ROLLBACK');
+      await execBatchSql(client, 'ROLLBACK');
       txCleanlyClosed = true;
     } catch {
       // Ignore rollback errors if connection dropped
@@ -114,13 +114,13 @@ export async function withUnscopedRlsCheck<T>(operation: (client: DbClient) => P
         `BEGIN; SET LOCAL search_path TO public;${hasRole ? ' SET LOCAL ROLE autodata_app;' : ''} SELECT set_config('app.current_tenant_id', '', true);`
       );
       const result = await operation(client);
-      await client.query('COMMIT');
+      await execBatchSql(client, 'COMMIT');
       txCleanlyClosed = true;
       return result;
     }
   } catch (err) {
     try {
-      await client.query('ROLLBACK');
+      await execBatchSql(client, 'ROLLBACK');
       txCleanlyClosed = true;
     } catch {
       // Ignore
@@ -163,13 +163,13 @@ export async function withSystemPrivilege<T>(operation: (client: DbClient) => Pr
     } else {
       await execBatchSql(client, 'BEGIN; SET LOCAL search_path TO public;');
       const result = await operation(client);
-      await client.query('COMMIT');
+      await execBatchSql(client, 'COMMIT');
       txCleanlyClosed = true;
       return result;
     }
   } catch (err) {
     try {
-      await client.query('ROLLBACK');
+      await execBatchSql(client, 'ROLLBACK');
       txCleanlyClosed = true;
     } catch {
       // Ignore

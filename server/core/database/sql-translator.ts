@@ -175,6 +175,50 @@ function findLastTopLevelKeyword(sql: string, keyword: string): number {
   return lastIdx;
 }
 
+function replaceMakeIntervalCalls(input: string): string {
+  const unitMap: Record<string, string> = {
+    year: 'YEAR',
+    years: 'YEAR',
+    month: 'MONTH',
+    months: 'MONTH',
+    day: 'DAY',
+    days: 'DAY',
+    hour: 'HOUR',
+    hours: 'HOUR',
+    min: 'MINUTE',
+    mins: 'MINUTE',
+    minute: 'MINUTE',
+    minutes: 'MINUTE',
+    sec: 'SECOND',
+    secs: 'SECOND',
+    second: 'SECOND',
+    seconds: 'SECOND',
+  };
+
+  let result = input;
+  const re = /\bmake_interval\s*\(/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(result)) !== null) {
+    const startIdx = match.index;
+    const openParenIdx = startIdx + match[0].length - 1;
+    const closeParenIdx = findMatchingParen(result, openParenIdx);
+    if (closeParenIdx === -1) break;
+
+    const inner = result.slice(openParenIdx + 1, closeParenIdx).trim();
+    const argMatch = inner.match(/^([a-zA-Z]+)\s*=>\s*([\s\S]+)$/);
+    const unit = argMatch ? unitMap[argMatch[1].toLowerCase()] : undefined;
+    if (!argMatch || !unit) {
+      re.lastIndex = closeParenIdx + 1;
+      continue;
+    }
+
+    const replacement = `INTERVAL ${argMatch[2].trim()} ${unit}`;
+    result = result.slice(0, startIdx) + replacement + result.slice(closeParenIdx + 1);
+    re.lastIndex = startIdx + replacement.length;
+  }
+  return result;
+}
+
 function isDeterministicKeyExpr(expr: string): boolean {
   const e = expr.trim();
   if (/^\$\d+(?:::[a-zA-Z0-9_\[\]\(\)\s,]+)?$/.test(e)) return true;
@@ -460,15 +504,27 @@ export function translatePostgresSqlToMariaDb(sql: string, params: any[] = []): 
     }
 
     // 5. PostgreSQL functions & syntax on masked SQL
-    masked = masked
+    masked = replaceMakeIntervalCalls(masked)
       .replace(/\bclock_timestamp\(\)/gi, 'CURRENT_TIMESTAMP(6)')
       .replace(/\bgen_random_uuid\(\)/gi, 'UUID()')
-      .replace(/make_interval\(hours\s*=>\s*([^)]+)\)/gi, 'INTERVAL $1 HOUR')
-      .replace(/make_interval\(days\s*=>\s*([^)]+)\)/gi, 'INTERVAL $1 DAY')
-      .replace(/make_interval\(mins?\s*=>\s*([^)]+)\)/gi, 'INTERVAL $1 MINUTE')
+      .replace(
+        /\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+(ASC|DESC)\s+NULLS\s+(LAST|FIRST)\b/gi,
+        (_m, col, dir, pos) => {
+          const isLast = String(pos).toUpperCase() === 'LAST';
+          return `CASE WHEN ${col} IS NULL THEN ${isLast ? 1 : 0} ELSE ${isLast ? 0 : 1} END, ${col} ${String(dir).toUpperCase()}`;
+        }
+      )
+      .replace(
+        /\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+NULLS\s+(LAST|FIRST)\b/gi,
+        (_m, col, pos) => {
+          const isLast = String(pos).toUpperCase() === 'LAST';
+          return `CASE WHEN ${col} IS NULL THEN ${isLast ? 1 : 0} ELSE ${isLast ? 0 : 1} END, ${col} ASC`;
+        }
+      )
       .replace(/\bCOUNT\(\*\)::int\b/gi, 'COUNT(*)')
       // Typecast stripping (supports ::type, ::type(len), ::type[])
       .replace(/::(?:[a-zA-Z0-9_]+)(?:\([0-9\s,]+\))?(?:\[\])?/gi, '')
+      .replace(/\s+~\s+(?=@@_LIT_)/g, ' REGEXP ')
       .replace(/\bILIKE\b/gi, 'LIKE')
       // ON CONFLICT ... DO NOTHING: only use ON DUPLICATE KEY UPDATE id = id when `id` actually exists in columns/conflict key;
       // otherwise use standard MariaDB `INSERT IGNORE INTO` so tables without `.id` (e.g. platform_settings) never fail.
@@ -488,8 +544,11 @@ export function translatePostgresSqlToMariaDb(sql: string, params: any[] = []): 
       .replace(/ON\s+CONFLICT\s*\([^)]*\)\s*DO\s*UPDATE\s+SET/gi, 'ON DUPLICATE KEY UPDATE')
       .replace(/EXCLUDED\.([a-zA-Z0-9_]+)/gi, 'VALUES($1)')
       .replace(/SELECT\s+pg_advisory_xact_lock\(hashtext\(([^)]+)\)\)/gi, 'SELECT GET_LOCK(MD5($1), 5) AS lock_acquired')
-      .replace(/SELECT\s+pg_try_advisory_lock\(hashtext\(([^)]+)\)\)/gi, 'SELECT GET_LOCK($1, 0) AS lock_acquired')
-      .replace(/SELECT\s+pg_advisory_unlock\(hashtext\(([^)]+)\)\)/gi, 'SELECT RELEASE_LOCK($1) AS lock_released');
+      .replace(/SELECT\s+pg_try_advisory_lock\(hashtext\(([^)]+)\)\)/gi, 'SELECT GET_LOCK(MD5($1), 0) AS lock_acquired')
+      .replace(/SELECT\s+pg_advisory_unlock\(hashtext\(([^)]+)\)\)/gi, 'SELECT RELEASE_LOCK(MD5($1)) AS lock_released')
+      .replace(/SELECT\s+pg_advisory_xact_lock\(([^)]+)\)/gi, 'SELECT GET_LOCK(MD5(CAST($1 AS CHAR)), 5) AS lock_acquired')
+      .replace(/SELECT\s+pg_try_advisory_lock\(([^)]+)\)/gi, 'SELECT GET_LOCK(MD5(CAST($1 AS CHAR)), 0) AS lock_acquired')
+      .replace(/SELECT\s+pg_advisory_unlock\(([^)]+)\)/gi, 'SELECT RELEASE_LOCK(MD5(CAST($1 AS CHAR))) AS lock_released');
 
     // 6. Unmask string literals
     return masked.replace(/@@_LIT_(\d+)_@@/g, (_m, idx) => literals[parseInt(idx, 10)] ?? '');

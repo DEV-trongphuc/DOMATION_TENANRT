@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { APP_CONFIG } from '../config.ts';
 import { getDatabasePool, type DbClient } from '../core/database/db-adapter.ts';
 import { runMigrations } from '../core/database/migrate.ts';
 import { runDirectDbSlaSweeper } from './subroutines/sla-sweeper.ts';
@@ -6,6 +9,7 @@ import { runZaloTokenRefresher } from './subroutines/zalo-refresher.ts';
 import { runSubscriptionExpiryManager } from './subroutines/billing-manager.ts';
 import { runWebhookDlqRetryWorker } from './subroutines/webhook-retry.ts';
 import { runMetaCapiRetryWorker } from './subroutines/capi-retry.ts';
+import { runDailyReportWorker } from './subroutines/daily-report.ts';
 import {
   recordCronRunLog,
   runAttendanceConfirmWorker,
@@ -15,6 +19,7 @@ import {
   runOutboxEventsWorker,
   runRemindersWorker,
 } from './subroutines/wave2-workers.ts';
+import { ensureZnsDispatcherRegistered } from '../services/zalo-zns.service.ts';
 
 const LOCK_KEY_PG = `hashtext('autodata_master_cron_lock')`;
 const LOCK_KEY_MARIADB = `'autodata_master_cron_lock'`;
@@ -32,6 +37,7 @@ export const ALL_CRON_SUBROUTINES = [
   'attendance_confirm',
   'reminders',
   'outbox_events',
+  'daily_report',
 ] as const;
 
 export interface CronRunStats {
@@ -48,6 +54,7 @@ export interface CronRunStats {
   attendanceConfirmationsCount: number;
   remindersDispatchedCount: number;
   outboxEventsProcessed: number;
+  dailyReportsDispatchedCount: number;
   errors: string[];
 }
 
@@ -56,6 +63,7 @@ export async function executeMasterCron(options?: {
   tenantId?: string;
   forceLock?: boolean;
 }): Promise<{ locked: boolean; stats: CronRunStats }> {
+  ensureZnsDispatcherRegistered();
   const startTime = Date.now();
   const stats: CronRunStats = {
     durationMs: 0,
@@ -71,6 +79,7 @@ export async function executeMasterCron(options?: {
     attendanceConfirmationsCount: 0,
     remindersDispatchedCount: 0,
     outboxEventsProcessed: 0,
+    dailyReportsDispatchedCount: 0,
     errors: [],
   };
 
@@ -239,12 +248,25 @@ export async function executeMasterCron(options?: {
         stats.outboxEventsProcessed = n;
       }
     );
+    await runLoggedSubroutine(
+      'daily_report',
+      'Subroutine M (Daily Report)',
+      () => runDailyReportWorker(options?.tenantId),
+      (n) => {
+        stats.dailyReportsDispatchedCount = n;
+      }
+    );
   } finally {
     if (pool.isEmbedded) {
       try {
         const unlockClient = await pool.connect();
         try {
           await unlockClient.query(`SELECT pg_advisory_unlock(${LOCK_KEY_PG}) AS lock_released`);
+          if (unlockClient.exec) {
+            await unlockClient.exec('CHECKPOINT;');
+          } else {
+            await unlockClient.query('CHECKPOINT;');
+          }
         } finally {
           unlockClient.release();
         }
@@ -269,12 +291,31 @@ export async function executeMasterCron(options?: {
   return { locked: false, stats };
 }
 
+export function shouldRefuseDirectCliPglite(options?: {
+  pgliteDataDir?: string;
+  databaseUrl?: string;
+  allowOfflinePgliteCron?: string;
+}): boolean {
+  const dbUrl = (options?.databaseUrl ?? APP_CONFIG.databaseUrl ?? '').trim();
+  if (dbUrl) return false;
+  const allow = (options?.allowOfflinePgliteCron ?? process.env.ALLOW_OFFLINE_PGLITE_CRON ?? '').trim();
+  if (allow === 'true') return false;
+  const dataDir = path.resolve(options?.pgliteDataDir ?? APP_CONFIG.pgliteDataDir);
+  return fs.existsSync(path.join(dataDir, 'postmaster.pid'));
+}
+
 // CLI Execution Guard
 const isDirectCli =
   typeof process.argv[1] === 'string' &&
   (process.argv[1].endsWith('master-cron.ts') || process.argv[1].endsWith('master-cron.js') || process.env.CRON_CLI === 'true');
 
 if (isDirectCli) {
+  if (shouldRefuseDirectCliPglite()) {
+    console.error(
+      `[MasterCron] Refusing direct CLI execution against PGlite (${APP_CONFIG.pgliteDataDir}): postmaster.pid exists and ALLOW_OFFLINE_PGLITE_CRON !== 'true'.`
+    );
+    process.exit(1);
+  }
   runMigrations()
     .then(() => executeMasterCron())
     .then(({ locked, stats }) => {
@@ -282,7 +323,7 @@ if (isDirectCli) {
         process.exit(0);
       }
       console.log(
-        `[MasterCron] Completed in ${stats.durationMs}ms. Results: SLA=${stats.slaBreachedCount}, Drain=${stats.leadsDrainedCount}, Zalo=${stats.zaloRefreshedCount}, Billing=${stats.subscriptionsProcessed}, Webhooks=${stats.webhooksReplayedCount}, CAPI=${stats.capiRetriedCount}, Flows=${stats.marketingFlowsProcessed}, Campaigns=${stats.marketingCampaignsProcessed}, Audiences=${stats.audiencesReevalCount}, AttConfirm=${stats.attendanceConfirmationsCount}, Reminders=${stats.remindersDispatchedCount}, Outbox=${stats.outboxEventsProcessed}. Errors=${stats.errors.length}`
+        `[MasterCron] Completed in ${stats.durationMs}ms. Results: SLA=${stats.slaBreachedCount}, Drain=${stats.leadsDrainedCount}, Zalo=${stats.zaloRefreshedCount}, Billing=${stats.subscriptionsProcessed}, Webhooks=${stats.webhooksReplayedCount}, CAPI=${stats.capiRetriedCount}, Flows=${stats.marketingFlowsProcessed}, Campaigns=${stats.marketingCampaignsProcessed}, Audiences=${stats.audiencesReevalCount}, AttConfirm=${stats.attendanceConfirmationsCount}, Reminders=${stats.remindersDispatchedCount}, Outbox=${stats.outboxEventsProcessed}, DailyReports=${stats.dailyReportsDispatchedCount}. Errors=${stats.errors.length}`
       );
       process.exit(stats.errors.length > 0 ? 1 : 0);
     })

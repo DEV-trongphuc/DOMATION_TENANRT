@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DbClient } from '../../core/database/db-adapter.ts';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
 import { tenantRedis } from '../../core/cache/tenant-redis.ts';
@@ -10,6 +11,27 @@ import {
   onDomainEvent,
 } from '../../core/events/event-bus.ts';
 import { compileSegmentWhereSql } from './segment-compiler.ts';
+
+function isPlainJsonObject(val: unknown): val is Record<string, unknown> {
+  return typeof val === 'object' && val !== null && !Array.isArray(val);
+}
+
+export function deepMergeJsonObjects(
+  base: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+  depth = 0
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, val] of Object.entries(incoming)) {
+    if (val === undefined) continue;
+    if (depth < 16 && isPlainJsonObject(val) && isPlainJsonObject(out[key])) {
+      out[key] = deepMergeJsonObjects(out[key] as Record<string, unknown>, val, depth + 1);
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+}
 
 export interface EvaluateAudienceResult {
   audience_id: string;
@@ -319,6 +341,8 @@ export async function evaluateDynamicAudience(
 }
 
 const inFlightTenantDynamicEval = new Map<string, { promise: Promise<void>; rerun: boolean }>();
+const dynamicEvalContext = new AsyncLocalStorage<Set<string>>();
+const MAX_DYNAMIC_REEVAL_PASSES = 5;
 
 export async function evaluateAllDynamicAudiencesForTenant(tenantId: string): Promise<void> {
   if (!tenantId) return;
@@ -329,6 +353,18 @@ export async function evaluateAllDynamicAudiencesForTenant(tenantId: string): Pr
     return;
   }
 
+  // Re-entrant call inside an active `evaluateAllDynamicAudiencesForTenant(tenantId)` call chain
+  // (e.g. `audience.entered` -> flow `add_remove_tag` -> `marketing.engaged` -> re-eval):
+  // request a trailing pass and return immediately instead of awaiting our own promise (prevents deadlock).
+  const activeChainTenants = dynamicEvalContext.getStore();
+  if (activeChainTenants?.has(tenantId)) {
+    const active = inFlightTenantDynamicEval.get(tenantId);
+    if (active) {
+      active.rerun = true;
+    }
+    return;
+  }
+
   const existingInFlight = inFlightTenantDynamicEval.get(tenantId);
   if (existingInFlight) {
     existingInFlight.rerun = true;
@@ -336,11 +372,16 @@ export async function evaluateAllDynamicAudiencesForTenant(tenantId: string): Pr
     return;
   }
 
+  const nextChainTenants = new Set<string>(activeChainTenants || []);
+  nextChainTenants.add(tenantId);
+
   const state = { promise: Promise.resolve(), rerun: false };
-  const runner = (async () => {
+  const runner = dynamicEvalContext.run(nextChainTenants, async () => {
     try {
+      let pass = 0;
       do {
         state.rerun = false;
+        pass++;
         const dynamicIds = await withTenantTransaction(tenantId, async (client) => {
           const r = await client.query<{ id: string }>(
             `SELECT id FROM tenant_audiences
@@ -358,11 +399,11 @@ export async function evaluateAllDynamicAudiencesForTenant(tenantId: string): Pr
         for (const audId of dynamicIds) {
           await evaluateDynamicAudience(tenantId, audId);
         }
-      } while (state.rerun);
+      } while (state.rerun && pass < MAX_DYNAMIC_REEVAL_PASSES);
     } finally {
       inFlightTenantDynamicEval.delete(tenantId);
     }
-  })();
+  });
 
   state.promise = runner;
   inFlightTenantDynamicEval.set(tenantId, state);
@@ -497,28 +538,36 @@ export async function upsertMasterContactInTx(
 
   // Deduplicate within tenant by phone first, then email
   let existingId: string | null = null;
+  let existingCustomFieldsRaw: unknown = null;
   if (normalizedPhone) {
-    const byPhone = await client.query<{ id: string }>(
-      'SELECT id FROM leads WHERE tenant_id = $1 AND phone = $2 AND is_deleted = false ORDER BY created_at DESC LIMIT 1',
+    const byPhone = await client.query<{ id: string; custom_fields?: unknown }>(
+      'SELECT id, custom_fields FROM leads WHERE tenant_id = $1 AND phone = $2 AND is_deleted = false ORDER BY created_at DESC LIMIT 1',
       [tenantId, normalizedPhone]
     );
     existingId = byPhone.rows[0]?.id || null;
+    existingCustomFieldsRaw = byPhone.rows[0]?.custom_fields ?? null;
   }
   if (!existingId && cleanEmail) {
-    const byEmail = await client.query<{ id: string }>(
-      'SELECT id FROM leads WHERE tenant_id = $1 AND LOWER(email) = $2 AND is_deleted = false ORDER BY created_at DESC LIMIT 1',
+    const byEmail = await client.query<{ id: string; custom_fields?: unknown }>(
+      'SELECT id, custom_fields FROM leads WHERE tenant_id = $1 AND LOWER(email) = $2 AND is_deleted = false ORDER BY created_at DESC LIMIT 1',
       [tenantId, cleanEmail]
     );
     existingId = byEmail.rows[0]?.id || null;
+    existingCustomFieldsRaw = byEmail.rows[0]?.custom_fields ?? null;
   }
 
   const customFields: Record<string, unknown> =
-    rawItem.custom_fields && typeof rawItem.custom_fields === 'object'
+    rawItem.custom_fields && typeof rawItem.custom_fields === 'object' && !Array.isArray(rawItem.custom_fields)
       ? { ...rawItem.custom_fields }
       : {};
   for (const [k, v] of Object.entries(rawItem)) {
-    if (k.startsWith('cf_') && v !== undefined && v !== '') {
+    if (v === undefined || v === '') continue;
+    if (k.startsWith('cf_')) {
       customFields[k.slice(3)] = v;
+    } else if (k.startsWith('cf.')) {
+      customFields[k.slice(3)] = v;
+    } else if (k.startsWith('custom_fields.')) {
+      customFields[k.slice(14)] = v;
     }
   }
 
@@ -531,6 +580,22 @@ export async function upsertMasterContactInTx(
   const totalRev = Number.isFinite(Number(rawItem.total_revenue_vnd)) ? Math.round(Number(rawItem.total_revenue_vnd)) : 0;
 
   if (existingId) {
+    let existingCfObj: Record<string, unknown> = {};
+    if (existingCustomFieldsRaw && typeof existingCustomFieldsRaw === 'object' && !Array.isArray(existingCustomFieldsRaw)) {
+      existingCfObj = { ...(existingCustomFieldsRaw as Record<string, unknown>) };
+    } else if (typeof existingCustomFieldsRaw === 'string' && existingCustomFieldsRaw.trim()) {
+      try {
+        const parsed = JSON.parse(existingCustomFieldsRaw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          existingCfObj = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // ignore invalid json
+      }
+    }
+    const hasIncomingCf = Object.keys(customFields).length > 0;
+    const mergedCf = hasIncomingCf ? deepMergeJsonObjects(existingCfObj, customFields) : existingCfObj;
+
     await client.query(
       `UPDATE leads
        SET name = COALESCE($3, name),
@@ -551,8 +616,8 @@ export async function upsertMasterContactInTx(
         campaign,
         leadScore,
         totalRev,
-        Object.keys(customFields).length > 0,
-        JSON.stringify(customFields),
+        hasIncomingCf,
+        JSON.stringify(mergedCf),
       ]
     );
     return { leadId: existingId, created: false };
@@ -618,6 +683,7 @@ export async function upsertMasterContactInTx(
     ]
   );
 
+  tenantRedis.invalidateTenantMonthlyLeadCount(tenantId);
   return { leadId: newLeadId, created: true };
 }
 
@@ -648,6 +714,7 @@ export async function importRowsIntoAudience(
     let updatedCount = 0;
     let skippedCount = 0;
     const importedLeadIds: string[] = [];
+    const newlyEnteredLeadIds: string[] = [];
 
     for (const row of rows) {
       if (!row || typeof row !== 'object') {
@@ -663,13 +730,16 @@ export async function importRowsIntoAudience(
         if (upserted.created) createdCount++;
         else updatedCount++;
 
-        await client.query(
+        const insMem = await client.query(
           `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
            VALUES ($1, $2, $3, $4, 'csv', '{}'::jsonb)
            ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
           [crypto.randomUUID(), tenantId, audienceId, upserted.leadId]
         );
         importedLeadIds.push(upserted.leadId);
+        if ((insMem.rowCount || 0) > 0) {
+          newlyEnteredLeadIds.push(upserted.leadId);
+        }
       } catch {
         skippedCount++;
       }
@@ -683,8 +753,20 @@ export async function importRowsIntoAudience(
       imported_count: createdCount + updatedCount,
       total_audience_members: totalMembers,
       lead_ids: importedLeadIds,
+      newly_entered_lead_ids: newlyEnteredLeadIds,
+      audience_name: audCheck.rows[0].name,
     };
   });
+
+  for (const lid of summary.newly_entered_lead_ids) {
+    await emitDomainEvent('audience.entered', {
+      tenantId,
+      audienceId,
+      audienceName: summary.audience_name,
+      audienceType: 'static_list',
+      leadId: lid,
+    });
+  }
 
   // Trigger dynamic segment evaluation once after bulk import
   await evaluateAllDynamicAudiencesForTenant(tenantId);
@@ -692,44 +774,401 @@ export async function importRowsIntoAudience(
     await runUnassignedLeadDrainer(tenantId).catch(() => {});
   }
 
-  return summary;
+  return {
+    created_count: summary.created_count,
+    updated_count: summary.updated_count,
+    skipped_count: summary.skipped_count,
+    imported_count: summary.imported_count,
+    total_audience_members: summary.total_audience_members,
+    lead_ids: summary.lead_ids,
+  };
+}
+
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function safeAudSavepoint<T extends Record<string, any> = Record<string, any>>(
+  client: DbClient,
+  sql: string,
+  params: unknown[]
+): Promise<T[]> {
+  const sp = `sp_aud_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  const isMaria = client.dialect === 'mariadb';
+  try {
+    if (!isMaria) await client.query(`SAVEPOINT ${sp}`);
+    const r = await client.query<T>(sql, params);
+    if (!isMaria) await client.query(`RELEASE SAVEPOINT ${sp}`);
+    return r.rows || [];
+  } catch {
+    if (!isMaria) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${sp}`).catch(() => {});
+      await client.query(`RELEASE SAVEPOINT ${sp}`).catch(() => {});
+    }
+    return [];
+  }
 }
 
 /**
- * Splits an existing Audience randomly into N sub-audiences (A/B/N testing)
+ * Resolves live non-deleted member lead IDs for BOTH static lists and `dynamic_logic` segments.
+ */
+export async function resolveAudienceMemberLeadIdsInTx(
+  client: DbClient,
+  tenantId: string,
+  audienceId: string,
+  options?: { excludeSuppressed?: boolean }
+): Promise<{
+  audience: {
+    id: string;
+    name: string;
+    audience_type: string;
+    color_hex: string;
+    filter_branches: unknown;
+  };
+  leadIds: string[];
+}> {
+  const audRes = await client.query<{
+    id: string;
+    name: string;
+    audience_type: string;
+    color_hex: string;
+    filter_branches: unknown;
+  }>(
+    `SELECT id, name, audience_type, color_hex, filter_branches
+     FROM tenant_audiences
+     WHERE tenant_id = $1 AND id = $2
+     LIMIT 1`,
+    [tenantId, audienceId]
+  );
+  const aud = audRes.rows[0];
+  if (!aud) throw new Error('AUDIENCE_NOT_FOUND');
+
+  const suppressFilter = options?.excludeSuppressed
+    ? ` AND COALESCE(l.email_consent, 'subscribed') NOT IN ('unsubscribed', 'bounced', 'complained')`
+    : '';
+
+  if (aud.audience_type === 'dynamic_logic') {
+    const compiled = compileSegmentWhereSql(tenantId, aud.filter_branches, {
+      audienceIdForExclusions: audienceId,
+      startParamIndex: 1,
+    });
+    if (compiled.hasRules) {
+      const mRes = await client.query<{ id: string }>(
+        `SELECT l.id
+         FROM leads l
+         LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+         WHERE ${compiled.whereClause}${suppressFilter}
+         ORDER BY l.created_at DESC, l.id ASC`,
+        compiled.params
+      );
+      return {
+        audience: aud,
+        leadIds: Array.from(new Set(mRes.rows.map((r) => String(r.id)))),
+      };
+    }
+  }
+
+  const membersRes = await client.query<{ lead_id: string }>(
+    `SELECT tam.lead_id
+     FROM tenant_audience_members tam
+     INNER JOIN leads l ON l.tenant_id = tam.tenant_id AND l.id = tam.lead_id
+     WHERE tam.tenant_id = $1 AND tam.audience_id = $2 AND l.is_deleted = false${suppressFilter}
+     ORDER BY tam.joined_at DESC, tam.lead_id ASC`,
+    [tenantId, audienceId]
+  );
+
+  return {
+    audience: aud,
+    leadIds: Array.from(new Set(membersRes.rows.map((r) => String(r.lead_id)))),
+  };
+}
+
+/**
+ * Largest-remainder bucket allocation so percentage splits ALWAYS sum cleanly to exact total.
+ */
+function allocateByWeights(total: number, weights: number[]): number[] {
+  if (total <= 0) return weights.map(() => 0);
+  const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
+  const exact = weights.map((w) => (total * w) / totalWeight);
+  const floors = exact.map((x) => Math.floor(x));
+  let remainder = total - floors.reduce((a, b) => a + b, 0);
+  const order = exact
+    .map((x, idx) => ({ idx, frac: x - Math.floor(x) }))
+    .sort((a, b) => b.frac - a.frac || a.idx - b.idx);
+  for (let i = 0; i < remainder; i++) {
+    floors[order[i % order.length].idx] += 1;
+  }
+  return floors;
+}
+
+/**
+ * Splits an existing Audience (static list or dynamic segment) cleanly across all strategies:
+ *   - `percentage` / `ratio` (A/B/N split by %)
+ *   - `round_robin` (deterministic interleaved balanced split into N parts)
+ *   - `count` / `quantity` (extract N contacts random/top into new or existing list)
+ *   - `selection` / `list` / `phone` (extract specific contacts or valid-phone contacts)
  */
 export async function splitAudienceIntoParts(
   tenantId: string,
   audienceId: string,
   options: {
+    mode?: 'percentage' | 'ratio' | 'round_robin' | 'count' | 'quantity' | 'selection' | 'list' | 'phone';
+    type?: string;
     ratios?: number[];
     ratio_a?: number;
     parts?: number;
     count_parts?: number;
+    quantity?: number;
+    count?: number;
+    strategy?: 'random' | 'top' | 'round_robin';
+    deterministic?: boolean;
+    data?: string[];
+    lead_ids?: string[];
+    destination_id?: string | null;
+    destination_name?: string | null;
     name_prefix?: string;
+    exclude_from_source?: boolean;
+    cleanup_invalid?: boolean;
     actorId?: string;
   }
 ) {
-  return withTenantTransaction(tenantId, async (client) => {
-    const audRes = await client.query<{ id: string; name: string; color_hex: string }>(
-      'SELECT id, name, color_hex FROM tenant_audiences WHERE tenant_id = $1 AND id = $2 LIMIT 1',
-      [tenantId, audienceId]
-    );
-    const sourceAud = audRes.rows[0];
-    if (!sourceAud) throw new Error('AUDIENCE_NOT_FOUND');
+  const result = await withTenantTransaction(tenantId, async (client) => {
+    const resolved = await resolveAudienceMemberLeadIdsInTx(client, tenantId, audienceId, {
+      excludeSuppressed: Boolean(options.cleanup_invalid),
+    });
+    const sourceAud = resolved.audience;
+    const baseLeadIds = [...resolved.leadIds];
 
-    const membersRes = await client.query<{ lead_id: string }>(
-      `SELECT tam.lead_id
-       FROM tenant_audience_members tam
-       INNER JOIN leads l ON l.tenant_id = tam.tenant_id AND l.id = tam.lead_id
-       WHERE tam.tenant_id = $1 AND tam.audience_id = $2 AND l.is_deleted = false`,
-      [tenantId, audienceId]
-    );
+    const rawMode = String(options.mode || options.type || '').trim().toLowerCase();
+    const effectiveMode:
+      | 'percentage'
+      | 'round_robin'
+      | 'count'
+      | 'selection'
+      | 'list'
+      | 'phone' =
+      rawMode === 'round_robin'
+        ? 'round_robin'
+        : rawMode === 'count' || rawMode === 'quantity'
+          ? 'count'
+          : rawMode === 'selection'
+            ? 'selection'
+            : rawMode === 'list'
+              ? 'list'
+              : rawMode === 'phone'
+                ? 'phone'
+                : rawMode === 'percentage' || rawMode === 'ratio'
+                  ? 'percentage'
+                  : (options.count !== undefined || (options.quantity !== undefined && !Array.isArray(options.ratios) && options.parts === undefined && options.count_parts === undefined && options.ratio_a === undefined && (options.destination_id || options.destination_name)))
+                    ? 'count'
+                    : 'percentage';
 
-    const shuffled = membersRes.rows.map((r) => r.lead_id);
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    const prefix = String(options.name_prefix || sourceAud.name).trim();
+
+    // Helper: create or reuse static target audience and insert member IDs idempotently
+    const materializeBucket = async (
+      bucketIds: string[],
+      targetName: string,
+      description: string,
+      variantLabel: string,
+      existingDestId?: string | null
+    ) => {
+      let targetAudId = existingDestId && UUID_V4_RE.test(existingDestId) ? existingDestId : null;
+      if (targetAudId) {
+        const destCheck = await client.query<{ id: string }>(
+          'SELECT id FROM tenant_audiences WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [tenantId, targetAudId]
+        );
+        if (!destCheck.rows[0]) targetAudId = null;
+      }
+
+      if (!targetAudId) {
+        targetAudId = crypto.randomUUID();
+        await client.query(
+          `INSERT INTO tenant_audiences (
+             id, tenant_id, name, description, audience_type, filter_branches,
+             cached_member_count, color_hex, is_active, created_by
+           ) VALUES ($1, $2, $3, $4, 'static_data', '[]'::jsonb, 0, $5, true, $6)`,
+          [
+            targetAudId,
+            tenantId,
+            targetName.slice(0, 200),
+            description,
+            sourceAud.color_hex || '#1E40FF',
+            options.actorId || null,
+          ]
+        );
+      }
+
+      let added = 0;
+      for (const lid of Array.from(new Set(bucketIds))) {
+        const ins = await client.query(
+          `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
+           VALUES ($1, $2, $3, $4, 'ab_split', $5::jsonb)
+           ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
+          [
+            crypto.randomUUID(),
+            tenantId,
+            targetAudId,
+            lid,
+            JSON.stringify({ parent_audience_id: audienceId, mode: effectiveMode, variant: variantLabel }),
+          ]
+        );
+        added += Number(ins.rowCount || 0);
+      }
+      await refreshAudienceCachedCount(client, tenantId, targetAudId);
+      const subRow = await client.query('SELECT * FROM tenant_audiences WHERE tenant_id = $1 AND id = $2', [
+        tenantId,
+        targetAudId,
+      ]);
+      return { audience: subRow.rows[0], added_count: added };
+    };
+
+    // Single-destination extraction modes (`count`, `selection`, `list`, `phone`)
+    if (effectiveMode === 'count' || effectiveMode === 'selection' || effectiveMode === 'list' || effectiveMode === 'phone') {
+      let pickedIds: string[] = [];
+
+      if (effectiveMode === 'selection') {
+        const wanted = new Set(
+          (Array.isArray(options.lead_ids) ? options.lead_ids : Array.isArray(options.data) ? options.data : [])
+            .map((x) => String(x || '').trim())
+            .filter(Boolean)
+        );
+        pickedIds = baseLeadIds.filter((id) => wanted.has(id));
+      } else if (effectiveMode === 'list') {
+        const tokens = (Array.isArray(options.data) ? options.data : [])
+          .map((x) => String(x || '').trim().toLowerCase())
+          .filter(Boolean);
+        const digitTokens = new Set(tokens.map((t) => t.replace(/\D/g, '')).filter((d) => d.length >= 8));
+        const tokenSet = new Set(tokens);
+        if (baseLeadIds.length > 0 && tokens.length > 0) {
+          const ph = baseLeadIds.map((_, i) => `$${i + 2}`).join(', ');
+          const lRes = await client.query<{ id: string; email: string | null; phone: string | null }>(
+            `SELECT id, email, phone FROM leads WHERE tenant_id = $1 AND id IN (${ph})`,
+            [tenantId, ...baseLeadIds]
+          );
+          for (const row of lRes.rows) {
+            const em = String(row.email || '').trim().toLowerCase();
+            const phRaw = String(row.phone || '').trim().toLowerCase();
+            const phDigits = phRaw.replace(/\D/g, '');
+            const localPhone = phDigits.startsWith('84') ? `0${phDigits.slice(2)}` : phDigits;
+            if (
+              (em && tokenSet.has(em)) ||
+              (phRaw && tokenSet.has(phRaw)) ||
+              (phDigits && digitTokens.has(phDigits)) ||
+              (localPhone && digitTokens.has(localPhone))
+            ) {
+              pickedIds.push(String(row.id));
+            }
+          }
+        }
+      } else if (effectiveMode === 'phone') {
+        if (baseLeadIds.length > 0) {
+          const ph = baseLeadIds.map((_, i) => `$${i + 2}`).join(', ');
+          const pRes = await client.query<{ id: string; phone: string | null }>(
+            `SELECT id, phone FROM leads WHERE tenant_id = $1 AND id IN (${ph})`,
+            [tenantId, ...baseLeadIds]
+          );
+          for (const row of pRes.rows) {
+            const digits = String(row.phone || '').replace(/\D/g, '');
+            if (digits.length >= 9) pickedIds.push(String(row.id));
+          }
+        }
+      } else {
+        // `count` / `quantity`
+        const requestedQty = Math.max(0, Math.floor(Number(options.count ?? options.quantity ?? 0)));
+        const working = [...baseLeadIds];
+        if ((options.strategy || 'random') === 'random' && !options.deterministic) {
+          for (let i = working.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [working[i], working[j]] = [working[j], working[i]];
+          }
+        }
+        pickedIds = working.slice(0, Math.min(working.length, requestedQty));
+      }
+
+      const destName = String(
+        options.destination_name || `${prefix} — Tách (${pickedIds.length})`
+      ).trim();
+      const mat = await materializeBucket(
+        pickedIds,
+        destName,
+        `Tách ${pickedIds.length} khách hàng từ tệp "${sourceAud.name}" (${effectiveMode})`,
+        effectiveMode.toUpperCase(),
+        options.destination_id
+      );
+
+      // Optional Move / Exclude from source
+      if (options.exclude_from_source && pickedIds.length > 0) {
+        if (sourceAud.audience_type === 'dynamic_logic') {
+          for (const lid of pickedIds) {
+            await client.query(
+              `INSERT INTO tenant_audience_exclusions (id, tenant_id, audience_id, lead_id, reason, created_by)
+               VALUES ($1, $2, $3, $4, 'split_move', $5)`,
+              [crypto.randomUUID(), tenantId, audienceId, lid, options.actorId || null]
+            );
+          }
+        } else {
+          const ph = pickedIds.map((_, i) => `$${i + 3}`).join(', ');
+          await client.query(
+            `DELETE FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id = $2 AND lead_id IN (${ph})`,
+            [tenantId, audienceId, ...pickedIds]
+          );
+          await refreshAudienceCachedCount(client, tenantId, audienceId);
+        }
+      }
+
+      const createdArr = mat.audience ? [mat.audience] : [];
+      return {
+        parent_audience_id: audienceId,
+        mode: effectiveMode,
+        total_split_members: pickedIds.length,
+        destination_audience_id: mat.audience?.id || null,
+        added_count: mat.added_count,
+        created_audiences: createdArr,
+        items: createdArr,
+        created: createdArr,
+        needsDynamicReeval: Boolean(options.exclude_from_source && sourceAud.audience_type === 'dynamic_logic'),
+      };
+    }
+
+    // Multi-bucket modes: `round_robin` OR `percentage`
+    if (effectiveMode === 'round_robin') {
+      const nParts = Math.min(10, Math.max(2, Math.round(Number(options.parts || options.count_parts || 2))));
+      const buckets: string[][] = Array.from({ length: nParts }, () => []);
+      baseLeadIds.forEach((lid, idx) => {
+        buckets[idx % nParts].push(lid);
+      });
+
+      const createdSubAudiences: any[] = [];
+      for (let idx = 0; idx < nParts; idx++) {
+        const labelSuffix = String.fromCharCode(65 + idx);
+        const subName = `${prefix} — Round-Robin ${labelSuffix} (${idx + 1}/${nParts})`;
+        const mat = await materializeBucket(
+          buckets[idx],
+          subName,
+          `Chia đều Round-Robin (${idx + 1}/${nParts}) từ tệp "${sourceAud.name}"`,
+          `RR-${labelSuffix}`
+        );
+        if (mat.audience) createdSubAudiences.push(mat.audience);
+      }
+
+      return {
+        parent_audience_id: audienceId,
+        mode: 'round_robin',
+        total_split_members: baseLeadIds.length,
+        created_audiences: createdSubAudiences,
+        items: createdSubAudiences,
+        created: createdSubAudiences,
+        needsDynamicReeval: false,
+      };
+    }
+
+    // `percentage` / `ratio` split (largest-remainder exact allocation)
+    const shuffled = [...baseLeadIds];
+    if (!options.deterministic) {
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
     }
 
     let weights: number[] = [];
@@ -744,67 +1183,523 @@ export async function splitAudienceIntoParts(
     }
 
     const totalWeight = weights.reduce((a, b) => a + b, 0);
-    const prefix = (options.name_prefix || sourceAud.name).trim();
+    const counts = allocateByWeights(shuffled.length, weights);
     const createdSubAudiences: any[] = [];
     let cursor = 0;
 
     for (let idx = 0; idx < weights.length; idx++) {
-      const isLast = idx === weights.length - 1;
-      const sliceCount = isLast
-        ? shuffled.length - cursor
-        : Math.round((shuffled.length * weights[idx]) / totalWeight);
-      const bucketIds = shuffled.slice(cursor, cursor + Math.max(0, sliceCount));
+      const bucketIds = shuffled.slice(cursor, cursor + counts[idx]);
       cursor += bucketIds.length;
 
-      const labelSuffix = String.fromCharCode(65 + idx); // A, B, C...
+      const labelSuffix = String.fromCharCode(65 + idx);
       const pctLabel = Math.round((weights[idx] / totalWeight) * 100);
-      const subId = crypto.randomUUID();
       const subName = `${prefix} — Nhánh ${labelSuffix} (${pctLabel}%)`;
-
-      await client.query(
-        `INSERT INTO tenant_audiences (
-           id, tenant_id, name, description, audience_type, filter_branches,
-           cached_member_count, color_hex, is_active, created_by
-         ) VALUES ($1, $2, $3, $4, 'static_data', '[]'::jsonb, $5, $6, true, $7)`,
-        [
-          subId,
-          tenantId,
-          subName,
-          `Tách ngẫu nhiên A/B từ tệp "${sourceAud.name}"`,
-          bucketIds.length,
-          sourceAud.color_hex || '#1E40FF',
-          options.actorId || null,
-        ]
+      const mat = await materializeBucket(
+        bucketIds,
+        subName,
+        `Tách theo tỷ lệ ${pctLabel}% từ tệp "${sourceAud.name}"`,
+        labelSuffix
       );
-
-      for (const lid of bucketIds) {
-        await client.query(
-          `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
-           VALUES ($1, $2, $3, $4, 'ab_split', $5::jsonb)
-           ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
-          [
-            crypto.randomUUID(),
-            tenantId,
-            subId,
-            lid,
-            JSON.stringify({ parent_audience_id: audienceId, variant: labelSuffix }),
-          ]
-        );
-      }
-
-      const subRow = await client.query('SELECT * FROM tenant_audiences WHERE tenant_id = $1 AND id = $2', [
-        tenantId,
-        subId,
-      ]);
-      createdSubAudiences.push(subRow.rows[0]);
+      if (mat.audience) createdSubAudiences.push(mat.audience);
     }
 
     return {
       parent_audience_id: audienceId,
+      mode: 'percentage',
       total_split_members: shuffled.length,
       created_audiences: createdSubAudiences,
       items: createdSubAudiences,
       created: createdSubAudiences,
+      needsDynamicReeval: false,
     };
   });
+
+  if (result.needsDynamicReeval) {
+    await evaluateDynamicAudience(tenantId, audienceId).catch(() => {});
+  }
+  const { needsDynamicReeval: _ignored, ...cleanResult } = result;
+  return cleanResult;
+}
+
+/**
+ * Merges 2+ Audiences (static lists or dynamic segments) using Set Algebra:
+ *   - `union` (A ∪ B ∪ ...): deduplicated union
+ *   - `intersection` (A ∩ B ∩ ...): members present in ALL selected audiences
+ *   - `subtract` (Base \ Others): members in `base_id` (defaults to `source_ids[0]`) not in remaining audiences
+ * 100% Idempotent with exact duplicate accounting.
+ */
+export async function mergeAudiences(
+  tenantId: string,
+  options: {
+    operation?: 'union' | 'intersection' | 'subtract';
+    source_ids?: string[];
+    list_ids?: string[];
+    base_id?: string | null;
+    merge_type?: 'new' | 'existing';
+    target_id?: string | null;
+    target_list_id?: string | null;
+    destination_id?: string | null;
+    new_list_name?: string | null;
+    name?: string | null;
+    delete_source_lists?: boolean;
+    actorId?: string;
+  }
+) {
+  const rawIds = Array.isArray(options.source_ids)
+    ? options.source_ids
+    : Array.isArray(options.list_ids)
+      ? options.list_ids
+      : [];
+  const sourceIds = Array.from(new Set(rawIds.map((x) => String(x || '').trim()).filter((x) => UUID_V4_RE.test(x))));
+
+  const rawOp = String(options.operation || 'union').trim().toLowerCase();
+  const operation: 'union' | 'intersection' | 'subtract' =
+    rawOp === 'intersection' ? 'intersection' : rawOp === 'subtract' ? 'subtract' : 'union';
+
+  const explicitTargetId = String(
+    options.target_id || options.target_list_id || options.destination_id || ''
+  ).trim();
+  const mergeType: 'new' | 'existing' =
+    options.merge_type === 'existing' || (!options.merge_type && UUID_V4_RE.test(explicitTargetId))
+      ? 'existing'
+      : 'new';
+
+  if (mergeType === 'existing' && !UUID_V4_RE.test(explicitTargetId)) {
+    throw new Error('INVALID_MERGE_TARGET');
+  }
+  if (sourceIds.length === 0) {
+    throw new Error('INVALID_MERGE_SOURCES');
+  }
+  if ((operation === 'intersection' || operation === 'subtract') && sourceIds.length < 2) {
+    throw new Error('MERGE_REQUIRES_AT_LEAST_TWO_SOURCES');
+  }
+
+  return withTenantTransaction(tenantId, async (client) => {
+    // Resolve member sets for every source audience
+    const memberSets = new Map<string, Set<string>>();
+    const sourceMeta = new Map<string, { id: string; name: string; audience_type: string }>();
+    let rawInputTotal = 0;
+
+    for (const srcId of sourceIds) {
+      const resolved = await resolveAudienceMemberLeadIdsInTx(client, tenantId, srcId);
+      const set = new Set(resolved.leadIds);
+      memberSets.set(srcId, set);
+      sourceMeta.set(srcId, {
+        id: resolved.audience.id,
+        name: resolved.audience.name,
+        audience_type: resolved.audience.audience_type,
+      });
+      rawInputTotal += set.size;
+    }
+
+    // Compute set algebra
+    let resultIds: string[] = [];
+    if (operation === 'union') {
+      const unionSet = new Set<string>();
+      for (const s of memberSets.values()) {
+        for (const id of s) unionSet.add(id);
+      }
+      resultIds = Array.from(unionSet);
+    } else if (operation === 'intersection') {
+      const setsArr = Array.from(memberSets.values());
+      const [first, ...rest] = setsArr;
+      resultIds = Array.from(first).filter((id) => rest.every((other) => other.has(id)));
+    } else {
+      // subtract: base \ others
+      const effectiveBaseId =
+        options.base_id && memberSets.has(options.base_id) ? options.base_id : sourceIds[0];
+      const baseSet = memberSets.get(effectiveBaseId) || new Set<string>();
+      const excludeSet = new Set<string>();
+      for (const [sid, s] of memberSets.entries()) {
+        if (sid === effectiveBaseId) continue;
+        for (const id of s) excludeSet.add(id);
+      }
+      resultIds = Array.from(baseSet).filter((id) => !excludeSet.has(id));
+    }
+
+    const duplicatesRemoved =
+      operation === 'union' ? Math.max(0, rawInputTotal - resultIds.length) : 0;
+
+    let targetId = explicitTargetId;
+    let targetName = '';
+
+    if (mergeType === 'new') {
+      targetId = crypto.randomUUID();
+      const opLabel =
+        operation === 'intersection' ? 'Giao nhau' : operation === 'subtract' ? 'Loại trừ' : 'Gộp';
+      targetName = String(
+        options.new_list_name || options.name || `${opLabel} (${sourceIds.length} tệp)`
+      )
+        .trim()
+        .slice(0, 200);
+      await client.query(
+        `INSERT INTO tenant_audiences (
+           id, tenant_id, name, description, audience_type, filter_branches,
+           cached_member_count, color_hex, is_active, created_by
+         ) VALUES ($1, $2, $3, $4, 'static_data', '[]'::jsonb, 0, '#1E40FF', true, $5)`,
+        [
+          targetId,
+          tenantId,
+          targetName,
+          `Kết quả ${opLabel} từ ${sourceIds.length} tệp khách hàng (${operation})`,
+          options.actorId || null,
+        ]
+      );
+    } else {
+      const tgtCheck = await client.query<{ id: string; name: string }>(
+        'SELECT id, name FROM tenant_audiences WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [tenantId, targetId]
+      );
+      if (!tgtCheck.rows[0]) throw new Error('AUDIENCE_NOT_FOUND');
+      targetName = tgtCheck.rows[0].name;
+
+      // For intersection / subtract into an existing target, replace target membership with exact set result
+      if (operation === 'intersection' || operation === 'subtract') {
+        await client.query(
+          'DELETE FROM tenant_audience_members WHERE tenant_id = $1 AND audience_id = $2',
+          [tenantId, targetId]
+        );
+      }
+    }
+
+    let insertedCount = 0;
+    for (const lid of resultIds) {
+      const ins = await client.query(
+        `INSERT INTO tenant_audience_members (id, tenant_id, audience_id, lead_id, source_type, metadata)
+         VALUES ($1, $2, $3, $4, 'merge', $5::jsonb)
+         ON CONFLICT (tenant_id, audience_id, lead_id) DO NOTHING`,
+        [
+          crypto.randomUUID(),
+          tenantId,
+          targetId,
+          lid,
+          JSON.stringify({ operation, source_ids: sourceIds }),
+        ]
+      );
+      insertedCount += Number(ins.rowCount || 0);
+    }
+
+    const totalMembers = await refreshAudienceCachedCount(client, tenantId, targetId);
+
+    // Optional deletion of non-target static source lists
+    let deletedSourceCount = 0;
+    if (options.delete_source_lists) {
+      for (const srcId of sourceIds) {
+        if (srcId === targetId) continue;
+        const meta = sourceMeta.get(srcId);
+        if (meta && meta.audience_type !== 'dynamic_logic') {
+          const del = await client.query(
+            'DELETE FROM tenant_audiences WHERE tenant_id = $1 AND id = $2',
+            [tenantId, srcId]
+          );
+          deletedSourceCount += Number(del.rowCount || 0);
+        }
+      }
+    }
+
+    const audRowRes = await client.query('SELECT * FROM tenant_audiences WHERE tenant_id = $1 AND id = $2', [
+      tenantId,
+      targetId,
+    ]);
+
+    return {
+      operation,
+      target_audience_id: targetId,
+      target_audience_name: targetName,
+      source_count: sourceIds.length,
+      raw_input_total: rawInputTotal,
+      unique_count: resultIds.length,
+      duplicates_removed: duplicatesRemoved,
+      merged_count: insertedCount,
+      total_members: totalMembers,
+      deleted_source_count: deletedSourceCount,
+      audience: audRowRes.rows[0] || null,
+    };
+  });
+}
+
+/**
+ * Meta-Report-style Audience & Segment Analytics (tenant-wide or scoped to an audienceId).
+ */
+export async function computeAudienceAnalyticsInTx(
+  client: DbClient,
+  tenantId: string,
+  audienceId?: string | null
+) {
+  let scopeFilterSql = 'l.tenant_id = $1 AND l.is_deleted = false';
+  const scopeParams: unknown[] = [tenantId];
+  let scopedAudience: { id: string; name: string; audience_type: string } | null = null;
+
+  if (audienceId && UUID_V4_RE.test(audienceId)) {
+    const resolved = await resolveAudienceMemberLeadIdsInTx(client, tenantId, audienceId);
+    scopedAudience = {
+      id: resolved.audience.id,
+      name: resolved.audience.name,
+      audience_type: resolved.audience.audience_type,
+    };
+    if (resolved.leadIds.length === 0) {
+      scopeFilterSql += ' AND 1 = 0';
+    } else {
+      scopeParams.push(resolved.leadIds);
+      scopeFilterSql += ` AND l.id::text = ANY($${scopeParams.length}::text[])`;
+    }
+  }
+
+  const [
+    summaryRows,
+    audCountsRows,
+    sourceRows,
+    adRows,
+    stageRows,
+    growthRows,
+  ] = await Promise.all([
+    client.query<{
+      total_contacts: number;
+      email_reach: number;
+      phone_reach: number;
+      zalo_reach: number;
+      messenger_reach: number;
+      suppressed_consent: number;
+      hot_count: number;
+      warm_count: number;
+      cold_count: number;
+      avg_lead_score: number;
+      total_revenue_vnd: number;
+    }>(
+      `SELECT
+         COUNT(*)::int AS total_contacts,
+         COALESCE(SUM(CASE WHEN l.email IS NOT NULL AND TRIM(l.email) != '' AND COALESCE(l.email_consent, 'subscribed') = 'subscribed' THEN 1 ELSE 0 END), 0)::int AS email_reach,
+         COALESCE(SUM(CASE WHEN l.phone IS NOT NULL AND TRIM(l.phone) != '' THEN 1 ELSE 0 END), 0)::int AS phone_reach,
+         COALESCE(SUM(CASE WHEN COALESCE(l.zns_consent, 'opted_in') = 'opted_in' AND (
+           (l.phone IS NOT NULL AND TRIM(l.phone) != '')
+           OR NULLIF(TRIM(COALESCE(l.custom_fields->>'zalo_user_id', '')), '') IS NOT NULL
+         ) THEN 1 ELSE 0 END), 0)::int AS zalo_reach,
+         COALESCE(SUM(CASE WHEN NULLIF(TRIM(COALESCE(l.custom_fields->>'meta_psid', '')), '') IS NOT NULL OR LOWER(COALESCE(l.source, '')) LIKE '%messenger%' THEN 1 ELSE 0 END), 0)::int AS messenger_reach,
+         COALESCE(SUM(CASE WHEN COALESCE(l.email_consent, 'subscribed') IN ('unsubscribed', 'bounced', 'complained') THEN 1 ELSE 0 END), 0)::int AS suppressed_consent,
+         COALESCE(SUM(CASE WHEN COALESCE(l.email_consent, 'subscribed') NOT IN ('unsubscribed', 'bounced', 'complained') AND COALESCE(l.lead_score, 0) >= 70 THEN 1 ELSE 0 END), 0)::int AS hot_count,
+         COALESCE(SUM(CASE WHEN COALESCE(l.email_consent, 'subscribed') NOT IN ('unsubscribed', 'bounced', 'complained') AND COALESCE(l.lead_score, 0) >= 30 AND COALESCE(l.lead_score, 0) < 70 THEN 1 ELSE 0 END), 0)::int AS warm_count,
+         COALESCE(SUM(CASE WHEN COALESCE(l.email_consent, 'subscribed') NOT IN ('unsubscribed', 'bounced', 'complained') AND COALESCE(l.lead_score, 0) < 30 THEN 1 ELSE 0 END), 0)::int AS cold_count,
+         COALESCE(ROUND(AVG(COALESCE(l.lead_score, 0))::numeric, 1), 0)::float AS avg_lead_score,
+         COALESCE(SUM(COALESCE(l.total_revenue_vnd, 0)), 0)::bigint AS total_revenue_vnd
+       FROM leads l
+       WHERE ${scopeFilterSql}`,
+      scopeParams
+    ),
+    client.query<{ static_count: number; dynamic_count: number }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN audience_type IN ('static_data', 'sync_data') THEN 1 ELSE 0 END), 0)::int AS static_count,
+         COALESCE(SUM(CASE WHEN audience_type = 'dynamic_logic' THEN 1 ELSE 0 END), 0)::int AS dynamic_count
+       FROM tenant_audiences
+       WHERE tenant_id = $1 AND is_active = true`,
+      [tenantId]
+    ),
+    client.query<{
+      source: string;
+      cnt: number;
+      avg_score: number;
+      revenue_vnd: number;
+    }>(
+      `SELECT
+         COALESCE(NULLIF(TRIM(l.source), ''), 'Direct / Khác') AS source,
+         COUNT(*)::int AS cnt,
+         COALESCE(ROUND(AVG(COALESCE(l.lead_score, 0))::numeric, 1), 0)::float AS avg_score,
+         COALESCE(SUM(COALESCE(l.total_revenue_vnd, 0)), 0)::bigint AS revenue_vnd
+       FROM leads l
+       WHERE ${scopeFilterSql}
+       GROUP BY COALESCE(NULLIF(TRIM(l.source), ''), 'Direct / Khác')
+       ORDER BY cnt DESC
+       LIMIT 8`,
+      scopeParams
+    ),
+    client.query<{
+      campaign_name: string;
+      utm_source: string;
+      utm_medium: string;
+      ad_name: string;
+      leads_count: number;
+      won_count: number;
+      revenue_vnd: number;
+    }>(
+      `SELECT
+         COALESCE(NULLIF(TRIM(l.custom_fields->>'utm_campaign'), ''), NULLIF(TRIM(l.campaign), ''), NULLIF(TRIM(l.custom_fields->>'campaign_name'), ''), 'Organic / Direct') AS campaign_name,
+         COALESCE(NULLIF(TRIM(l.utm_source), ''), NULLIF(TRIM(l.custom_fields->>'utm_source'), ''), NULLIF(TRIM(l.source), ''), 'direct') AS utm_source,
+         COALESCE(NULLIF(TRIM(l.utm_medium), ''), NULLIF(TRIM(l.custom_fields->>'utm_medium'), ''), '—') AS utm_medium,
+         COALESCE(NULLIF(TRIM(l.custom_fields->>'ad_name'), ''), NULLIF(TRIM(l.ad_id), ''), '—') AS ad_name,
+         COUNT(*)::int AS leads_count,
+         COALESCE(SUM(CASE WHEN COALESCE(s.is_won_stage, false) = true OR l.lifecycle_stage IN ('customer', 'evangelist') THEN 1 ELSE 0 END), 0)::int AS won_count,
+         COALESCE(SUM(COALESCE(l.total_revenue_vnd, 0)), 0)::bigint AS revenue_vnd
+       FROM leads l
+       LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+       WHERE ${scopeFilterSql}
+       GROUP BY 1, 2, 3, 4
+       ORDER BY leads_count DESC, revenue_vnd DESC
+       LIMIT 8`,
+      scopeParams
+    ),
+    client.query<{
+      stage_id: string | null;
+      stage_name: string;
+      color_hex: string;
+      cnt: number;
+      revenue_vnd: number;
+    }>(
+      `SELECT
+         l.stage_id::text AS stage_id,
+         COALESCE(NULLIF(TRIM(s.stage_name), ''), CASE WHEN l.status = 'marketing_nurture' THEN 'Nuôi dưỡng Marketing' ELSE 'Chưa vào Pipeline' END) AS stage_name,
+         COALESCE(s.color_hex, '#64748b') AS color_hex,
+         COUNT(*)::int AS cnt,
+         COALESCE(SUM(COALESCE(l.total_revenue_vnd, 0)), 0)::bigint AS revenue_vnd
+       FROM leads l
+       LEFT JOIN tenant_pipeline_stages s ON s.tenant_id = l.tenant_id AND s.id = l.stage_id
+       WHERE ${scopeFilterSql}
+       GROUP BY l.stage_id, s.stage_name, s.color_hex, l.status
+       ORDER BY cnt DESC
+       LIMIT 10`,
+      scopeParams
+    ),
+    client.query<{
+      day: string;
+      new_contacts: number;
+      engaged_contacts: number;
+    }>(
+      `SELECT
+         TO_CHAR(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+         COUNT(*)::int AS new_contacts,
+         COALESCE(SUM(CASE WHEN l.last_engaged_at IS NOT NULL THEN 1 ELSE 0 END), 0)::int AS engaged_contacts
+       FROM leads l
+       WHERE ${scopeFilterSql} AND l.created_at >= (clock_timestamp() - INTERVAL '14 days')
+       GROUP BY 1
+       ORDER BY 1 ASC`,
+      scopeParams
+    ),
+  ]);
+
+  const socialRows = await safeAudSavepoint<{ channel: string; cnt: number }>(
+    client,
+    `SELECT sc.channel, COUNT(DISTINCT sc.lead_id)::int AS cnt
+     FROM mkt_social_conversations sc
+     INNER JOIN leads l ON l.tenant_id = sc.tenant_id AND l.id = sc.lead_id
+     WHERE ${scopeFilterSql}
+     GROUP BY sc.channel`,
+    scopeParams
+  );
+  const suppressedRows = await safeAudSavepoint<{ cnt: number }>(
+    client,
+    `SELECT COUNT(DISTINCT l.id)::int AS cnt
+     FROM leads l
+     INNER JOIN mkt_suppression_list ms ON ms.tenant_id = l.tenant_id
+       AND ((l.email IS NOT NULL AND LOWER(ms.recipient) = LOWER(l.email)) OR (l.phone IS NOT NULL AND ms.recipient = l.phone))
+     WHERE ${scopeFilterSql}`,
+    scopeParams
+  );
+
+  const sRow = summaryRows.rows[0] || {
+    total_contacts: 0,
+    email_reach: 0,
+    phone_reach: 0,
+    zalo_reach: 0,
+    messenger_reach: 0,
+    suppressed_consent: 0,
+    hot_count: 0,
+    warm_count: 0,
+    cold_count: 0,
+    avg_lead_score: 0,
+    total_revenue_vnd: 0,
+  };
+  const total = Number(sRow.total_contacts || 0);
+  const pct = (v: number) => (total > 0 ? Math.round((v / total) * 1000) / 10 : 0);
+
+  let socialMessenger = 0;
+  let socialZalo = 0;
+  for (const r of socialRows) {
+    if (r.channel === 'messenger') socialMessenger = Number(r.cnt || 0);
+    if (r.channel === 'zalo_oa') socialZalo = Number(r.cnt || 0);
+  }
+  const emailReach = Number(sRow.email_reach || 0);
+  const phoneReach = Number(sRow.phone_reach || 0);
+  const zaloReach = Math.max(Number(sRow.zalo_reach || 0), socialZalo);
+  const messengerReach = Math.max(Number(sRow.messenger_reach || 0), socialMessenger);
+  const suppressedCount = Math.max(Number(sRow.suppressed_consent || 0), Number(suppressedRows[0]?.cnt || 0));
+
+  // Build full 14-day timeline
+  const growthMap = new Map<string, { new_contacts: number; engaged_contacts: number }>();
+  for (const r of growthRows.rows) {
+    growthMap.set(String(r.day), {
+      new_contacts: Number(r.new_contacts || 0),
+      engaged_contacts: Number(r.engaged_contacts || 0),
+    });
+  }
+  const growthTrend14d: Array<{
+    date: string;
+    label: string;
+    new_contacts: number;
+    engaged_contacts: number;
+  }> = [];
+  const now = new Date();
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
+    const iso = d.toISOString().slice(0, 10);
+    const label = `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const rec = growthMap.get(iso);
+    growthTrend14d.push({
+      date: iso,
+      label,
+      new_contacts: rec?.new_contacts || 0,
+      engaged_contacts: rec?.engaged_contacts || 0,
+    });
+  }
+
+  return {
+    scope: scopedAudience ? 'audience' : 'tenant',
+    audience: scopedAudience,
+    summary: {
+      total_contacts: total,
+      email_reach: emailReach,
+      phone_reach: phoneReach,
+      zalo_reach: zaloReach,
+      messenger_reach: messengerReach,
+      suppressed_count: suppressedCount,
+      avg_lead_score: Number(sRow.avg_lead_score || 0),
+      total_revenue_vnd: Number(sRow.total_revenue_vnd || 0),
+      static_lists_count: Number(audCountsRows.rows[0]?.static_count || 0),
+      dynamic_segments_count: Number(audCountsRows.rows[0]?.dynamic_count || 0),
+    },
+    channel_reach: [
+      { key: 'email', channel: 'Email Marketing', count: emailReach, pct: pct(emailReach), color: '#1E40FF' },
+      { key: 'phone', channel: 'Điện thoại / SMS', count: phoneReach, pct: pct(phoneReach), color: '#10b981' },
+      { key: 'zalo', channel: 'Zalo OA / ZNS', count: zaloReach, pct: pct(zaloReach), color: '#0284c7' },
+      { key: 'messenger', channel: 'Meta Messenger', count: messengerReach, pct: pct(messengerReach), color: '#8b5cf6' },
+    ],
+    top_sources: sourceRows.rows.map((r) => ({
+      source: String(r.source),
+      count: Number(r.cnt || 0),
+      pct: pct(Number(r.cnt || 0)),
+      avg_score: Number(r.avg_score || 0),
+      revenue_vnd: Number(r.revenue_vnd || 0),
+    })),
+    top_ad_attribution: adRows.rows.map((r) => ({
+      campaign_name: String(r.campaign_name),
+      utm_source: String(r.utm_source),
+      utm_medium: String(r.utm_medium),
+      ad_name: String(r.ad_name),
+      leads_count: Number(r.leads_count || 0),
+      won_count: Number(r.won_count || 0),
+      revenue_vnd: Number(r.revenue_vnd || 0),
+    })),
+    pipeline_stages: stageRows.rows.map((r) => ({
+      stage_id: r.stage_id || null,
+      stage_name: String(r.stage_name),
+      color_hex: String(r.color_hex || '#64748b'),
+      count: Number(r.cnt || 0),
+      pct: pct(Number(r.cnt || 0)),
+      revenue_vnd: Number(r.revenue_vnd || 0),
+    })),
+    engagement_tiers: [
+      { tier: 'hot', label: 'Nóng (Hot ≥ 70)', count: Number(sRow.hot_count || 0), pct: pct(Number(sRow.hot_count || 0)), color: '#ef4444' },
+      { tier: 'warm', label: 'Ấm (Warm 30-69)', count: Number(sRow.warm_count || 0), pct: pct(Number(sRow.warm_count || 0)), color: '#f59e0b' },
+      { tier: 'cold', label: 'Lạnh (Cold < 30)', count: Number(sRow.cold_count || 0), pct: pct(Number(sRow.cold_count || 0)), color: '#3b82f6' },
+      { tier: 'suppressed', label: 'Bị chặn / Hủy nhận', count: suppressedCount, pct: pct(suppressedCount), color: '#64748b' },
+    ],
+    growth_trend_14d: growthTrend14d,
+  };
 }

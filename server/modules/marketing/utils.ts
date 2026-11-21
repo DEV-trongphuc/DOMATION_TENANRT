@@ -3,6 +3,57 @@ import { APP_CONFIG } from '../../config.ts';
 import type { DbClient } from '../../core/database/db-adapter.ts';
 import { decryptTenantSecret } from '../../core/crypto/vault.ts';
 import { resolveUserEffectivePermissions } from '../../core/security/rbac.ts';
+import { formatPhoneDisplayVN, normalizePhoneE164 } from '../../services/phone.service.ts';
+
+export function normalizeSuppressionRecipient(channel: string, rawRecipient: string): string {
+  const raw = String(rawRecipient || '').trim();
+  if (!raw) return '';
+  if (channel === 'zns') {
+    const e164 = normalizePhoneE164(raw, { default_dial_code: '84' });
+    return e164 || raw.toLowerCase();
+  }
+  return raw.toLowerCase();
+}
+
+export function getSuppressionMatchKeys(channel: string, rawRecipient: string): string[] {
+  const raw = String(rawRecipient || '').trim().toLowerCase();
+  if (!raw) return [];
+  if (channel !== 'zns') return [raw];
+  const keys = new Set<string>([raw]);
+  const e164 = normalizePhoneE164(raw, { default_dial_code: '84' });
+  if (e164) {
+    keys.add(e164.toLowerCase());
+    keys.add(`+${e164.toLowerCase()}`);
+    const local = formatPhoneDisplayVN(e164, '84');
+    if (local) keys.add(local.toLowerCase());
+  }
+  return Array.from(keys);
+}
+
+export function buildSuppressionSet(rows: Array<{ channel: string; recipient: string }>): Set<string> {
+  const set = new Set<string>();
+  for (const row of rows) {
+    const ch = String(row.channel || '').trim().toLowerCase();
+    for (const key of getSuppressionMatchKeys(ch, row.recipient)) {
+      set.add(`${ch}:${key}`);
+    }
+  }
+  return set;
+}
+
+export function isRecipientSuppressed(
+  suppressedSet: Set<string>,
+  channel: string,
+  rawRecipient: string | null | undefined
+): boolean {
+  const raw = String(rawRecipient || '').trim();
+  if (!raw) return false;
+  const ch = String(channel || '').trim().toLowerCase();
+  for (const key of getSuppressionMatchKeys(ch, raw)) {
+    if (suppressedSet.has(`${ch}:${key}`)) return true;
+  }
+  return false;
+}
 
 export function parseJsonCol<T>(raw: unknown, fallback: T): T {
   if (raw === null || raw === undefined) return fallback;
@@ -237,12 +288,157 @@ export function renderMergeTags(
   });
 }
 
+export function resolvePublicRequestOrigin(
+  req?: {
+    headers?: Record<string, unknown>;
+    protocol?: string;
+    get?: (name: string) => string | undefined;
+  },
+  fallbackUrl?: string
+): string {
+  const hostFromReq = req
+    ? String(req.headers?.['x-forwarded-host'] || req.get?.('host') || req.headers?.host || '').split(',')[0].trim()
+    : '';
+  const protoFromReq = req
+    ? String(req.headers?.['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim()
+    : 'http';
+
+  const isLocalTestHost =
+    hostFromReq.startsWith('127.0.0.1:') ||
+    hostFromReq.startsWith('localhost:') ||
+    hostFromReq === '127.0.0.1' ||
+    hostFromReq === 'localhost';
+
+  const isProduction = process.env.NODE_ENV === 'production' || APP_CONFIG.nodeEnv === 'production';
+  const allowLocalTestOverride = isLocalTestHost && !isProduction;
+  const envOrigin =
+    String(process.env.APP_PUBLIC_URL || '').trim().replace(/\/+$/, '') ||
+    (isProduction ? String(APP_CONFIG.appPublicUrl || 'https://data.domation.net').trim().replace(/\/+$/, '') : '');
+
+  if (envOrigin && !allowLocalTestOverride) {
+    return envOrigin;
+  }
+  if (hostFromReq) {
+    return `${protoFromReq}://${hostFromReq}`.replace(/\/+$/, '');
+  }
+  if (envOrigin) {
+    return envOrigin;
+  }
+  if (fallbackUrl) {
+    return String(fallbackUrl).trim().replace(/\/+$/, '');
+  }
+  if (isProduction) {
+    return APP_CONFIG.appPublicUrl || 'https://data.domation.net';
+  }
+  return `http://127.0.0.1:${APP_CONFIG.port || 3100}`;
+}
+
+export function stripHtmlTagsForPlainText(html: string): string {
+  return String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<\/(p|div|tr|h[1-6]|li|br)\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export function injectEmailOpenAndClickTracking(
+  html: string,
+  opts: { baseUrl: string; claimId: string; unsubscribeUrl?: string }
+): string {
+  const baseUrl = String(opts.baseUrl || '').replace(/\/+$/, '');
+  const claimId = String(opts.claimId || '').trim();
+  if (!baseUrl || !claimId) return String(html || '');
+
+  let out = String(html || '');
+  const looksLikeHtml =
+    /<\/[a-z][a-z0-9]*\s*>/i.test(out) ||
+    /<(?:!doctype|html|head|body|div|p|span|a|img|table|thead|tbody|tr|td|th|h[1-6]|ul|ol|li|br|hr|strong|em|section|style)\b[^>]*>/i.test(out) ||
+    /<[a-z][a-z0-9]*\s+[a-z-]+\s*=/i.test(out);
+  if (!looksLikeHtml) {
+    const safeEscaped = out
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br/>');
+    out = `<!DOCTYPE html><html><body><div>${safeEscaped}</div></body></html>`;
+  }
+
+  // Wrap HTTP(S) <a href="..."> links with click tracker (safe against double-wrapping and non-HTTP/unsubscribe links)
+  out = out.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])([^"']+)\2([^>]*)>/gi, (full, pre, quote, rawHref, post) => {
+    const decodedHref = String(rawHref || '').replace(/&amp;/g, '&').trim();
+    const lower = decodedHref.toLowerCase();
+    if (
+      !decodedHref ||
+      lower.startsWith('#') ||
+      lower.startsWith('mailto:') ||
+      lower.startsWith('tel:') ||
+      lower.startsWith('sms:') ||
+      lower.startsWith('javascript:') ||
+      lower.startsWith('data:') ||
+      /\/unsubscribe(?:[/?#]|$)/i.test(lower) ||
+      lower.includes('/track/click/') ||
+      lower.includes('/track/open/') ||
+      (opts.unsubscribeUrl && decodedHref === opts.unsubscribeUrl)
+    ) {
+      return full;
+    }
+    if (!/^https?:\/\//i.test(decodedHref)) {
+      return full;
+    }
+    const trackedHref = `${baseUrl}/api/v1/public/marketing/track/click/${claimId}?url=${encodeURIComponent(decodedHref)}`;
+    const attrSafe = trackedHref.replace(/"/g, '&quot;');
+    return `<a${pre}href=${quote}${attrSafe}${quote}${post}>`;
+  });
+
+  // Inject 1x1 open tracking pixel (skip if already present for this claimId)
+  const pixelMarker = `/api/v1/public/marketing/track/open/${claimId}`;
+  if (!out.includes(pixelMarker)) {
+    const pixelImg = `<img src="${baseUrl}${pixelMarker}" alt="" width="1" height="1" style="display:none;width:1px;height:1px;border:0;" />`;
+    if (/<\/body>/i.test(out)) {
+      out = out.replace(/<\/body>/i, `${pixelImg}</body>`);
+    } else {
+      out += pixelImg;
+    }
+  }
+
+  return out;
+}
+
 export function buildCountdownTimerSvg(
   targetIso: string,
   accentHex = '#1E40FF',
-  label = 'Ưu đãi kết thúc sau'
+  label = 'Ưu đãi kết thúc sau',
+  bgColor?: string
 ): string {
-  const safeHex = /^#[0-9a-fA-F]{6}$/.test(accentHex) ? accentHex : '#1E40FF';
+  const normHex = (raw: string | undefined, fallback: string): string => {
+    const cleaned = String(raw || '').trim().replace(/^#/, '');
+    if (/^[0-9a-fA-F]{6}$/.test(cleaned)) return `#${cleaned}`;
+    if (/^[0-9a-fA-F]{3}$/.test(cleaned)) {
+      return `#${cleaned[0]}${cleaned[0]}${cleaned[1]}${cleaned[1]}${cleaned[2]}${cleaned[2]}`;
+    }
+    return fallback;
+  };
+  const safeHex = normHex(accentHex, '#1E40FF');
+  const rawBg = String(bgColor || '').trim().toLowerCase();
+  const isTransparent = rawBg === 'transparent' || rawBg === 'none';
+  const r = parseInt(safeHex.slice(1, 3), 16);
+  const g = parseInt(safeHex.slice(3, 5), 16);
+  const b = parseInt(safeHex.slice(5, 7), 16);
+  const isLightInk = (0.299 * r + 0.587 * g + 0.114 * b) > 180;
+  const outerFill = isTransparent ? 'none' : normHex(bgColor, '#F8FAFF');
+  const outerStroke = isTransparent ? 'none' : '#E2E8F0';
+  const boxFill = isTransparent && isLightInk ? 'rgba(15, 23, 42, 0.45)' : '#FFFFFF';
+  const boxStroke = isTransparent && isLightInk ? 'rgba(255, 255, 255, 0.25)' : '#DBEAFE';
+  const unitFill = isTransparent && isLightInk ? '#E2E8F0' : '#64748B';
+  const labelFill = isTransparent && isLightInk ? '#F8FAFC' : '#334155';
   const targetMs = new Date(targetIso).getTime();
   const nowMs = Date.now();
   const diffSec = Number.isFinite(targetMs) ? Math.max(0, Math.floor((targetMs - nowMs) / 1000)) : 86400;
@@ -262,16 +458,16 @@ export function buildCountdownTimerSvg(
     .map(
       (b) => `
     <g transform="translate(${b.x}, 36)">
-      <rect width="80" height="62" rx="12" fill="#FFFFFF" stroke="#DBEAFE" stroke-width="1.5"/>
+      <rect width="80" height="62" rx="12" fill="${boxFill}" stroke="${boxStroke}" stroke-width="1.5"/>
       <text x="40" y="34" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="800" fill="${safeHex}">${b.val}</text>
-      <text x="40" y="52" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="9" font-weight="700" fill="#64748B">${b.unit}</text>
+      <text x="40" y="52" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="9" font-weight="700" fill="${unitFill}">${b.unit}</text>
     </g>`
     )
     .join('');
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="416" height="112" viewBox="0 0 416 112" role="img" aria-label="${escapeHtml(label)}">
-    <rect width="416" height="112" rx="16" fill="#F8FAFF" stroke="#E2E8F0" stroke-width="1"/>
-    <text x="208" y="23" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="11" font-weight="700" fill="#334155">${escapeHtml(label)}</text>
+    <rect width="416" height="112" rx="16" fill="${outerFill}" stroke="${outerStroke}" stroke-width="1"/>
+    <text x="208" y="23" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="11" font-weight="700" fill="${labelFill}">${escapeHtml(label)}</text>
     ${boxesSvg}
   </svg>`;
 }

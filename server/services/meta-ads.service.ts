@@ -4,6 +4,7 @@ import { decryptTenantSecret, encryptTenantSecret } from '../core/crypto/vault.t
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import { getTenantSettingsCached } from '../core/settings/tenant-cache.ts';
 import { formatDateTimeVnSql } from '../routes/legacy/legacy-helpers.ts';
+import { isValidIsoDateString } from '../routes/workspace.routes.ts';
 
 export interface MetaAdAccountRecord {
   id: string;
@@ -851,12 +852,12 @@ export async function discoverMetaTokenAssets(
     });
 
   const meUrl = `https://graph.facebook.com/v21.0/me?fields=id,name&access_token=${encodeURIComponent(token)}`;
-  const accountsUrl =
-    `https://graph.facebook.com/v21.0/me/adaccounts?fields=${encodeURIComponent('id,account_id,name,account_status,currency,business{id,name},adspixels{id,name,last_fired_time}')}&limit=100&access_token=${encodeURIComponent(token)}`;
+  const buildAccountsUrl = (fields: string) =>
+    `https://graph.facebook.com/v21.0/me/adaccounts?fields=${encodeURIComponent(fields)}&limit=100&access_token=${encodeURIComponent(token)}`;
 
-  const [meRes, firstAccRes] = await Promise.all([
+  const [meRes, initialAccRes] = await Promise.all([
     fetcher(meUrl).catch(() => null),
-    fetcher(accountsUrl),
+    fetcher(buildAccountsUrl('id,account_id,name,account_status,currency,business{id,name},adspixels{id,name,last_fired_time}')),
   ]);
 
   let tokenOwner: { id: string; name: string } | null = null;
@@ -871,7 +872,26 @@ export async function discoverMetaTokenAssets(
     }
   }
 
-  const firstAccJson = await firstAccRes.json();
+  let firstAccRes = initialAccRes;
+  let firstAccJson = await firstAccRes.json();
+
+  // Retry without `business{id,name}` (or `adspixels`) when token only has ads_read / ads_management without business_management
+  if ((!firstAccRes.ok || firstAccJson?.error) && /business_management|adspixels|\(#100\)|permission/i.test(String(firstAccJson?.error?.message || ''))) {
+    const fallbackFieldSets = [
+      'id,account_id,name,account_status,currency,adspixels{id,name,last_fired_time}',
+      'id,account_id,name,account_status,currency',
+    ];
+    for (const fields of fallbackFieldSets) {
+      const retryRes = await fetcher(buildAccountsUrl(fields)).catch(() => null);
+      if (!retryRes) continue;
+      const retryJson = await retryRes.json().catch(() => null);
+      firstAccRes = retryRes;
+      firstAccJson = retryJson;
+      if (retryRes.ok && retryJson && !retryJson.error) {
+        break;
+      }
+    }
+  }
   const discoveredAccounts: DiscoveredMetaAdAccount[] = [];
   const pixelMap = new Map<string, DiscoveredMetaPixel>();
 
@@ -1054,9 +1074,13 @@ export function resolveOverviewDateWindow(
   let until = today;
   let isAllTime = false;
 
-  if (range === 'custom' && fromDateRaw && toDateRaw) {
-    since = String(fromDateRaw).slice(0, 10);
-    until = String(toDateRaw).slice(0, 10);
+  const cleanFrom = fromDateRaw ? String(fromDateRaw).trim().slice(0, 10) : '';
+  const cleanTo = toDateRaw ? String(toDateRaw).trim().slice(0, 10) : '';
+  const hasExplicitBounds = isValidIsoDateString(cleanFrom) && isValidIsoDateString(cleanTo);
+
+  if (hasExplicitBounds) {
+    since = cleanFrom <= cleanTo ? cleanFrom : cleanTo;
+    until = cleanFrom <= cleanTo ? cleanTo : cleanFrom;
   } else if (range === 'today') {
     since = today;
     until = today;
@@ -1064,10 +1088,13 @@ export function resolveOverviewDateWindow(
     const y = addDaysIso(today, -1);
     since = y;
     until = y;
-  } else if (range === '7days' || range === 'last_7d' || range === 'last_7_days') {
+  } else if (range === 'yesterday_to_today' || range === 'hôm qua - hôm nay') {
+    since = addDaysIso(today, -1);
+    until = today;
+  } else if (range === '7days' || range === '7_days' || range === 'last_7d' || range === 'last_7days' || range === 'last_7_days') {
     since = addDaysIso(today, -6);
     until = today;
-  } else if (range === '30days' || range === 'last_30d' || range === 'last_30_days') {
+  } else if (range === '30days' || range === '30_days' || range === 'last_30d' || range === 'last_30days' || range === 'last_30_days') {
     since = addDaysIso(today, -29);
     until = today;
   } else if (range === 'this_week') {
@@ -1112,9 +1139,6 @@ export function resolveOverviewDateWindow(
     since = '2020-01-01';
     until = today;
     isAllTime = true;
-  } else if (fromDateRaw && toDateRaw) {
-    since = String(fromDateRaw).slice(0, 10);
-    until = String(toDateRaw).slice(0, 10);
   }
 
   const startMs = new Date(`${since}T00:00:00Z`).getTime();

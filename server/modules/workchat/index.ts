@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import { getTenantContext } from '../../core/context/tenant-context.ts';
 import { hashPassword, verifyPassword } from '../../core/crypto/password.ts';
 import {
@@ -157,6 +158,7 @@ const updateMyAccountHandler = async (req: any, res: any) => {
           'UPDATE tenants SET settings = $2::jsonb, updated_at = clock_timestamp() WHERE id = $1',
           [ctx.tenantId, JSON.stringify(settings)]
         );
+        tenantRedis.invalidateTenantCache(ctx.tenantId, ctx.tenantSlug);
       }
 
       const fresh = await client.query(
@@ -265,6 +267,7 @@ export interface QuickWorkStatusStickerMeta {
 }
 
 const COMMERCIAL_STICKER_PACKS: CommercialStickerPackMeta[] = [
+  { id: 'dom', name: 'DOM Mascot', count: 16, is_mascot_pack: true, sample_emojis: ['🤖', '💙', '🎉', '✅', '🚀', '☕'] },
   { id: 'ghost', name: 'Ghost Cute', count: 14, sample_emojis: ['👻', '✨', '💫', '🥳', '🎉', '🙌'] },
   { id: 'maruko', name: 'Maruko', count: 20, sample_emojis: ['😊', '🌸', '🍵', '🎶', '📚', '🌞'] },
   { id: 'smalldog', name: 'Cún Con Năng Động', count: 16, sample_emojis: ['🐶', '🐾', '🦴', '💛', '🏃', '🎾'] },
@@ -515,9 +518,11 @@ router.get('/channels/:id/messages', requirePermission('workchat', 'view'), asyn
 
       let sql = `
         SELECT m.*,
+               u.avatar_url AS sender_avatar,
                pm.sender_name AS parent_sender_name,
                pm.content AS parent_content
         FROM tenant_workchat_messages m
+        LEFT JOIN users u ON u.tenant_id = m.tenant_id AND u.id = m.sender_user_id
         LEFT JOIN tenant_workchat_messages pm ON pm.tenant_id = m.tenant_id AND pm.id = m.parent_message_id
         WHERE m.tenant_id = $1 AND m.channel_id = $2 AND m.is_deleted = false
       `;
@@ -531,6 +536,8 @@ router.get('/channels/:id/messages', requirePermission('workchat', 'view'), asyn
         channel: ch.rows[0],
         items: r.rows.map((row) => ({
           ...row,
+          sender_id: row.sender_id || row.sender_user_id,
+          sender_avatar: row.sender_avatar || null,
           attachments: parseJsonSafe(row.attachments_json, []),
           reactions: parseJsonSafe(row.reactions_json, {}),
         })),
@@ -1131,9 +1138,11 @@ router.get('/feed', requirePermission('workchat', 'view'), async (req, res) => {
     const items = await withTenantTransaction(ctx.tenantId, async (client) => {
       let sql = `
         SELECT fp.*,
+               u.avatar_url AS author_avatar,
                d.name AS department_name,
                b.name AS branch_name
         FROM tenant_feed_posts fp
+        LEFT JOIN users u ON u.tenant_id = fp.tenant_id AND u.id = fp.author_user_id
         LEFT JOIN tenant_departments d ON d.tenant_id = fp.tenant_id AND d.id = fp.department_id
         LEFT JOIN tenant_branches b ON b.tenant_id = fp.tenant_id AND b.id = fp.branch_id
         WHERE fp.tenant_id = $1

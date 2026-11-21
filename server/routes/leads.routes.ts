@@ -32,7 +32,10 @@ import {
   ingestAndDistributeLead,
   validateAndSanitizeCustomFields,
 } from '../services/distribution.service.ts';
-import { dispatchStageCapiEventDetached } from '../services/capi.service.ts';
+import {
+  dispatchStageCapiEventDetached,
+  resolveCapiEventForQualityOrStage,
+} from '../services/capi.service.ts';
 import { enqueueOutboundWebhookEvent } from '../services/webhook.service.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import { emitDomainEvent } from '../core/events/event-bus.ts';
@@ -355,7 +358,9 @@ async function handleDatabankRelease(req: Request, res: Response) {
     const leadIdsRaw = Array.isArray(b.lead_ids)
       ? b.lead_ids
       : [req.params.id || b.lead_id || b.id].filter(Boolean);
-    const leadIds = Array.from(new Set(leadIdsRaw.map((x: unknown) => String(x || '').trim()).filter(Boolean)));
+    const leadIds: string[] = Array.from(
+      new Set(leadIdsRaw.map((x: unknown) => String(x || '').trim()).filter(Boolean))
+    );
     if (leadIds.length === 0) {
       sendApiError(res, 422, 'VALIDATION_ERROR', 'Cần cung cấp ít nhất 1 lead_id để thả vào Kho Số.');
       return;
@@ -363,24 +368,35 @@ async function handleDatabankRelease(req: Request, res: Response) {
     const reason = String(b.reason || 'Thả số về Kho Số Chung (Public Databank)').trim();
 
     const released = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const results: any[] = [];
-      for (const lid of leadIds) {
-        const lRes = await client.query<{
-          id: string;
-          stage_id: string;
-          phone: string;
-          assigned_to: string | null;
-        }>(
-          'SELECT id, stage_id, phone, assigned_to FROM leads WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
-          [ctx.tenantId, lid]
-        );
-        const lead = lRes.rows[0];
-        if (!lead) continue;
+      const lRes = await client.query<{
+        id: string;
+        stage_id: string | null;
+        phone: string | null;
+        assigned_to: string | null;
+      }>(
+        'SELECT id, stage_id, phone, assigned_to FROM leads WHERE tenant_id = $1 AND id = ANY($2::uuid[]) FOR UPDATE',
+        [ctx.tenantId, leadIds]
+      );
+      if (lRes.rows.length === 0) {
+        return [];
+      }
+
+      const leadMap = new Map(lRes.rows.map((r) => [r.id, r]));
+      const orderedLeads = leadIds.map((id) => leadMap.get(id)).filter((r): r is NonNullable<typeof r> => Boolean(r));
+
+      for (const lead of orderedLeads) {
         const canAccess = await canActorAccessLeadInTx(client, ctx.tenantId, resolved, lead.assigned_to, 'edit');
         if (!canAccess) {
           throw new Error('FORBIDDEN_NOT_ASSIGNED');
         }
+      }
 
+      const matchedIds = orderedLeads.map((l) => l.id);
+      const actorRole = String(resolved.userOrg?.role || ctx.userRole || 'staff').slice(0, 30);
+      const actorName = ctx.userName || 'Staff';
+      const branchId = resolved.userOrg?.branch_id || null;
+
+      for (const lead of orderedLeads) {
         const poolId = crypto.randomUUID();
         await client.query(
           `INSERT INTO crm_public_leads_pool (
@@ -399,18 +415,12 @@ async function handleDatabankRelease(req: Request, res: Response) {
           [
             poolId,
             ctx.tenantId,
-            lid,
-            resolved.userOrg?.branch_id || null,
+            lead.id,
+            branchId,
             ctx.userId,
             reason,
             JSON.stringify({ previous_owner: lead.assigned_to }),
           ]
-        );
-        await client.query(
-          `UPDATE leads
-           SET status = 'recalled', assigned_to = NULL, is_accepted = false, accepted_at = NULL, updated_at = clock_timestamp()
-           WHERE tenant_id = $1 AND id = $2`,
-          [ctx.tenantId, lid]
         );
         await client.query(
           `INSERT INTO lead_timeline_events (
@@ -418,26 +428,34 @@ async function handleDatabankRelease(req: Request, res: Response) {
            ) VALUES ($1, $2, 'databank_release', 'system', $3, $4, $5, $6, $7, $8::jsonb)`,
           [
             ctx.tenantId,
-            lid,
+            lead.id,
             ctx.userId,
-            String(resolved.userOrg?.role || ctx.userRole || 'staff').slice(0, 30),
-            ctx.userName || 'Staff',
+            actorRole,
+            actorName,
             'Thả khách hàng vào Kho Số Chung (Databank)',
             reason,
             JSON.stringify({ previous_owner: lead.assigned_to }),
           ]
         );
         if (lead.stage_id) {
-          await tenantRedis.zrem('sla_queue', `${lid}:${lead.stage_id}`, ctx.tenantId);
+          await tenantRedis.zrem('sla_queue', `${lead.id}:${lead.stage_id}`, ctx.tenantId);
         }
-        const pRow = await client.query(
-          `SELECT *, pool_status AS status, release_reason AS reason, created_at AS released_at
-           FROM crm_public_leads_pool WHERE tenant_id = $1 AND lead_id = $2 LIMIT 1`,
-          [ctx.tenantId, lid]
-        );
-        results.push(pRow.rows[0]);
       }
-      return results;
+
+      await client.query(
+        `UPDATE leads
+         SET status = 'recalled', assigned_to = NULL, is_accepted = false, accepted_at = NULL, updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND id = ANY($2::uuid[])`,
+        [ctx.tenantId, matchedIds]
+      );
+
+      const pRows = await client.query(
+        `SELECT *, pool_status AS status, release_reason AS reason, created_at AS released_at
+         FROM crm_public_leads_pool WHERE tenant_id = $1 AND lead_id = ANY($2::uuid[])`,
+        [ctx.tenantId, matchedIds]
+      );
+      const poolByLead = new Map(pRows.rows.map((r: any) => [String(r.lead_id), r]));
+      return matchedIds.map((id) => poolByLead.get(id)).filter(Boolean);
     });
 
     res.status(201).json({ success: true, data: released.length === 1 ? released[0] : released, items: released });
@@ -1377,14 +1395,15 @@ leadsRouter.patch('/:id', requirePermission('leads', 'edit'), async (req, res) =
 
     const resolved = await getResolvedUserRbac(req);
     const actorFlags = derivePiiActorFlagsFromRbac(resolved, ctx);
-    const updated = await withTenantTransaction(ctx.tenantId, async (client) => {
+    const txResult = await withTenantTransaction(ctx.tenantId, async (client) => {
       const leadRes = await client.query<{
         id: string;
         pipeline_id: string | null;
         assigned_to: string | null;
+        quality_status: string | null;
         custom_fields: Record<string, unknown> | null;
       }>(
-        'SELECT id, pipeline_id, assigned_to, custom_fields FROM leads WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+        'SELECT id, pipeline_id, assigned_to, quality_status, custom_fields FROM leads WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
         [ctx.tenantId, leadId]
       );
       const lead = leadRes.rows[0];
@@ -1392,6 +1411,7 @@ leadsRouter.patch('/:id', requirePermission('leads', 'edit'), async (req, res) =
       if (!(await canActorAccessLeadInTx(client, ctx.tenantId, resolved, lead.assigned_to, 'edit'))) {
         throw new Error('FORBIDDEN_NOT_ASSIGNED');
       }
+      const previousQualityStatus = lead.quality_status || null;
 
       let nextCustomFields: Record<string, unknown> | null = null;
       if (custom_fields && typeof custom_fields === 'object') {
@@ -1473,13 +1493,63 @@ leadsRouter.patch('/:id', requirePermission('leads', 'edit'), async (req, res) =
         ]
       );
 
-      return transformLeadForActor(
-        r.rows[0],
-        ctx,
+      const rawUpdated = r.rows[0];
+      return {
+        rawUpdated,
         cfg,
-        rbac.effectivePermissions.leads?.actions.unmask_phone
-      );
+        previousQualityStatus,
+        transformed: transformLeadForActor(
+          rawUpdated,
+          ctx,
+          cfg,
+          rbac.effectivePermissions.leads?.actions.unmask_phone
+        ),
+      };
     });
+
+    const updated = txResult.transformed;
+    const nextQuality = quality_status ? String(quality_status).trim() : null;
+    let capiDispatched = null;
+    if (nextQuality && nextQuality !== txResult.previousQualityStatus) {
+      const capiEvent = resolveCapiEventForQualityOrStage({
+        qualityStatus: nextQuality,
+        tenantSettings: txResult.cfg,
+      });
+      if (capiEvent) {
+        const raw = txResult.rawUpdated;
+        const capiRes = await dispatchStageCapiEventDetached({
+          tenantId: ctx.tenantId,
+          tenantSlug: ctx.tenantSlug,
+          eventName: capiEvent,
+          tenantSettings: txResult.cfg,
+          lead: {
+            leadId: raw.id,
+            name: raw.name,
+            phone: raw.phone,
+            email: raw.email,
+            metaLeadId: raw.meta_lead_id,
+            fbclid: raw.fbclid,
+            fbc: raw.fbc,
+            fbp: raw.fbp,
+            dealValue: Number(raw.total_revenue_vnd || 0) || undefined,
+            customFields: raw.custom_fields,
+          },
+          timelineAudit: {
+            actorId: ctx.userId,
+            actorRole: ctx.userRole,
+            stageName: nextQuality,
+          },
+        });
+        capiDispatched = {
+          event_name: capiRes.event_name,
+          event_id: capiRes.event_id,
+          status: capiRes.status,
+          http_status: capiRes.status,
+          status_label: capiRes.status_label,
+          fbtrace_id: capiRes.fbtrace_id,
+        };
+      }
+    }
 
     await emitDomainEvent('lead.updated', {
       tenantId: ctx.tenantId,
@@ -1487,7 +1557,7 @@ leadsRouter.patch('/:id', requirePermission('leads', 'edit'), async (req, res) =
       actorId: ctx.userId,
     });
 
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data: updated, capi_dispatched: capiDispatched });
   } catch (err: any) {
     const msg = String(err?.message || '');
     if (msg === 'FORBIDDEN_NOT_ASSIGNED') {
@@ -1791,11 +1861,15 @@ leadsRouter.patch('/:id/stage', requirePermission('leads', 'edit'), async (req, 
 
     // Auto-trigger Meta Conversions API completely outside any DB transaction / row lock
     let capiDispatched = null;
-    if (txState.targetStage.capi_event_mapping && txState.targetStage.capi_event_mapping !== 'Skip') {
+    const stageCapiEvent = resolveCapiEventForQualityOrStage({
+      stageCapiMapping: txState.targetStage.capi_event_mapping,
+      tenantSettings: txState.cfg,
+    });
+    if (stageCapiEvent) {
       const capiRes = await dispatchStageCapiEventDetached({
         tenantId: ctx.tenantId,
         tenantSlug: ctx.tenantSlug,
-        eventName: txState.targetStage.capi_event_mapping,
+        eventName: stageCapiEvent,
         tenantSettings: txState.cfg,
         lead: {
           leadId: txState.lead.id,
@@ -2186,7 +2260,9 @@ leadsRouter.post('/:id/timeline/notes', requirePermission('leads', 'edit'), asyn
     const leadId = req.params.id;
     const { category = 'note', note_type = 'CALL_CONNECTED', title, content, metadata = {} } = req.body || {};
 
-    if (!title && !content) {
+    const cleanTitle = String(title || '').trim();
+    const cleanContent = String(content || '').trim();
+    if (!cleanTitle && !cleanContent) {
       sendApiError(res, 422, 'EMPTY_NOTE', 'Vui lòng nhập tiêu đề hoặc nội dung ghi chú tương tác.');
       return;
     }

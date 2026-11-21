@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { APP_CONFIG } from '../config.ts';
+import { tenantRedis } from '../core/cache/tenant-redis.ts';
 import { hashPassword } from '../core/crypto/password.ts';
 import type { DbClient } from '../core/database/db-adapter.ts';
 import { encryptTenantSecret } from '../core/crypto/vault.ts';
@@ -1324,6 +1325,11 @@ export async function seedTenantWorkspace(
         ]
       );
     }
+  }
+
+  tenantRedis.invalidateDistributionSnapshot(tenantId);
+  if (seededLeadsCount > 0) {
+    tenantRedis.invalidateTenantMonthlyLeadCount(tenantId);
   }
 
   return {

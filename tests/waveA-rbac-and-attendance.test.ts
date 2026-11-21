@@ -81,7 +81,13 @@ describe('Wave A: Zero-Hardcode Role-Screen RBAC, Attendance Anti-Spoofing & Str
     tenantBId = regB.json.data.tenant.id;
     ownerBToken = regB.json.data.access_token;
 
-    // Switch Tenant A to domation_promax (with education_addon = false)
+    // Fund & Switch Tenant A and Tenant B to domation_promax (with education_addon = false)
+    await withTenantTransaction(tenantAId, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantAId]);
+    });
+    await withTenantTransaction(tenantBId, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantBId]);
+    });
     const swA = await apiRequest(harness.baseUrl, '/api/v1/billing/switch-package', {
       method: 'POST',
       token: ownerAToken,

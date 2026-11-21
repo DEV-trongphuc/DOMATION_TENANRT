@@ -1,6 +1,6 @@
-import type { DbClient } from '../core/database/db-adapter.ts';
+import { getDatabasePool, type DbClient } from '../core/database/db-adapter.ts';
 import { withTenantTransaction } from '../core/database/transaction.ts';
-import { tenantRedis } from '../core/cache/tenant-redis.ts';
+import { tenantRedis, type CachedGatekeeperConfig } from '../core/cache/tenant-redis.ts';
 import {
   flattenCustomFieldVars,
   renderTemplateString,
@@ -12,6 +12,9 @@ import {
   type TenantSettings,
 } from '../core/settings/tenant-settings.ts';
 import {
+  getGatekeeperPreflightCached,
+  getTenantBlacklistCached,
+  getTenantDistributionSnapshotCached,
   getTenantMetaCached,
   getTenantSettingsCached,
 } from '../core/settings/tenant-cache.ts';
@@ -19,8 +22,14 @@ import { validateAndNormalizePhone } from './phone.service.ts';
 import { dispatchStageCapiEventDetached } from './capi.service.ts';
 import { sendTenantEmailNotification, renderEmailHtmlEnvelope } from './zalo-mail.service.ts';
 import { enforceTenantOperationalPolicy } from './billing.service.ts';
-import { getTelegramConfig, sendTelegramNotification } from './telegram.service.ts';
+import { resolveTenantTelegramConfig, sendTelegramNotification } from './telegram.service.ts';
 import { isOutboundSilentMode } from '../core/security/outbound-guard.ts';
+import { emitDomainEventDetached } from '../core/events/event-bus.ts';
+import { resolveDecryptedSharedAiConfig } from './dom-meta-report.service.ts';
+import {
+  evaluateLeadGatekeeperWithGemini,
+  hasLeadAiScreenerTestFetcher,
+} from './ai-screener.service.ts';
 
 export interface CandidateConsultant {
   round_consultant_id: string;
@@ -370,6 +379,7 @@ export interface LeadIngestInput {
   campaign_id?: string;
   form_id?: string;
   connection_id?: string;
+  integration_type?: string;
   meta_lead_id?: string;
   fbclid?: string;
   fbc?: string;
@@ -523,14 +533,157 @@ export async function ingestAndDistributeLead(
   let postCommitSla: { deadlineMs: number; member: string } | null = null;
   let postCommitCapi: Parameters<typeof dispatchStageCapiEventDetached>[0] | null = null;
   let postCommitAssignedEmail: string | null = null;
+  let postCommitStageId: string | null = null;
+  let insertedNewLead = false;
+
+  interface AiScreenerOutcome {
+    status: string;
+    evaluation: string | null;
+    usedFallback: boolean;
+    holdDecision: 'hold' | 'reject' | null;
+    score: number;
+    promptTokens: number;
+    completionTokens: number;
+  }
+
+  let preflightGk: CachedGatekeeperConfig | null = null;
+  let localRuleHit: string | null = null;
+  let aiOutcome: AiScreenerOutcome = {
+    status: 'not_screened',
+    evaluation: null,
+    usedFallback: false,
+    holdDecision: null,
+    score: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+  };
+
+  const evaluateManualRulesMatch = (manualRulesRaw: unknown[]): string | null => {
+    const checkPayload: Record<string, unknown> = {
+      ...(input as unknown as Record<string, unknown>),
+      phone: normalizedPhone,
+      custom_fields: input.custom_fields || {},
+    };
+    for (const mr of manualRulesRaw) {
+      if (mr && typeof mr === 'object') {
+        const mrObj = mr as Record<string, unknown>;
+        const ruleConditions = Array.isArray(mrObj.conditions) ? mrObj.conditions : [mrObj];
+        if (matchesRoutingConditions(ruleConditions, checkPayload)) {
+          return String(mrObj.reason || mrObj.label || 'Không đạt tiêu chuẩn Gatekeeper');
+        }
+      }
+    }
+    return null;
+  };
+
+  if (!input.skip_gatekeeper) {
+    const preflight = await getGatekeeperPreflightCached(tenantId, resolveDecryptedSharedAiConfig);
+    preflightGk = preflight.gk;
+
+    if (preflightGk && preflightGk.is_enabled) {
+      const manualRules = Array.isArray(preflightGk.manual_rules) ? preflightGk.manual_rules : [];
+      localRuleHit = evaluateManualRulesMatch(manualRules);
+
+      if (preflight.sharedAi) {
+        if (!preflight.sharedAi.aiLeadEvalEnabled) {
+          aiOutcome = {
+            status: 'not_screened',
+            evaluation: 'AI Lead Eval đang tắt (fallback thủ công)',
+            usedFallback: true,
+            holdDecision: null,
+            score: 0,
+            promptTokens: 0,
+            completionTokens: 0,
+          };
+        } else if (!localRuleHit) {
+          if (!preflight.sharedAi.apiKey) {
+            aiOutcome = {
+              status: 'not_screened',
+              evaluation: 'Chưa cấu hình Gemini API Key (fallback thủ công)',
+              usedFallback: true,
+              holdDecision: null,
+              score: 0,
+              promptTokens: 0,
+              completionTokens: 0,
+            };
+          } else if (isOutboundSilentMode() && !hasLeadAiScreenerTestFetcher()) {
+            aiOutcome = {
+              status: 'not_screened',
+              evaluation: 'Silent mode (fallback thủ công)',
+              usedFallback: true,
+              holdDecision: null,
+              score: 0,
+              promptTokens: 0,
+              completionTokens: 0,
+            };
+          } else {
+            // Execute fast Gemini JSON evaluation strictly OUTSIDE any DB lock/transaction
+            const aiRes = await evaluateLeadGatekeeperWithGemini({
+              apiKey: preflight.sharedAi.apiKey,
+              model: preflight.sharedAi.model || preflightGk.model_name,
+              promptRules: preflightGk.prompt_rules,
+              lead: {
+                name: input.name,
+                phone: normalizedPhone,
+                email: input.email,
+                source: input.source,
+                campaign: input.campaign,
+                product_interest: input.product_interest,
+                budget_range: input.budget_range,
+                note: input.note,
+                custom_fields: input.custom_fields || {},
+              },
+              timeoutMs: 2_500,
+            });
+
+            if (aiRes.ok) {
+              if (aiRes.decision === 'hold' || aiRes.decision === 'reject') {
+                aiOutcome = {
+                  status: 'failed',
+                  evaluation: aiRes.reason,
+                  usedFallback: false,
+                  holdDecision: aiRes.decision,
+                  score: aiRes.score,
+                  promptTokens: aiRes.promptTokens,
+                  completionTokens: aiRes.completionTokens,
+                };
+              } else {
+                aiOutcome = {
+                  status: 'passed',
+                  evaluation: aiRes.reason,
+                  usedFallback: false,
+                  holdDecision: null,
+                  score: aiRes.score,
+                  promptTokens: aiRes.promptTokens,
+                  completionTokens: aiRes.completionTokens,
+                };
+              }
+            } else {
+              aiOutcome = {
+                status: 'fallback_manual',
+                evaluation: aiRes.reason,
+                usedFallback: true,
+                holdDecision: null,
+                score: 0,
+                promptTokens: 0,
+                completionTokens: 0,
+              };
+            }
+          }
+        }
+      }
+    }
+  }
 
   const outcome = await tenantRedis.withLock(tenantId, `phone:${normalizedPhone}`, 3000, async () => {
     return withTenantTransaction(tenantId, async (client) => {
-      // Kernel-level transactional advisory lock prevents duplicate race conditions
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))", [
-        tenantId,
-        normalizedPhone,
-      ]);
+      // Kernel-level transactional advisory lock prevents duplicate race conditions (skipped on embedded single-process PGlite where tenantRedis.withLock + checkoutChain already serialize)
+      if (!getDatabasePool().isEmbedded) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))", [
+          tenantId,
+          normalizedPhone,
+        ]);
+      }
 
       const tenantMeta = preloadedTenant || (await getTenantMetaCached(tenantId, client));
       if (!tenantMeta) {
@@ -547,35 +700,60 @@ export async function ingestAndDistributeLead(
       // Step A: Blacklist Check (`blacklist_entries` — phone, email, keyword, ip)
       if (!input.skip_blacklist) {
         const cleanEmail = input.email?.trim().toLowerCase() || '';
-        const blRes = await client.query<{ id: string; entry_type: string; value: string; reason: string | null }>(
-          `SELECT id, entry_type, value, reason
-           FROM blacklist_entries
-           WHERE tenant_id = $1
-             AND (
-               entry_type IN ('keyword', 'ip')
-               OR (entry_type = 'phone' AND value = $2)
-               OR (entry_type = 'email' AND $3 != '' AND LOWER(value) = $3)
-             )`,
-          [tenantId, normalizedPhone, cleanEmail]
-        );
-        const haystack = [
-          input.name,
-          normalizedPhone,
-          input.email,
-          input.source,
-          input.campaign,
-          input.note,
-          input.product_interest,
-          input.custom_fields ? JSON.stringify(input.custom_fields) : '',
-        ]
-          .filter(Boolean)
-          .join(' ')
-          .toLowerCase();
-        const matchedBl = blRes.rows.find((row) => {
-          if (row.entry_type === 'phone' || row.entry_type === 'email') return true;
-          const kw = String(row.value || '').trim().toLowerCase();
-          return kw.length > 0 && haystack.includes(kw);
-        });
+        const blSnapshot = await getTenantBlacklistCached(tenantId, client);
+        let matchedBl: { id: string; entry_type: string; value: string; reason: string | null } | undefined;
+
+        if (blSnapshot.overflow) {
+          const blRes = await client.query<{ id: string; entry_type: string; value: string; reason: string | null }>(
+            `SELECT id, entry_type, value, reason
+             FROM blacklist_entries
+             WHERE tenant_id = $1
+               AND (
+                 entry_type IN ('keyword', 'ip')
+                 OR (entry_type = 'phone' AND value = $2)
+                 OR (entry_type = 'email' AND $3 != '' AND LOWER(value) = $3)
+               )`,
+            [tenantId, normalizedPhone, cleanEmail]
+          );
+          const haystack = [
+            input.name,
+            normalizedPhone,
+            input.email,
+            input.source,
+            input.campaign,
+            input.note,
+            input.product_interest,
+            input.custom_fields ? JSON.stringify(input.custom_fields) : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+          matchedBl = blRes.rows.find((row) => {
+            if (row.entry_type === 'phone' || row.entry_type === 'email') return true;
+            const kw = String(row.value || '').trim().toLowerCase();
+            return kw.length > 0 && haystack.includes(kw);
+          });
+        } else {
+          matchedBl =
+            blSnapshot.phoneMap.get(normalizedPhone) ||
+            (cleanEmail ? blSnapshot.emailMap.get(cleanEmail) : undefined);
+          if (!matchedBl && blSnapshot.keywordsAndIps.length > 0) {
+            const haystack = [
+              input.name,
+              normalizedPhone,
+              input.email,
+              input.source,
+              input.campaign,
+              input.note,
+              input.product_interest,
+              input.custom_fields ? JSON.stringify(input.custom_fields) : '',
+            ]
+              .filter(Boolean)
+              .join(' ')
+              .toLowerCase();
+            matchedBl = blSnapshot.keywordsAndIps.find((item) => haystack.includes(item.needle))?.entry;
+          }
+        }
         if (matchedBl) {
           const heldRes = await client.query<{ id: string }>(
             `INSERT INTO held_leads (
@@ -613,105 +791,82 @@ export async function ingestAndDistributeLead(
       }
 
       // Step B: AI Gatekeeper Check (`ai_screener_configs` when enabled)
-      if (!input.skip_gatekeeper) {
-        const gkRes = await client.query<{
-          is_enabled: boolean;
-          mode: string;
-          manual_action: string;
-          manual_rules: any[];
-          prompt_rules: string | null;
-        }>(
-          `SELECT is_enabled, mode, manual_action, manual_rules, prompt_rules
-           FROM ai_screener_configs
-           WHERE tenant_id = $1 AND is_enabled = true
-           LIMIT 1`,
-          [tenantId]
-        );
-        const gk = gkRes.rows[0];
-        if (gk && gk.is_enabled) {
-          let failedReason: string | null = null;
-          const manualRules = Array.isArray(gk.manual_rules) ? gk.manual_rules : [];
-          const checkPayload: Record<string, unknown> = {
-            ...(input as unknown as Record<string, unknown>),
-            phone: normalizedPhone,
-            custom_fields: input.custom_fields || {},
+      if (!input.skip_gatekeeper && preflightGk && preflightGk.is_enabled) {
+        const gk = preflightGk;
+        const manualRules = Array.isArray(gk.manual_rules) ? gk.manual_rules : [];
+        let failedReason: string | null = localRuleHit ?? evaluateManualRulesMatch(manualRules);
+        let holdTargetStatus: 'held' | 'rejected' = gk.manual_action === 'reject' ? 'rejected' : 'held';
+        let holdDispatchReason = gk.manual_action === 'reject' ? 'ai_gatekeeper_rejected' : 'ai_gatekeeper_held';
+
+        if (!failedReason && aiOutcome.holdDecision) {
+          failedReason = aiOutcome.evaluation || 'AI Gatekeeper đánh giá Lead không đạt tiêu chuẩn';
+          holdTargetStatus =
+            aiOutcome.holdDecision === 'reject' || gk.manual_action === 'reject' ? 'rejected' : 'held';
+          holdDispatchReason =
+            holdTargetStatus === 'rejected' ? 'ai_gatekeeper_rejected' : 'ai_gatekeeper_held';
+        }
+
+        if (failedReason && (gk.manual_action === 'hold' || gk.manual_action === 'reject' || aiOutcome.holdDecision)) {
+          const heldRes = await client.query<{ id: string }>(
+            `INSERT INTO held_leads (
+               tenant_id, connection_id, name, phone, email, source, campaign,
+               ai_screener_status, ai_evaluation, hold_reason, status, payload_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'failed', $8, $9, $10, $11::jsonb)
+             RETURNING id`,
+            [
+              tenantId,
+              input.connection_id || null,
+              (input.name || '').trim() || `Khách hàng ${normalizedPhone.slice(-4)}`,
+              normalizedPhone,
+              input.email?.trim() || null,
+              input.source?.trim() || cfg.default_lead_source,
+              input.campaign?.trim() || null,
+              failedReason,
+              failedReason,
+              holdTargetStatus,
+              JSON.stringify({
+                ...input,
+                ai_score: aiOutcome.score,
+                ai_prompt_tokens: aiOutcome.promptTokens,
+                ai_completion_tokens: aiOutcome.completionTokens,
+              }),
+            ]
+          );
+          return {
+            leadId: heldRes.rows[0].id,
+            phoneNormalized: normalizedPhone,
+            status: 'unassigned_pending' as const,
+            assignedTo: null,
+            assignedName: null,
+            roundId: null,
+            isDuplicateReminder: false,
+            dispatchReason: holdDispatchReason,
+            distributionLatencyMs: Math.max(1, Date.now() - startedAt),
+            held: true,
+            heldReason: failedReason,
           };
-          for (const mr of manualRules) {
-            if (mr && typeof mr === 'object') {
-              const ruleConditions = Array.isArray(mr.conditions) ? mr.conditions : [mr];
-              if (matchesRoutingConditions(ruleConditions, checkPayload)) {
-                failedReason = String(mr.reason || mr.label || 'Không đạt tiêu chuẩn Gatekeeper');
-                break;
-              }
-            }
-          }
-          if (failedReason && (gk.manual_action === 'hold' || gk.manual_action === 'reject')) {
-            const targetStatus = gk.manual_action === 'reject' ? 'rejected' : 'held';
-            const heldRes = await client.query<{ id: string }>(
-              `INSERT INTO held_leads (
-                 tenant_id, connection_id, name, phone, email, source, campaign,
-                 ai_screener_status, ai_evaluation, hold_reason, status, payload_json
-               ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'failed', $8, $9, $10, $11::jsonb)
-               RETURNING id`,
-              [
-                tenantId,
-                input.connection_id || null,
-                (input.name || '').trim() || `Khách hàng ${normalizedPhone.slice(-4)}`,
-                normalizedPhone,
-                input.email?.trim() || null,
-                input.source?.trim() || cfg.default_lead_source,
-                input.campaign?.trim() || null,
-                failedReason,
-                failedReason,
-                targetStatus,
-                JSON.stringify(input),
-              ]
-            );
-            return {
-              leadId: heldRes.rows[0].id,
-              phoneNormalized: normalizedPhone,
-              status: 'unassigned_pending' as const,
-              assignedTo: null,
-              assignedName: null,
-              roundId: null,
-              isDuplicateReminder: false,
-              dispatchReason: gk.manual_action === 'reject' ? 'ai_gatekeeper_rejected' : 'ai_gatekeeper_held',
-              distributionLatencyMs: Math.max(1, Date.now() - startedAt),
-              held: true,
-              heldReason: failedReason,
-            };
-          }
         }
       }
 
       // Resolve target pipeline (allowing cross-pipeline routing rules when pipeline_id is not explicitly forced)
+      const distSnapshot = await getTenantDistributionSnapshotCached(tenantId, client);
       const explicitPipelineProvided = Boolean(input.pipeline_id);
       let pipelineId = input.pipeline_id;
       let preMatchedRoundId: string | null = null;
       let injectedRuleFields: Record<string, unknown> = {};
+      let checkedAllRulesWithNoneActive = false;
 
       if (!explicitPipelineProvided && !input.force_assigned_to) {
-        const crossRulesRes = await client.query<{
-          round_id: string;
-          pipeline_id: string;
-          conditions_json: any;
-          condition_branches: any;
-          connection_scopes: any;
-          inject_fields: Record<string, unknown> | null;
-        }>(
-          `SELECT r.round_id, dr.pipeline_id, r.conditions_json, r.condition_branches, r.connection_scopes, r.inject_fields
-           FROM routing_rules r
-           INNER JOIN distribution_rounds dr ON dr.tenant_id = r.tenant_id AND dr.id = r.round_id
-           WHERE r.tenant_id = $1 AND r.is_active = true AND dr.is_active = true
-           ORDER BY r.priority ASC`,
-          [tenantId]
-        );
+        const crossRules = distSnapshot ? distSnapshot.activeRoutingRules : [];
+        if (crossRules.length === 0) {
+          checkedAllRulesWithNoneActive = true;
+        }
         const preMatchPayload: Record<string, unknown> = {
           ...(input as unknown as Record<string, unknown>),
           phone: normalizedPhone,
           custom_fields: input.custom_fields || {},
         };
-        for (const rule of crossRulesRes.rows) {
+        for (const rule of crossRules) {
           if (
             matchesRoutingBranches(
               rule.condition_branches,
@@ -733,51 +888,21 @@ export async function ingestAndDistributeLead(
       }
 
       if (!pipelineId) {
-        const pipeRes = await client.query<{ id: string }>(
-          'SELECT id FROM tenant_pipelines WHERE tenant_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1',
-          [tenantId]
-        );
-        pipelineId = pipeRes.rows[0]?.id;
+        pipelineId = distSnapshot?.defaultPipelineId;
       }
       if (!pipelineId) {
         throw new Error('PIPELINE_NOT_CONFIGURED');
       }
 
-      const firstStageRes = await client.query<{
-        id: string;
-        stage_name: string;
-        sla_timeout_minutes: number;
-        capi_event_mapping: string;
-        is_won_stage: boolean;
-        is_lost_stage: boolean;
-      }>(
-        `SELECT id, stage_name, sla_timeout_minutes, capi_event_mapping, is_won_stage, is_lost_stage
-         FROM tenant_pipeline_stages
-         WHERE tenant_id = $1 AND pipeline_id = $2
-         ORDER BY stage_order ASC LIMIT 1`,
-        [tenantId, pipelineId]
-      );
-      const firstStage = firstStageRes.rows[0];
+      const firstStage = distSnapshot?.firstStagesByPipeline[pipelineId];
       if (!firstStage) {
         throw new Error('PIPELINE_STAGES_EMPTY');
       }
 
       // Validate & sanitize custom fields on pipeline
-      const customFieldDefs = await client.query<{
-        field_key: string;
-        field_label: string;
-        field_type: string;
-        is_required: boolean;
-        options_json: string[];
-        config_json: Record<string, unknown>;
-      }>(
-        `SELECT field_key, field_label, field_type, is_required, options_json, config_json
-         FROM tenant_pipeline_custom_fields
-         WHERE tenant_id = $1 AND pipeline_id = $2`,
-        [tenantId, pipelineId]
-      );
+      const customFieldDefsRows = distSnapshot?.customFieldsByPipeline[pipelineId] || [];
       const customFieldsObj = {
-        ...validateAndSanitizeCustomFields(customFieldDefs.rows, input.custom_fields),
+        ...validateAndSanitizeCustomFields(customFieldDefsRows, input.custom_fields),
         ...injectedRuleFields,
       };
 
@@ -908,20 +1033,9 @@ export async function ingestAndDistributeLead(
       let resolvedRoundId: string | null = preMatchedRoundId;
       if (!assignedTo) {
         let targetRoundId: string | null = preMatchedRoundId;
-        if (!targetRoundId) {
-          const rulesRes = await client.query<{
-            round_id: string;
-            conditions_json: any;
-            condition_branches: any;
-            connection_scopes: any;
-            inject_fields: Record<string, unknown> | null;
-          }>(
-            `SELECT r.round_id, r.conditions_json, r.condition_branches, r.connection_scopes, r.inject_fields
-             FROM routing_rules r
-             INNER JOIN distribution_rounds dr ON dr.tenant_id = r.tenant_id AND dr.id = r.round_id
-             WHERE r.tenant_id = $1 AND dr.pipeline_id = $2 AND r.is_active = true AND dr.is_active = true
-             ORDER BY r.priority ASC`,
-            [tenantId, pipelineId]
+        if (!targetRoundId && !checkedAllRulesWithNoneActive) {
+          const pipelineRules = (distSnapshot?.activeRoutingRules || []).filter(
+            (r) => r.pipeline_id === pipelineId
           );
 
           const matchPayload: Record<string, unknown> = {
@@ -930,7 +1044,7 @@ export async function ingestAndDistributeLead(
             custom_fields: customFieldsObj,
           };
 
-          for (const rule of rulesRes.rows) {
+          for (const rule of pipelineRules) {
             if (
               matchesRoutingBranches(
                 rule.condition_branches,
@@ -950,15 +1064,15 @@ export async function ingestAndDistributeLead(
           }
         }
 
+        if (!targetRoundId && aiOutcome.usedFallback && preflightGk?.fallback_enabled && preflightGk.fallback_round_id) {
+          if (distSnapshot?.activeRoundIds.includes(preflightGk.fallback_round_id)) {
+            targetRoundId = preflightGk.fallback_round_id;
+            dispatchReason = 'ai_gatekeeper_fallback_round';
+          }
+        }
+
         if (!targetRoundId) {
-          const roundRes = await client.query<{ id: string }>(
-            `SELECT id FROM distribution_rounds
-             WHERE tenant_id = $1 AND pipeline_id = $2 AND is_active = true
-             ORDER BY priority ASC, created_at ASC
-             LIMIT 1`,
-            [tenantId, pipelineId]
-          );
-          targetRoundId = roundRes.rows[0]?.id || null;
+          targetRoundId = distSnapshot?.defaultActiveRoundByPipeline[pipelineId] || null;
         }
         resolvedRoundId = targetRoundId;
 
@@ -1125,57 +1239,7 @@ export async function ingestAndDistributeLead(
         );
       }
 
-      const insertRes = await client.query<{ id: string }>(
-        `INSERT INTO leads (
-          tenant_id, pipeline_id, stage_id, assigned_to, round_id, connection_id, status,
-          name, phone, email, source, campaign, product_interest, budget_range,
-          utm_source, utm_medium, utm_content, ad_id, adset_id, campaign_id, form_id,
-          meta_lead_id, fbclid, fbc, fbp, custom_fields, is_accepted, accepted_at,
-          is_duplicate_reminder, is_duplicated
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7,
-          $8, $9, $10, $11, $12, $13, $14,
-          $15, $16, $17, $18, $19, $20, $21,
-          $22, $23, $24, $25, $26::jsonb, $27, $28,
-          $29, $30
-        ) RETURNING id`,
-        [
-          tenantId,
-          pipelineId,
-          firstStage.id,
-          assignedTo,
-          resolvedRoundId,
-          input.connection_id || null,
-          leadStatus,
-          leadName,
-          normalizedPhone,
-          input.email?.trim() || null,
-          leadSource,
-          input.campaign?.trim() || null,
-          input.product_interest?.trim() || null,
-          input.budget_range?.trim() || null,
-          input.utm_source?.trim() || null,
-          input.utm_medium?.trim() || null,
-          input.utm_content?.trim() || null,
-          input.ad_id?.trim() || null,
-          input.adset_id?.trim() || null,
-          input.campaign_id?.trim() || null,
-          input.form_id?.trim() || null,
-          input.meta_lead_id?.trim() || null,
-          input.fbclid?.trim() || null,
-          input.fbc?.trim() || null,
-          input.fbp?.trim() || null,
-          JSON.stringify(customFieldsObj),
-          autoAccept,
-          autoAccept ? new Date().toISOString() : null,
-          isDuplicateReminder,
-          isDuplicateReminder,
-        ]
-      );
-      const leadId = insertRes.rows[0].id;
       const latencyMs = Math.max(1, Date.now() - startedAt);
-
-      // Append immutable event-sourced timeline record
       const timelineTitle =
         isDuplicateReminder && duplicateAction !== 'round_robin'
           ? `DUPLICATE_REMINDER: Khách cũ tương tác lại — định tuyến thẳng về ${assignedName || 'Sale cũ'}`
@@ -1184,26 +1248,132 @@ export async function ingestAndDistributeLead(
             : cfg.distribution_mode === 'manual_only'
               ? 'MANUAL_QUEUE: Chế độ chia số thủ công — chờ Quản lý phân bổ'
               : 'UNASSIGNED_PENDING: Toàn bộ Sale đang bận/nghỉ — xếp hàng chờ ưu tiên';
+      const timelineEventType = isDuplicateReminder ? 'duplicate_reminder' : 'lead_distributed';
+      const timelineActorName = assignedName || 'AutoData Engine';
+      const timelineContent =
+        input.note || `Nguồn: ${leadSource}${input.campaign ? ` • Chiến dịch: ${input.campaign}` : ''}`;
+      const timelineMetadataJson = JSON.stringify({
+        dispatch_reason: dispatchReason,
+        latency_ms: latencyMs,
+        is_duplicate_reminder: isDuplicateReminder,
+      });
 
-      await client.query(
-        `INSERT INTO lead_timeline_events (
-          tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-        ) VALUES ($1, $2, $3, 'system', $4, 'tenant_admin', $5, $6, $7, $8::jsonb)`,
-        [
-          tenantId,
-          leadId,
-          isDuplicateReminder ? 'duplicate_reminder' : 'lead_distributed',
-          assignedTo,
-          assignedName || 'AutoData Engine',
-          timelineTitle,
-          input.note || `Nguồn: ${leadSource}${input.campaign ? ` • Chiến dịch: ${input.campaign}` : ''}`,
-          JSON.stringify({
-            dispatch_reason: dispatchReason,
-            latency_ms: latencyMs,
-            is_duplicate_reminder: isDuplicateReminder,
-          }),
-        ]
-      );
+      const leadInsertParams = [
+        tenantId,
+        pipelineId,
+        firstStage.id,
+        assignedTo,
+        resolvedRoundId,
+        input.connection_id || null,
+        leadStatus,
+        leadName,
+        normalizedPhone,
+        input.email?.trim() || null,
+        aiOutcome.score > 0 ? aiOutcome.score : 0,
+        leadSource,
+        input.campaign?.trim() || null,
+        input.product_interest?.trim() || null,
+        input.budget_range?.trim() || null,
+        input.utm_source?.trim() || null,
+        input.utm_medium?.trim() || null,
+        input.utm_content?.trim() || null,
+        input.ad_id?.trim() || null,
+        input.adset_id?.trim() || null,
+        input.campaign_id?.trim() || null,
+        input.form_id?.trim() || null,
+        input.meta_lead_id?.trim() || null,
+        input.fbclid?.trim() || null,
+        input.fbc?.trim() || null,
+        input.fbp?.trim() || null,
+        JSON.stringify(customFieldsObj),
+        autoAccept,
+        autoAccept ? new Date().toISOString() : null,
+        isDuplicateReminder,
+        isDuplicateReminder,
+        aiOutcome.status,
+        aiOutcome.evaluation,
+        aiOutcome.promptTokens,
+        aiOutcome.completionTokens,
+      ];
+
+      let leadId: string;
+      if (client.dialect === 'postgres') {
+        const cteRes = await client.query<{ id: string }>(
+          `WITH inserted_lead AS (
+             INSERT INTO leads (
+               tenant_id, pipeline_id, stage_id, assigned_to, round_id, connection_id, status,
+               name, phone, email, lead_score, source, campaign, product_interest, budget_range,
+               utm_source, utm_medium, utm_content, ad_id, adset_id, campaign_id, form_id,
+               meta_lead_id, fbclid, fbc, fbp, custom_fields, is_accepted, accepted_at,
+               is_duplicate_reminder, is_duplicated,
+               ai_screener_status, ai_evaluation, ai_prompt_tokens, ai_completion_tokens
+             ) VALUES (
+               $1, $2, $3, $4, $5, $6, $7,
+               $8, $9, $10, $11, $12, $13, $14, $15,
+               $16, $17, $18, $19, $20, $21, $22,
+               $23, $24, $25, $26, $27::jsonb, $28, $29,
+               $30, $31,
+               $32, $33, $34, $35
+             ) RETURNING id
+           ), inserted_timeline AS (
+             INSERT INTO lead_timeline_events (
+               tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+             )
+             SELECT
+               $1, id, $36, 'system', $37, 'tenant_admin', $38, $39, $40, $41::jsonb
+             FROM inserted_lead
+           )
+           SELECT id FROM inserted_lead`,
+          [
+            ...leadInsertParams,
+            timelineEventType,
+            assignedTo,
+            timelineActorName,
+            timelineTitle,
+            timelineContent,
+            timelineMetadataJson,
+          ]
+        );
+        leadId = cteRes.rows[0].id;
+      } else {
+        const insertRes = await client.query<{ id: string }>(
+          `INSERT INTO leads (
+            tenant_id, pipeline_id, stage_id, assigned_to, round_id, connection_id, status,
+            name, phone, email, lead_score, source, campaign, product_interest, budget_range,
+            utm_source, utm_medium, utm_content, ad_id, adset_id, campaign_id, form_id,
+            meta_lead_id, fbclid, fbc, fbp, custom_fields, is_accepted, accepted_at,
+            is_duplicate_reminder, is_duplicated,
+            ai_screener_status, ai_evaluation, ai_prompt_tokens, ai_completion_tokens
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12, $13, $14, $15,
+            $16, $17, $18, $19, $20, $21, $22,
+            $23, $24, $25, $26, $27::jsonb, $28, $29,
+            $30, $31,
+            $32, $33, $34, $35
+          ) RETURNING id`,
+          leadInsertParams
+        );
+        leadId = insertRes.rows[0].id;
+
+        // Append immutable event-sourced timeline record
+        await client.query(
+          `INSERT INTO lead_timeline_events (
+            tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+          ) VALUES ($1, $2, $3, 'system', $4, 'tenant_admin', $5, $6, $7, $8::jsonb)`,
+          [
+            tenantId,
+            leadId,
+            timelineEventType,
+            assignedTo,
+            timelineActorName,
+            timelineTitle,
+            timelineContent,
+            timelineMetadataJson,
+          ]
+        );
+      }
+      insertedNewLead = true;
 
       // Prepare Stage SLA timeout & Meta CAPI signal to execute AFTER transaction commit
       const rawStageSla = Number(firstStage.sla_timeout_minutes || 0);
@@ -1242,6 +1412,7 @@ export async function ingestAndDistributeLead(
       }
 
       postCommitAssignedEmail = assignedEmail;
+      postCommitStageId = firstStage?.id ? String(firstStage.id) : null;
 
       return {
         leadId,
@@ -1257,6 +1428,10 @@ export async function ingestAndDistributeLead(
     });
   });
 
+  if (insertedNewLead) {
+    tenantRedis.incrementTenantMonthlyLeadCount(tenantId, 1);
+  }
+
   if (postCommitSla) {
     const slaItem = postCommitSla as { deadlineMs: number; member: string };
     await tenantRedis.zadd('sla_queue', slaItem.deadlineMs, slaItem.member, tenantId);
@@ -1264,6 +1439,59 @@ export async function ingestAndDistributeLead(
 
   if (postCommitCapi) {
     await dispatchStageCapiEventDetached(postCommitCapi);
+  }
+
+  // Non-blocking domain events into Flow Engine & Dynamic Audiences (strictly post-commit, never blocks ingestion)
+  const leadSourceForEvent = input.source?.trim() || preCfg.default_lead_source;
+  if (!outcome.held && outcome.leadId) {
+    const srcLower = String(leadSourceForEvent || '').toLowerCase();
+    const inferredIntegrationType =
+      input.integration_type?.trim().toLowerCase() ||
+      (input.meta_lead_id || /meta|facebook|fb_lead|lead_ads/.test(srcLower)
+        ? 'meta_lead_ads'
+        : /sheet|google_sheet|gsheet/.test(srcLower)
+          ? 'google_sheets'
+          : /ladipage|landing/.test(srcLower)
+            ? 'ladipage'
+            : /form|website|web/.test(srcLower)
+              ? 'form'
+              : input.connection_id || /webhook|api|zapier|make/.test(srcLower)
+                ? 'webhook'
+                : 'manual');
+
+    if (insertedNewLead) {
+      emitDomainEventDetached('lead.created', {
+        tenantId,
+        leadId: outcome.leadId,
+        status: outcome.status,
+        source: leadSourceForEvent,
+      });
+    }
+
+    if (outcome.assignedTo) {
+      emitDomainEventDetached('marketing.engaged', {
+        tenantId,
+        leadId: outcome.leadId,
+        engagementType: 'lead.assigned',
+        scoreDelta: 0,
+        metadata: {
+          event: 'lead.assigned',
+          isNewLead: insertedNewLead,
+          assignmentType: insertedNewLead ? 'initial' : 'reassigned',
+          source: leadSourceForEvent,
+          campaign: input.campaign || null,
+          utm_source: input.utm_source || null,
+          utm_medium: input.utm_medium || null,
+          utm_content: input.utm_content || null,
+          integration_type: inferredIntegrationType,
+          assigned_to: outcome.assignedTo,
+          assigned_name: outcome.assignedName || null,
+          round_id: outcome.roundId || null,
+          stage_id: postCommitStageId,
+          dispatch_reason: outcome.dispatchReason,
+        },
+      });
+    }
   }
 
   // Non-blocking assignment email notification (skipped automatically in silent/test mode)
@@ -1327,7 +1555,7 @@ export async function ingestAndDistributeLead(
 
   // Non-blocking notification dispatch (V-06): Detach Telegram notification so external HTTP latency / timeout
   // never blocks lead ingestion, event loops, or webhook responses.
-  const tgCfg = getTelegramConfig();
+  const { config: tgCfg } = await resolveTenantTelegramConfig(tenantId);
   if (!tgCfg.silentMode && tgCfg.enabled) {
     const renderedBotMsg = renderTemplateString(
       preCfg.notification_templates.assign_bot_message,
@@ -1347,7 +1575,7 @@ export async function ingestAndDistributeLead(
         .filter(Boolean)
         .join('\n');
 
-    void sendTelegramNotification(tenantId, text, { parseMode: 'HTML' }).catch((teleErr: any) => {
+    void sendTelegramNotification(tenantId, text, { parseMode: 'HTML', resolvedConfig: tgCfg }).catch((teleErr: any) => {
       console.warn(
         `[DistributionService] Detached Telegram notification failed for tenant ${tenantId}, lead ${outcome.leadId}:`,
         teleErr?.message || teleErr
@@ -1356,6 +1584,74 @@ export async function ingestAndDistributeLead(
   }
 
   return outcome;
+}
+
+async function insertBulkLeadTimelineEvents(
+  client: DbClient,
+  params: {
+    tenantId: string;
+    leadIds: string[];
+    eventType: string;
+    eventCategory: string;
+    actorId: string | null;
+    actorRole: string;
+    actorName: string;
+    title: string;
+    content: string;
+    metadataJson: string;
+  }
+): Promise<void> {
+  if (params.leadIds.length === 0) return;
+
+  if (client.dialect === 'postgres') {
+    await client.query(
+      `INSERT INTO lead_timeline_events (
+        tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+      )
+      SELECT $1, unnest($2::uuid[]), $3, $4, $5, $6, $7, $8, $9, $10::jsonb`,
+      [
+        params.tenantId,
+        params.leadIds,
+        params.eventType,
+        params.eventCategory,
+        params.actorId,
+        params.actorRole,
+        params.actorName,
+        params.title,
+        params.content,
+        params.metadataJson,
+      ]
+    );
+    return;
+  }
+
+  const CHUNK_SIZE = 200;
+  for (let offset = 0; offset < params.leadIds.length; offset += CHUNK_SIZE) {
+    const chunk = params.leadIds.slice(offset, offset + CHUNK_SIZE);
+    const valuesClauses: string[] = [];
+    const valuesParams: unknown[] = [
+      params.tenantId,
+      params.eventType,
+      params.eventCategory,
+      params.actorId,
+      params.actorRole,
+      params.actorName,
+      params.title,
+      params.content,
+      params.metadataJson,
+    ];
+    for (const leadId of chunk) {
+      const paramIdx = valuesParams.length + 1;
+      valuesParams.push(leadId);
+      valuesClauses.push(`($1, $${paramIdx}, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`);
+    }
+    await client.query(
+      `INSERT INTO lead_timeline_events (
+        tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
+      ) VALUES ${valuesClauses.join(', ')}`,
+      valuesParams
+    );
+  }
 }
 
 /**
@@ -1415,20 +1711,18 @@ export async function drainUnassignedLeads(
       }
     }
 
-    await client.query(
-      `INSERT INTO lead_timeline_events (
-        tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-      )
-      SELECT $1, unnest($2::uuid[]), 'queue_drained', 'system', $3, 'sale', $4, $5, $6, '{}'::jsonb`,
-      [
-        tenantId,
-        ids,
-        targetUserId,
-        targetUserName,
-        `QUEUE_DRAIN: Giao tự động cho ${targetUserName} ngay khi bật trạng thái Trực tuyến`,
-        'Lead chờ ngoài giờ đã được phân bổ tự động.',
-      ]
-    );
+    await insertBulkLeadTimelineEvents(client, {
+      tenantId,
+      leadIds: ids,
+      eventType: 'queue_drained',
+      eventCategory: 'system',
+      actorId: targetUserId,
+      actorRole: 'sale',
+      actorName: targetUserName,
+      title: `QUEUE_DRAIN: Giao tự động cho ${targetUserName} ngay khi bật trạng thái Trực tuyến`,
+      content: 'Lead chờ ngoài giờ đã được phân bổ tự động.',
+      metadataJson: '{}',
+    });
 
     return ids.length;
   });
@@ -1448,7 +1742,9 @@ export async function drainUnassignedLeadsFairShare(
   const cfg = await getTenantSettingsCached(tenantId);
   if (!cfg.auto_drain_on_online) return 0;
 
-  return withTenantTransaction(tenantId, async (client) => {
+  const drainedAssignments: Array<{ leadId: string; assignedTo: string; assignedName: string }> = [];
+
+  const drainedCount = await withTenantTransaction(tenantId, async (client) => {
     const allowedStatuses = cfg.drain_recalled_leads
       ? ['unassigned_pending', 'recalled']
       : ['unassigned_pending'];
@@ -1499,20 +1795,21 @@ export async function drainUnassignedLeadsFairShare(
         [sale.id, tenantId, leadIds]
       );
 
-      await client.query(
-        `INSERT INTO lead_timeline_events (
-          tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-        )
-        SELECT $1, unnest($2::uuid[]), 'queue_drained', 'system', $3, 'sale', $4, $5, $6, '{}'::jsonb`,
-        [
-          tenantId,
-          leadIds,
-          sale.id,
-          sale.full_name,
-          `QUEUE_DRAIN: Giao tự động vòng tròn (Fair-Share Round-Robin) cho ${sale.full_name}`,
-          'Lead chờ trong hàng đợi đã được phân bổ công bằng.',
-        ]
-      );
+      await insertBulkLeadTimelineEvents(client, {
+        tenantId,
+        leadIds,
+        eventType: 'queue_drained',
+        eventCategory: 'system',
+        actorId: sale.id,
+        actorRole: 'sale',
+        actorName: sale.full_name,
+        title: `QUEUE_DRAIN: Giao tự động vòng tròn (Fair-Share Round-Robin) cho ${sale.full_name}`,
+        content: 'Lead chờ trong hàng đợi đã được phân bổ công bằng.',
+        metadataJson: '{}',
+      });
+      for (const lid of leadIds) {
+        drainedAssignments.push({ leadId: lid, assignedTo: sale.id, assignedName: sale.full_name });
+      }
     }
 
     // Schedule SLA timers
@@ -1540,6 +1837,24 @@ export async function drainUnassignedLeadsFairShare(
 
     return pending.rows.length;
   });
+
+  for (const item of drainedAssignments) {
+    emitDomainEventDetached('marketing.engaged', {
+      tenantId,
+      leadId: item.leadId,
+      engagementType: 'lead.assigned',
+      scoreDelta: 0,
+      metadata: {
+        event: 'lead.assigned',
+        assignmentType: 'reassigned',
+        assigned_to: item.assignedTo,
+        assigned_name: item.assignedName,
+        dispatch_reason: 'queue_drained',
+      },
+    });
+  }
+
+  return drainedCount;
 }
 
 /**
@@ -1587,6 +1902,7 @@ export async function toggleSaleAdministrativeStatus(params: {
 
     let leadsRecalled = 0;
     let leadsTransferred = 0;
+    let transferredLeadIds: string[] = [];
     const slaToCancel: string[] = [];
     const slaToSchedule: Array<{ member: string; deadlineMs: number }> = [];
 
@@ -1720,22 +2036,18 @@ export async function toggleSaleAdministrativeStatus(params: {
           }
         }
 
-        await client.query(
-          `INSERT INTO lead_timeline_events (
-            tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-          )
-          SELECT $1, unnest($2::uuid[]), 'auto_recall', 'system', $3, $4, $5, $6, $7, $8::jsonb`,
-          [
-            params.tenantId,
-            recallIds,
-            params.actorId,
-            params.actorRole,
-            params.actorName,
-            'AUTO_RECALL: Thu hồi lead chưa tiếp nhận do Sale ngừng hoạt động',
-            params.reason || `Trạng thái chuyển sang ${params.newStatus}`,
-            JSON.stringify({ previous_assignee: params.targetUserId, new_status: params.newStatus }),
-          ]
-        );
+        await insertBulkLeadTimelineEvents(client, {
+          tenantId: params.tenantId,
+          leadIds: recallIds,
+          eventType: 'auto_recall',
+          eventCategory: 'system',
+          actorId: params.actorId,
+          actorRole: params.actorRole,
+          actorName: params.actorName,
+          title: 'AUTO_RECALL: Thu hồi lead chưa tiếp nhận do Sale ngừng hoạt động',
+          content: params.reason || `Trạng thái chuyển sang ${params.newStatus}`,
+          metadataJson: JSON.stringify({ previous_assignee: params.targetUserId, new_status: params.newStatus }),
+        });
       }
 
       // Step 3: Optionally bulk transfer accepted leads
@@ -1748,6 +2060,7 @@ export async function toggleSaleAdministrativeStatus(params: {
         );
         if (accepted.rows.length > 0) {
           const transferIds = accepted.rows.map((r) => r.id);
+          transferredLeadIds = transferIds;
           leadsTransferred = transferIds.length;
           await client.query(
             `UPDATE leads
@@ -1755,27 +2068,23 @@ export async function toggleSaleAdministrativeStatus(params: {
              WHERE tenant_id = $2 AND id = ANY($3::uuid[])`,
             [params.transferToUserId, params.tenantId, transferIds]
           );
-          await client.query(
-            `INSERT INTO lead_timeline_events (
-              tenant_id, lead_id, event_type, event_category, actor_id, actor_role, actor_name, title, content, metadata
-            )
-            SELECT $1, unnest($2::uuid[]), 'lead_transferred', 'system', $3, $4, $5, $6, $7, $8::jsonb`,
-            [
-              params.tenantId,
-              transferIds,
-              params.actorId,
-              params.actorRole,
-              params.actorName,
-              'BULK_TRANSFER: Điều chuyển khách hàng sang nhân sự tiếp quản',
-              params.reason || 'Bàn giao danh sách khách hàng',
-              JSON.stringify({ from_user: params.targetUserId, to_user: params.transferToUserId }),
-            ]
-          );
+          await insertBulkLeadTimelineEvents(client, {
+            tenantId: params.tenantId,
+            leadIds: transferIds,
+            eventType: 'lead_transferred',
+            eventCategory: 'system',
+            actorId: params.actorId,
+            actorRole: params.actorRole,
+            actorName: params.actorName,
+            title: 'BULK_TRANSFER: Điều chuyển khách hàng sang nhân sự tiếp quản',
+            content: params.reason || 'Bàn giao danh sách khách hàng',
+            metadataJson: JSON.stringify({ from_user: params.targetUserId, to_user: params.transferToUserId }),
+          });
         }
       }
     }
 
-    return { previousStatus, leadsRecalled, leadsTransferred, slaToCancel, slaToSchedule };
+    return { previousStatus, leadsRecalled, leadsTransferred, transferredLeadIds, slaToCancel, slaToSchedule };
   });
 
   for (const m of result.slaToCancel) {
@@ -1783,6 +2092,24 @@ export async function toggleSaleAdministrativeStatus(params: {
   }
   for (const s of result.slaToSchedule) {
     await tenantRedis.zadd('sla_queue', s.deadlineMs, s.member, params.tenantId);
+  }
+
+  if (params.transferToUserId && result.transferredLeadIds.length > 0) {
+    for (const lid of result.transferredLeadIds) {
+      emitDomainEventDetached('marketing.engaged', {
+        tenantId: params.tenantId,
+        leadId: lid,
+        engagementType: 'lead.assigned',
+        scoreDelta: 0,
+        metadata: {
+          event: 'lead.assigned',
+          assignmentType: 'reassigned',
+          assigned_to: params.transferToUserId,
+          previous_assigned_to: params.targetUserId,
+          dispatch_reason: 'bulk_transfer',
+        },
+      });
+    }
   }
 
   let sessionRevoked = false;

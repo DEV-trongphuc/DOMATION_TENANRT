@@ -60,6 +60,24 @@ export interface CapiRulesConfig {
   require_phone: boolean;
 }
 
+export interface DailyReportChannelsConfig {
+  zalo: boolean;
+  telegram: boolean;
+  email: boolean;
+  discord: boolean;
+}
+
+export type WeeklyReportDay =
+  | 'mon'
+  | 'tue'
+  | 'wed'
+  | 'thu'
+  | 'fri'
+  | 'sat'
+  | 'sun'
+  | 'off'
+  | 'none';
+
 export interface NotificationTemplatesConfig {
   assign_email_subject: string;
   assign_email_body: string;
@@ -205,6 +223,29 @@ export interface TenantSettings {
   ai_agent_name: string;
   ai_avatar_url: string;
   pipeline_tabs: Array<Record<string, unknown>>;
+
+  // 12. Daily / Weekly / Monthly Report & Meta Ads Fusion Settings
+  zalo_daily_report_time: string;
+  zalo_notify_only_group: boolean;
+  zalo_admin_group_chat_id: string;
+  zalo_weekly_report_day: WeeklyReportDay;
+  zalo_weekly_report_time: string;
+  zalo_monthly_report_enabled: boolean;
+  zalo_monthly_report_time: string;
+  daily_report_admins: string[];
+  daily_report_channels: DailyReportChannelsConfig;
+  daily_report_include_meta_ads: boolean;
+  daily_report_meta_ads_metrics: string[];
+  daily_report_meta_account_ids: string[];
+
+  // 13. Granular AI BYOK Feature Switches
+  ai_lead_eval_enabled: boolean;
+  ai_ads_eval_enabled: boolean;
+  ai_segment_analysis_enabled: boolean;
+  ai_user_behavior_enabled: boolean;
+  ai_email_designer_enabled: boolean;
+  ai_image_generator_enabled: boolean;
+  ai_agent_training_enabled: boolean;
 }
 
 export const DEFAULT_NOTE_TYPES: TenantNoteTypeConfig[] = [
@@ -262,6 +303,22 @@ export const DEFAULT_BLOCKED_PHONE_SEQUENCES: string[] = [
   '1234567890',
   '0912345678',
   '0901234567',
+];
+
+export const DEFAULT_DAILY_REPORT_CHANNELS: DailyReportChannelsConfig = {
+  zalo: false,
+  telegram: false,
+  email: false,
+  discord: false,
+};
+
+export const DEFAULT_DAILY_REPORT_META_ADS_METRICS: string[] = [
+  'results',
+  'leads',
+  'messages',
+  'reach',
+  'spend',
+  'peak_hours',
 ];
 
 export const DEFAULT_TENANT_SETTINGS: TenantSettings = {
@@ -392,6 +449,27 @@ export const DEFAULT_TENANT_SETTINGS: TenantSettings = {
   ai_agent_name: 'DOM Agent',
   ai_avatar_url: '/imgs/autodata/ICON.png',
   pipeline_tabs: [],
+
+  zalo_daily_report_time: '18:00',
+  zalo_notify_only_group: false,
+  zalo_admin_group_chat_id: '',
+  zalo_weekly_report_day: 'mon',
+  zalo_weekly_report_time: '09:00',
+  zalo_monthly_report_enabled: false,
+  zalo_monthly_report_time: '08:30',
+  daily_report_admins: [],
+  daily_report_channels: DEFAULT_DAILY_REPORT_CHANNELS,
+  daily_report_include_meta_ads: false,
+  daily_report_meta_ads_metrics: DEFAULT_DAILY_REPORT_META_ADS_METRICS,
+  daily_report_meta_account_ids: [],
+
+  ai_lead_eval_enabled: true,
+  ai_ads_eval_enabled: true,
+  ai_segment_analysis_enabled: true,
+  ai_user_behavior_enabled: true,
+  ai_email_designer_enabled: true,
+  ai_image_generator_enabled: true,
+  ai_agent_training_enabled: true,
 };
 
 function clampNum(val: unknown, fallback: number, min: number, max: number): number {
@@ -403,8 +481,13 @@ function clampNum(val: unknown, fallback: number, min: number, max: number): num
 
 function asBool(val: unknown, fallback: boolean): boolean {
   if (typeof val === 'boolean') return val;
-  if (val === 'true' || val === 1) return true;
-  if (val === 'false' || val === 0) return false;
+  if (val === 1) return true;
+  if (val === 0) return false;
+  if (typeof val === 'string') {
+    const low = val.trim().toLowerCase();
+    if (low === 'true' || low === '1') return true;
+    if (low === 'false' || low === '0') return false;
+  }
   return fallback;
 }
 
@@ -594,6 +677,96 @@ function normalizeBlockedPhoneSequences(raw: unknown, fallback: string[]): strin
     .map((item) => String(item || '').replace(/\D/g, '').slice(0, 20))
     .filter((digits) => digits.length >= 5);
   return cleaned.length > 0 ? Array.from(new Set(cleaned)).slice(0, 100) : [...fallback];
+}
+
+const VALID_WEEKLY_REPORT_DAYS = new Set<WeeklyReportDay>([
+  'mon',
+  'tue',
+  'wed',
+  'thu',
+  'fri',
+  'sat',
+  'sun',
+  'off',
+  'none',
+]);
+
+function normalizeWeeklyReportDay(raw: unknown, fallback: WeeklyReportDay): WeeklyReportDay {
+  if (typeof raw !== 'string') return fallback;
+  const low = raw.trim().toLowerCase() as WeeklyReportDay;
+  return VALID_WEEKLY_REPORT_DAYS.has(low) ? low : fallback;
+}
+
+function normalizeDailyReportAdmins(raw: unknown, fallback: string[]): string[] {
+  if (raw === undefined || raw === null) return [...fallback];
+  const parsed = parseMaybeJson(raw);
+  const items = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === 'string'
+      ? parsed.split(/[\r\n,;]+/)
+      : null;
+  if (!items) return [...fallback];
+  const cleaned = items
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter((id) => {
+      if (!id) return false;
+      const low = id.toLowerCase();
+      return low !== 'null' && low !== 'undefined' && low !== 'nan';
+    })
+    .map((id) => id.slice(0, 120));
+  return Array.from(new Set(cleaned)).slice(0, 100);
+}
+
+function normalizeDailyReportChannels(
+  raw: unknown,
+  fallback: DailyReportChannelsConfig
+): DailyReportChannelsConfig {
+  const parsed = parseMaybeJson(raw);
+  const obj = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
+  return {
+    zalo: asBool(obj.zalo, fallback.zalo),
+    telegram: asBool(obj.telegram, fallback.telegram),
+    email: asBool(obj.email, fallback.email),
+    discord: asBool(obj.discord, fallback.discord),
+  };
+}
+
+function normalizeDailyReportMetaAdsMetrics(raw: unknown, fallback: string[]): string[] {
+  if (raw === undefined || raw === null) return [...fallback];
+  const parsed = parseMaybeJson(raw);
+  const items = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === 'string'
+      ? parsed.split(/[\r\n,;|\s]+/)
+      : null;
+  if (!items) return [...fallback];
+  const cleaned = items
+    .map((item) => (typeof item === 'string' ? item.trim().toLowerCase() : ''))
+    .filter((m) => m.length > 0 && m !== 'null' && m !== 'undefined')
+    .map((m) => m.slice(0, 48));
+  return cleaned.length > 0 ? Array.from(new Set(cleaned)).slice(0, 24) : [...fallback];
+}
+
+function normalizeDailyReportMetaAccountIds(raw: unknown, fallback: string[]): string[] {
+  if (raw === undefined || raw === null) return [...fallback];
+  const parsed = parseMaybeJson(raw);
+  const items = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === 'string'
+      ? parsed.split(/[\r\n,;|\s]+/)
+      : null;
+  if (!items) return [...fallback];
+  const cleaned = items
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter((id) => {
+      if (!id) return false;
+      const low = id.toLowerCase();
+      return low !== 'null' && low !== 'undefined' && low !== 'nan';
+    })
+    .map((id) => id.slice(0, 80));
+  return Array.from(new Set(cleaned)).slice(0, 50);
 }
 
 export function normalizeTenantSettings(
@@ -998,6 +1171,72 @@ export function normalizeTenantSettings(
     pipeline_tabs: Array.isArray(s.pipeline_tabs)
       ? (s.pipeline_tabs as Array<Record<string, unknown>>).slice(0, 24)
       : baseDefaults.pipeline_tabs,
+
+    zalo_daily_report_time: asTimeHm(s.zalo_daily_report_time, baseDefaults.zalo_daily_report_time),
+    zalo_notify_only_group: asBool(s.zalo_notify_only_group, baseDefaults.zalo_notify_only_group),
+    zalo_admin_group_chat_id:
+      typeof s.zalo_admin_group_chat_id === 'string'
+        ? s.zalo_admin_group_chat_id.trim().slice(0, 120)
+        : baseDefaults.zalo_admin_group_chat_id,
+    zalo_weekly_report_day: normalizeWeeklyReportDay(
+      s.zalo_weekly_report_day,
+      baseDefaults.zalo_weekly_report_day
+    ),
+    zalo_weekly_report_time: asTimeHm(
+      s.zalo_weekly_report_time,
+      baseDefaults.zalo_weekly_report_time
+    ),
+    zalo_monthly_report_enabled: asBool(
+      s.zalo_monthly_report_enabled,
+      baseDefaults.zalo_monthly_report_enabled
+    ),
+    zalo_monthly_report_time: asTimeHm(
+      s.zalo_monthly_report_time,
+      baseDefaults.zalo_monthly_report_time
+    ),
+    daily_report_admins: normalizeDailyReportAdmins(
+      s.daily_report_admins,
+      baseDefaults.daily_report_admins
+    ),
+    daily_report_channels: normalizeDailyReportChannels(
+      s.daily_report_channels,
+      baseDefaults.daily_report_channels
+    ),
+    daily_report_include_meta_ads: asBool(
+      s.daily_report_include_meta_ads,
+      baseDefaults.daily_report_include_meta_ads
+    ),
+    daily_report_meta_ads_metrics: normalizeDailyReportMetaAdsMetrics(
+      s.daily_report_meta_ads_metrics,
+      baseDefaults.daily_report_meta_ads_metrics
+    ),
+    daily_report_meta_account_ids: normalizeDailyReportMetaAccountIds(
+      s.daily_report_meta_account_ids,
+      baseDefaults.daily_report_meta_account_ids
+    ),
+
+    ai_lead_eval_enabled: asBool(s.ai_lead_eval_enabled, baseDefaults.ai_lead_eval_enabled),
+    ai_ads_eval_enabled: asBool(s.ai_ads_eval_enabled, baseDefaults.ai_ads_eval_enabled),
+    ai_segment_analysis_enabled: asBool(
+      s.ai_segment_analysis_enabled,
+      baseDefaults.ai_segment_analysis_enabled
+    ),
+    ai_user_behavior_enabled: asBool(
+      s.ai_user_behavior_enabled,
+      baseDefaults.ai_user_behavior_enabled
+    ),
+    ai_email_designer_enabled: asBool(
+      s.ai_email_designer_enabled,
+      baseDefaults.ai_email_designer_enabled
+    ),
+    ai_image_generator_enabled: asBool(
+      s.ai_image_generator_enabled,
+      baseDefaults.ai_image_generator_enabled
+    ),
+    ai_agent_training_enabled: asBool(
+      s.ai_agent_training_enabled,
+      baseDefaults.ai_agent_training_enabled
+    ),
   };
 }
 

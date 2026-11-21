@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { withTenantTransaction } from '../../core/database/transaction.ts';
 import { getTenantContext } from '../../core/context/tenant-context.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
 import {
   buildGranularScopeWhereClause,
   requirePermission,
@@ -12,6 +13,11 @@ import {
   maskPiiInText,
 } from '../../core/security/pii-masker.ts';
 import { emitDomainEventDetached } from '../../core/events/event-bus.ts';
+import { executeFlowForLead } from '../marketing/flow-engine.service.ts';
+import {
+  executeSharedGeminiAnalysis,
+  resolveDecryptedSharedAiConfig,
+} from '../../services/dom-meta-report.service.ts';
 import {
   clampLimit,
   parseJsonSafe,
@@ -19,6 +25,462 @@ import {
 } from './schema.ts';
 
 export const contacts360Router = Router();
+
+async function safeContactQuery<T extends Record<string, any> = Record<string, any>>(
+  client: Parameters<Parameters<typeof withTenantTransaction>[1]>[0],
+  sql: string,
+  params: unknown[]
+): Promise<T[]> {
+  const sp = `sp_c360_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  const isMaria = client.dialect === 'mariadb';
+  try {
+    if (!isMaria) await client.query(`SAVEPOINT ${sp}`);
+    const r = await client.query<T>(sql, params);
+    if (!isMaria) await client.query(`RELEASE SAVEPOINT ${sp}`);
+    return r.rows || [];
+  } catch {
+    if (!isMaria) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${sp}`).catch(() => {});
+      await client.query(`RELEASE SAVEPOINT ${sp}`).catch(() => {});
+    }
+    return [];
+  }
+}
+
+async function buildContactAttributionAndBehaviorInTx(
+  client: Parameters<Parameters<typeof withTenantTransaction>[1]>[0],
+  tenantId: string,
+  rawLead: Record<string, any>
+) {
+  const leadId = String(rawLead.id);
+  const cf = parseJsonSafe<Record<string, any>>(rawLead.custom_fields, {});
+
+  // 1. Resolve Meta / Ad Insights & optional `contact_meta_attribution` (sequential SAVEPOINTs on same PG client)
+  const resolvedAdId = String(
+    rawLead.ad_id || cf.ad_id || cf.meta_ad_id || ''
+  ).trim();
+  const resolvedCampaignId = String(
+    rawLead.campaign_id || cf.campaign_id || cf.meta_campaign_id || ''
+  ).trim();
+
+  const metaAttrRows = await safeContactQuery<Record<string, any>>(
+    client,
+    `SELECT * FROM contact_meta_attribution
+     WHERE tenant_id = $1 AND (contact_id::text = $2 OR lead_id::text = $2)
+     ORDER BY created_at DESC LIMIT 1`,
+    [tenantId, leadId]
+  );
+  const metaAttr = metaAttrRows[0] || null;
+
+  let metaInsight: Record<string, any> | null = null;
+  if (resolvedAdId) {
+    const maiRows = await safeContactQuery<Record<string, any>>(
+      client,
+      `SELECT campaign_id, campaign_name, adset_id, adset_name, ad_id, ad_name, thumbnail_url, image_url, creative_title
+       FROM meta_ads_insights
+       WHERE tenant_id = $1 AND ad_id = $2
+       ORDER BY date_stop DESC LIMIT 1`,
+      [tenantId, resolvedAdId]
+    );
+    metaInsight = maiRows[0] || null;
+  } else if (resolvedCampaignId) {
+    const maiRows = await safeContactQuery<Record<string, any>>(
+      client,
+      `SELECT campaign_id, campaign_name, adset_id, adset_name, ad_id, ad_name, thumbnail_url, image_url, creative_title
+       FROM meta_ads_insights
+       WHERE tenant_id = $1 AND campaign_id = $2
+       ORDER BY date_stop DESC LIMIT 1`,
+      [tenantId, resolvedCampaignId]
+    );
+    metaInsight = maiRows[0] || null;
+  }
+
+  // 2. Web sessions & events
+  const webSessions = await safeContactQuery<Record<string, any>>(
+    client,
+    `SELECT id, entry_url, last_url, referrer, utm_source, utm_medium, utm_campaign,
+            device_type, browser, os, pageviews_count, duration_seconds,
+            pricing_intent_detected, started_at, last_seen_at
+     FROM mkt_web_sessions
+     WHERE tenant_id = $1 AND lead_id = $2
+     ORDER BY started_at ASC
+     LIMIT 100`,
+    [tenantId, leadId]
+  );
+
+  const webEvents = await safeContactQuery<Record<string, any>>(
+    client,
+    `SELECT event_type, page_url, element_selector, scroll_depth_pct, metadata, created_at
+     FROM mkt_web_events
+     WHERE tenant_id = $1 AND lead_id = $2
+     ORDER BY created_at DESC
+     LIMIT 400`,
+    [tenantId, leadId]
+  );
+
+  // 3. Email / Flow / Social / Survey / Timeline engagement
+  const emailClaims = await safeContactQuery<Record<string, any>>(
+    client,
+    `SELECT status, sent_at, opened_at, clicked_at, claimed_at
+     FROM mkt_send_claims
+     WHERE tenant_id = $1 AND lead_id = $2
+     ORDER BY claimed_at DESC
+     LIMIT 200`,
+    [tenantId, leadId]
+  );
+
+  const flowRows = await safeContactQuery<{ cnt: number }>(
+    client,
+    `SELECT COUNT(*)::int AS cnt FROM mkt_flow_enrollments WHERE tenant_id = $1 AND lead_id = $2`,
+    [tenantId, leadId]
+  );
+
+  const socialMsgRows = await safeContactQuery<{ cnt: number; last_at: string | null }>(
+    client,
+    `SELECT COUNT(*)::int AS cnt, MAX(m.created_at)::text AS last_at
+     FROM mkt_social_messages m
+     INNER JOIN mkt_social_conversations c ON c.tenant_id = m.tenant_id AND c.id = m.conversation_id
+     WHERE m.tenant_id = $1 AND c.lead_id = $2`,
+    [tenantId, leadId]
+  );
+
+  const socialRecentRows = await safeContactQuery<{ created_at: string }>(
+    client,
+    `SELECT m.created_at::text AS created_at
+     FROM mkt_social_messages m
+     INNER JOIN mkt_social_conversations c ON c.tenant_id = m.tenant_id AND c.id = m.conversation_id
+     WHERE m.tenant_id = $1 AND c.lead_id = $2 AND m.created_at >= (clock_timestamp() - INTERVAL '7 days')`,
+    [tenantId, leadId]
+  );
+
+  const surveyRows = await safeContactQuery<{ cnt: number }>(
+    client,
+    `SELECT COUNT(*)::int AS cnt FROM mkt_survey_responses WHERE tenant_id = $1 AND lead_id = $2`,
+    [tenantId, leadId]
+  );
+
+  const timelineRecentRows = await safeContactQuery<{ event_type: string; created_at: string }>(
+    client,
+    `SELECT event_type, created_at::text AS created_at
+     FROM lead_timeline_events
+     WHERE tenant_id = $1 AND lead_id = $2
+     ORDER BY created_at DESC
+     LIMIT 200`,
+    [tenantId, leadId]
+  );
+
+  // Build resolved `ad_attribution`
+  const firstSession = webSessions[0] || null;
+  const latestSession = webSessions[webSessions.length - 1] || null;
+
+  const utmSource =
+    rawLead.utm_source ||
+    cf.utm_source ||
+    metaAttr?.utm_source ||
+    firstSession?.utm_source ||
+    null;
+  const utmMedium =
+    rawLead.utm_medium ||
+    cf.utm_medium ||
+    metaAttr?.utm_medium ||
+    firstSession?.utm_medium ||
+    null;
+  const utmCampaign =
+    cf.utm_campaign ||
+    metaAttr?.utm_campaign ||
+    rawLead.campaign ||
+    firstSession?.utm_campaign ||
+    metaInsight?.campaign_name ||
+    null;
+  const utmContent =
+    rawLead.utm_content || cf.utm_content || metaAttr?.utm_content || null;
+
+  const adId = resolvedAdId || metaAttr?.ad_id || metaInsight?.ad_id || null;
+  const adsetId =
+    rawLead.adset_id ||
+    cf.adset_id ||
+    cf.meta_adset_id ||
+    metaAttr?.adset_id ||
+    metaInsight?.adset_id ||
+    null;
+  const campaignId =
+    resolvedCampaignId || metaAttr?.campaign_id || metaInsight?.campaign_id || null;
+
+  const campaignName =
+    metaAttr?.campaign_name ||
+    metaInsight?.campaign_name ||
+    cf.meta_campaign_name ||
+    cf.campaign_name ||
+    rawLead.campaign ||
+    utmCampaign ||
+    null;
+  const adsetName =
+    metaAttr?.adset_name ||
+    metaInsight?.adset_name ||
+    cf.meta_adset_name ||
+    cf.adset_name ||
+    null;
+  const adName =
+    metaAttr?.ad_name ||
+    metaInsight?.ad_name ||
+    cf.meta_ad_name ||
+    cf.ad_name ||
+    null;
+  const formId = rawLead.form_id || cf.form_id || metaAttr?.form_id || null;
+  const formName =
+    metaAttr?.form_name || cf.meta_form_name || cf.form_name || null;
+  const fbclid = rawLead.fbclid || rawLead.fbc || cf.fbclid || metaAttr?.fbclid || null;
+  const landingPage =
+    cf.landing_page ||
+    cf.entry_url ||
+    metaAttr?.landing_page ||
+    firstSession?.entry_url ||
+    null;
+  const referrer =
+    cf.referrer || metaAttr?.referrer || firstSession?.referrer || null;
+
+  const srcLow = String(utmSource || rawLead.source || '').toLowerCase();
+  const platform =
+    adId || fbclid || rawLead.meta_lead_id || srcLow.includes('facebook') || srcLow.includes('meta') || srcLow === 'fb' || srcLow === 'ig'
+      ? 'meta'
+      : srcLow.includes('google') || srcLow.includes('gclid')
+        ? 'google'
+        : srcLow.includes('tiktok')
+          ? 'tiktok'
+          : srcLow.includes('zalo')
+            ? 'zalo'
+            : firstSession
+              ? 'web'
+              : 'direct';
+
+  const firstTouchAt =
+    firstSession?.started_at ||
+    metaAttr?.created_at ||
+    rawLead.created_at ||
+    null;
+
+  const ad_attribution = {
+    platform,
+    source: rawLead.source || utmSource || 'Direct',
+    campaign_id: campaignId,
+    campaign_name: campaignName,
+    adset_id: adsetId,
+    adset_name: adsetName,
+    ad_id: adId,
+    ad_name: adName,
+    form_id: formId,
+    form_name: formName,
+    utm_source: utmSource,
+    utm_medium: utmMedium,
+    utm_campaign: utmCampaign,
+    utm_content: utmContent,
+    fbclid,
+    landing_page: landingPage,
+    referrer,
+    first_touch_at: firstTouchAt ? new Date(firstTouchAt).toISOString() : null,
+    thumbnail_url: metaInsight?.thumbnail_url || metaInsight?.image_url || null,
+    creative_title: metaInsight?.creative_title || null,
+  };
+
+  // Build `behavior_analytics`
+  let webPageviews = 0;
+  let totalActiveSeconds = 0;
+  let pricingIntentHits = 0;
+  for (const s of webSessions) {
+    webPageviews += Number(s.pageviews_count || 0);
+    totalActiveSeconds += Number(s.duration_seconds || 0);
+    if (s.pricing_intent_detected) pricingIntentHits += 1;
+  }
+
+  let webClicks = 0;
+  let maxScrollPct = 0;
+  let pageviewEventsCount = 0;
+  let pricingEventsCount = 0;
+
+  const ctaMap = new Map<
+    string,
+    { text: string; url: string; selector: string | null; count: number; last_at: string | null }
+  >();
+  const pageMap = new Map<
+    string,
+    { url: string; title: string | null; views: number; max_scroll_pct: number; last_at: string | null }
+  >();
+
+  for (const ev of webEvents) {
+    const evType = String(ev.event_type || '').toLowerCase();
+    const meta = parseJsonSafe<Record<string, any>>(ev.metadata, {});
+    const scrollVal = Number(
+      ev.scroll_depth_pct ?? meta.max_scroll_pct ?? meta.percent ?? 0
+    );
+    if (Number.isFinite(scrollVal) && scrollVal > maxScrollPct) {
+      maxScrollPct = Math.min(100, Math.round(scrollVal));
+    }
+
+    const pageUrl = String(ev.page_url || '').trim();
+    const evAt = ev.created_at ? new Date(ev.created_at).toISOString() : null;
+
+    if (evType === 'pageview' || evType === 'pricing_intent') {
+      pageviewEventsCount += 1;
+      if (evType === 'pricing_intent') pricingEventsCount += 1;
+      if (pageUrl) {
+        const cur = pageMap.get(pageUrl) || {
+          url: pageUrl,
+          title: meta.page_title ? String(meta.page_title) : null,
+          views: 0,
+          max_scroll_pct: 0,
+          last_at: evAt,
+        };
+        cur.views += 1;
+        if (scrollVal > cur.max_scroll_pct) cur.max_scroll_pct = Math.min(100, Math.round(scrollVal));
+        if (!cur.title && meta.page_title) cur.title = String(meta.page_title);
+        if (evAt && (!cur.last_at || evAt > cur.last_at)) cur.last_at = evAt;
+        pageMap.set(pageUrl, cur);
+      }
+    } else if (evType === 'scroll' && pageUrl) {
+      const cur = pageMap.get(pageUrl);
+      if (cur && scrollVal > cur.max_scroll_pct) {
+        cur.max_scroll_pct = Math.min(100, Math.round(scrollVal));
+      }
+    } else if (evType === 'click' || evType === 'cta_click' || evType === 'web_click') {
+      webClicks += 1;
+      const ctaText = String(
+        meta.cta_text ||
+          meta.button_text ||
+          meta.element_text ||
+          meta.text ||
+          meta.label ||
+          ev.element_selector ||
+          'Click CTA'
+      )
+        .trim()
+        .slice(0, 120);
+      const ctaUrl = String(meta.href || pageUrl || '').trim();
+      const ctaKey = `${ctaText.toLowerCase()}||${ctaUrl.toLowerCase()}`;
+      const cur = ctaMap.get(ctaKey) || {
+        text: ctaText,
+        url: ctaUrl,
+        selector: ev.element_selector ? String(ev.element_selector) : null,
+        count: 0,
+        last_at: evAt,
+      };
+      cur.count += 1;
+      if (evAt && (!cur.last_at || evAt > cur.last_at)) cur.last_at = evAt;
+      ctaMap.set(ctaKey, cur);
+    }
+  }
+
+  webPageviews = Math.max(webPageviews, pageviewEventsCount);
+  pricingIntentHits = Math.max(pricingIntentHits, pricingEventsCount);
+
+  const emailsSentClaims = emailClaims.filter((c) =>
+    ['sent', 'delivered', 'opened', 'clicked'].includes(String(c.status || '').toLowerCase()) || Boolean(c.sent_at)
+  ).length;
+  const emailsOpenedClaims = emailClaims.filter((c) => Boolean(c.opened_at)).length;
+  const emailsClickedClaims = emailClaims.filter((c) => Boolean(c.clicked_at)).length;
+
+  const tlEmailSent = timelineRecentRows.filter((t) => ['mkt_email_sent', 'email_sent'].includes(t.event_type)).length;
+  const tlEmailOpened = timelineRecentRows.filter((t) => ['email_opened', 'mkt_email_open'].includes(t.event_type)).length;
+  const tlEmailClicked = timelineRecentRows.filter((t) => ['email_clicked', 'mkt_email_click'].includes(t.event_type)).length;
+
+  const emailsSent = Math.max(emailsSentClaims, tlEmailSent);
+  const emailsOpened = Math.max(emailsOpenedClaims, tlEmailOpened);
+  const emailsClicked = Math.max(emailsClickedClaims, tlEmailClicked);
+  const flowsEnrolled = Number(flowRows[0]?.cnt || 0);
+  const socialMessages = Number(socialMsgRows[0]?.cnt || 0);
+  const surveysSubmitted = Number(surveyRows[0]?.cnt || 0);
+
+  // Build 7-day daily engagement timeline
+  const dayBuckets = new Map<string, { web: number; email: number; social: number }>();
+  const now = new Date();
+  const dayKeys: Array<{ date: string; label: string }> = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
+    const date = d.toISOString().slice(0, 10);
+    const label = `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    dayKeys.push({ date, label });
+    dayBuckets.set(date, { web: 0, email: 0, social: 0 });
+  }
+
+  const bumpDay = (ts: unknown, channel: 'web' | 'email' | 'social') => {
+    if (!ts) return;
+    const d = new Date(String(ts));
+    if (Number.isNaN(d.getTime())) return;
+    const key = d.toISOString().slice(0, 10);
+    const bucket = dayBuckets.get(key);
+    if (bucket) bucket[channel] += 1;
+  };
+
+  for (const ev of webEvents) bumpDay(ev.created_at, 'web');
+  for (const c of emailClaims) {
+    if (c.clicked_at) bumpDay(c.clicked_at, 'email');
+    else if (c.opened_at) bumpDay(c.opened_at, 'email');
+  }
+  for (const m of socialRecentRows) bumpDay(m.created_at, 'social');
+  for (const tl of timelineRecentRows) {
+    if (['email_opened', 'mkt_email_open', 'email_clicked', 'mkt_email_click'].includes(tl.event_type)) {
+      if (emailClaims.length === 0) bumpDay(tl.created_at, 'email');
+    } else if (tl.event_type === 'web_page_view' && webEvents.length === 0) {
+      bumpDay(tl.created_at, 'web');
+    }
+  }
+
+  const engagement_timeline_7d = dayKeys.map(({ date, label }) => {
+    const b = dayBuckets.get(date) || { web: 0, email: 0, social: 0 };
+    return {
+      date,
+      label,
+      web: b.web,
+      email: b.email,
+      social: b.social,
+      total: b.web + b.email + b.social,
+    };
+  });
+
+  const top_clicked_ctas = Array.from(ctaMap.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8);
+  const top_visited_pages = Array.from(pageMap.values())
+    .sort((a, b) => b.views - a.views || b.max_scroll_pct - a.max_scroll_pct)
+    .slice(0, 8);
+
+  // Deterministic Engagement Score (0 - 100)
+  const signalScore =
+    Math.min(20, webPageviews * 3) +
+    Math.min(20, webClicks * 5) +
+    Math.min(12, Math.round(maxScrollPct * 0.12)) +
+    Math.min(15, pricingIntentHits * 15) +
+    Math.min(15, emailsOpened * 3 + emailsClicked * 6) +
+    Math.min(10, socialMessages * 3 + surveysSubmitted * 5) +
+    Math.min(8, Math.round(totalActiveSeconds / 45));
+  const leadScoreFallback = Number(rawLead.lead_score || 0);
+  const engagement_score = Math.min(
+    100,
+    Math.max(0, signalScore > 0 ? Math.max(signalScore, Math.round(leadScoreFallback * 0.6)) : leadScoreFallback)
+  );
+
+  const behavior_analytics = {
+    web_pageviews: webPageviews,
+    web_clicks: webClicks,
+    max_scroll_pct: maxScrollPct,
+    total_active_seconds: totalActiveSeconds,
+    pricing_intent_hits: pricingIntentHits,
+    emails_sent: emailsSent,
+    emails_opened: emailsOpened,
+    emails_clicked: emailsClicked,
+    flows_enrolled: flowsEnrolled,
+    social_messages: socialMessages,
+    surveys_submitted: surveysSubmitted,
+    device_type: latestSession?.device_type || null,
+    browser: latestSession?.browser || null,
+    os: latestSession?.os || null,
+    top_clicked_ctas,
+    top_visited_pages,
+    engagement_timeline_7d,
+    engagement_score,
+  };
+
+  return { ad_attribution, behavior_analytics };
+}
 
 function slugifyTag(name: string): string {
   return (
@@ -99,6 +561,8 @@ contacts360Router.get(
       const uncontactedOnly = String(req.query.uncontacted_only || '') === '1';
       const dateFrom = String(req.query.date_from || '').trim();
       const dateTo = String(req.query.date_to || '').trim();
+      const campaignIdFilter = String(req.query.campaign_id || '').trim();
+      const adIdFilter = String(req.query.ad_id || '').trim();
 
       const data = await withTenantTransaction(ctx.tenantId, async (client) => {
         const { rbac, canUnmaskLeads, tenantSettings } = await resolveCrmActorContext(
@@ -149,9 +613,23 @@ contacts360Router.get(
 
         if (search) {
           conds.push(
-            `(LOWER(l.name) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.phone, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.email, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.product_interest, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(comp.name, '')) LIKE LOWER($${pIdx}))`
+            `(LOWER(l.name) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.phone, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.email, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.product_interest, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(comp.name, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.campaign, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.campaign_id, '')) LIKE LOWER($${pIdx}) OR LOWER(COALESCE(l.ad_id, '')) LIKE LOWER($${pIdx}))`
           );
           vals.push(`%${search}%`);
+          pIdx++;
+        }
+        if (campaignIdFilter) {
+          conds.push(
+            `(l.campaign_id = $${pIdx} OR COALESCE(l.custom_fields->>'campaign_id', '') = $${pIdx} OR LOWER(COALESCE(l.campaign, '')) = LOWER($${pIdx}))`
+          );
+          vals.push(campaignIdFilter);
+          pIdx++;
+        }
+        if (adIdFilter) {
+          conds.push(
+            `(l.ad_id = $${pIdx} OR COALESCE(l.custom_fields->>'ad_id', '') = $${pIdx})`
+          );
+          vals.push(adIdFilter);
           pIdx++;
         }
         if (lifecycleStage) {
@@ -258,7 +736,10 @@ contacts360Router.get(
             client.query<Record<string, any>>(
               `SELECT l.id, l.name, l.phone, l.email, l.status, l.lifecycle_stage, l.lead_score,
                       l.email_consent, l.zns_consent, l.total_revenue_vnd, l.last_engaged_at,
-                      l.source, l.campaign, l.product_interest, l.budget_range, l.pipeline_id, l.stage_id,
+                      l.source, l.campaign, l.ad_id, l.adset_id, l.campaign_id,
+                      l.custom_fields->>'ad_name' AS ad_name,
+                      l.custom_fields->>'campaign_name' AS cf_campaign_name,
+                      l.product_interest, l.budget_range, l.pipeline_id, l.stage_id,
                       l.assigned_to, l.company_id, l.job_title, l.address, l.custom_fields, l.is_accepted,
                       l.sla_breached, l.created_at, l.updated_at,
                       u.full_name AS owner_name,
@@ -338,9 +819,44 @@ contacts360Router.get(
           }
         }
 
+        const adInsightsByAdId = new Map<string, { ad_name: string | null; campaign_name: string | null }>();
+        const adIds = Array.from(
+          new Set(rowsRes.rows.map((r) => (r.ad_id ? String(r.ad_id).trim() : '')).filter(Boolean))
+        );
+        if (adIds.length > 0) {
+          const adPh = adIds.map((_, idx) => `$${idx + 2}`).join(', ');
+          const maiRes = await client.query<{
+            ad_id: string;
+            ad_name: string | null;
+            campaign_name: string | null;
+          }>(
+            `SELECT ad_id, ad_name, campaign_name
+             FROM meta_ads_insights
+             WHERE tenant_id = $1 AND ad_id IN (${adPh})
+             ORDER BY date_stop DESC`,
+            [ctx.tenantId, ...adIds]
+          );
+          for (const row of maiRes.rows) {
+            const key = String(row.ad_id);
+            if (!adInsightsByAdId.has(key)) {
+              adInsightsByAdId.set(key, {
+                ad_name: row.ad_name ?? null,
+                campaign_name: row.campaign_name ?? null,
+              });
+            }
+          }
+        }
+
         const piiCfg = parseJsonSafe<Record<string, any>>(tenantSettings, {});
-        const items = rowsRes.rows.map((r) => {
-          const masked = maskContactPiiIfDisallowed(r, canUnmaskLeads, piiCfg);
+        const items = rowsRes.rows.map((r: Record<string, any>) => {
+          const { cf_campaign_name, ...restRow } = r;
+          const insight = r.ad_id ? adInsightsByAdId.get(String(r.ad_id).trim()) : undefined;
+          const enrichedRow: Record<string, any> = {
+            ...restRow,
+            ad_name: insight?.ad_name ?? r.ad_name ?? null,
+            campaign_name: r.campaign ?? insight?.campaign_name ?? cf_campaign_name ?? null,
+          };
+          const masked = maskContactPiiIfDisallowed(enrichedRow, canUnmaskLeads, piiCfg);
           return {
             ...masked,
             custom_fields: parseJsonSafe(r.custom_fields, {}),
@@ -555,6 +1071,8 @@ contacts360Router.post(
           parseJsonSafe(tenantSettings, {})
         );
       });
+
+      tenantRedis.incrementTenantMonthlyLeadCount(ctx.tenantId, 1);
 
       emitDomainEventDetached('lead.created', {
         tenantId: ctx.tenantId,
@@ -865,6 +1383,9 @@ contacts360Router.get(
           parseJsonSafe(tenantSettings, {})
         );
 
+        const { ad_attribution, behavior_analytics } =
+          await buildContactAttributionAndBehaviorInTx(client, ctx.tenantId, rawLead);
+
         return {
           contact: {
             ...masked,
@@ -873,7 +1394,18 @@ contacts360Router.get(
             lead_score: Number(rawLead.lead_score || 0),
             tags: tagsRes.rows,
             audiences: audiencesRes.rows,
+            meta_ad_id: masked.ad_id || ad_attribution.ad_id,
+            meta_ad_name: ad_attribution.ad_name,
+            meta_adset_name: ad_attribution.adset_name,
+            meta_campaign_name: ad_attribution.campaign_name,
+            utm_campaign: ad_attribution.utm_campaign,
+            landing_page: ad_attribution.landing_page,
+            referrer: ad_attribution.referrer,
+            ad_attribution,
+            behavior_analytics,
           },
+          ad_attribution,
+          behavior_analytics,
           can_unmask_phone: canUnmaskLeads,
           custom_field_defs: [
             ...customFieldsRes.rows.map((f: any) => ({
@@ -921,6 +1453,235 @@ contacts360Router.get(
         500,
         'CRM_CONTACT_GET_FAILED',
         err?.message || 'Không thể tải hồ sơ khách hàng 360°.'
+      );
+    }
+  }
+);
+
+// ============================================================================
+// 4b. AI Behavioral Profile & Next-Best-Action (`POST /contacts/:id/ai-profile`)
+// ============================================================================
+contacts360Router.post(
+  '/contacts/:id/ai-profile',
+  requirePermission('leads', 'view'),
+  async (req, res) => {
+    try {
+      const ctx = getTenantContext();
+      const contactId = String(req.params.id || '').trim();
+
+      const snapshot = await withTenantTransaction(ctx.tenantId, async (client) => {
+        const { rbac } = await resolveCrmActorContext(client, ctx.tenantId, ctx.userId);
+        const scope = rbac.effectivePermissions.leads?.scope || 'own';
+        const scopeSql = await buildGranularScopeWhereClause(
+          client,
+          ctx.tenantId,
+          rbac.userOrg!,
+          scope,
+          {
+            tenantColumn: 'l.tenant_id',
+            ownerColumn: 'l.assigned_to',
+            startParamIndex: 1,
+            allowUnassignedForManagers: true,
+          }
+        );
+
+        const leadRes = await client.query<Record<string, any>>(
+          `SELECT l.*, ps.stage_name
+           FROM leads l
+           LEFT JOIN tenant_pipeline_stages ps ON ps.tenant_id = l.tenant_id AND ps.id = l.stage_id
+           WHERE ${scopeSql.clause} AND l.id = $${scopeSql.nextIndex} AND l.is_deleted = false
+           LIMIT 1`,
+          [...scopeSql.values, contactId]
+        );
+        if (leadRes.rows.length === 0) return null;
+        const rawLead = leadRes.rows[0];
+
+        const { ad_attribution, behavior_analytics } =
+          await buildContactAttributionAndBehaviorInTx(client, ctx.tenantId, rawLead);
+
+        const [aiCfg, tenantSetRes] = await Promise.all([
+          resolveDecryptedSharedAiConfig(client, ctx.tenantId).catch(() => ({
+            apiKey: '',
+            model: 'gemini-2.5-flash',
+            aiLeadEvalEnabled: true,
+            aiAdsEvalEnabled: true,
+            updatedAt: null,
+          })),
+          client.query<{ settings: Record<string, any> | null }>(
+            'SELECT settings FROM tenants WHERE id = $1 LIMIT 1',
+            [ctx.tenantId]
+          ),
+        ]);
+
+        const rawSet =
+          tenantSetRes.rows[0]?.settings && typeof tenantSetRes.rows[0].settings === 'object'
+            ? tenantSetRes.rows[0].settings
+            : {};
+        const aiUserBehaviorEnabled =
+          rawSet.ai_user_behavior_enabled === undefined
+            ? true
+            : Boolean(rawSet.ai_user_behavior_enabled);
+
+        return {
+          lead: rawLead,
+          ad_attribution,
+          behavior_analytics,
+          aiCfg,
+          aiUserBehaviorEnabled,
+        };
+      });
+
+      if (!snapshot) {
+        sendApiError(res, 404, 'CONTACT_NOT_FOUND', 'Không tìm thấy hồ sơ khách hàng.');
+        return;
+      }
+
+      const { lead, ad_attribution, behavior_analytics, aiCfg, aiUserBehaviorEnabled } = snapshot;
+      const score = behavior_analytics.engagement_score;
+      const intentLevel: 'very_high' | 'high' | 'medium' | 'low' =
+        score >= 75 || behavior_analytics.pricing_intent_hits > 0
+          ? 'very_high'
+          : score >= 50
+            ? 'high'
+            : score >= 25
+              ? 'medium'
+              : 'low';
+      const intentLabel =
+        intentLevel === 'very_high'
+          ? 'Ý định mua rất cao'
+          : intentLevel === 'high'
+            ? 'Quan tâm tích cực'
+            : intentLevel === 'medium'
+              ? 'Đang tìm hiểu'
+              : 'Tương tác thấp / Lạnh';
+
+      const personaTag =
+        behavior_analytics.pricing_intent_hits > 0
+          ? 'Buyer Ready (Xem Bảng giá)'
+          : behavior_analytics.web_clicks >= 3 || behavior_analytics.max_scroll_pct >= 75
+            ? 'Deep Reader (Đọc sâu & Click CTA)'
+            : behavior_analytics.emails_clicked > 0
+              ? 'Email Responder'
+              : behavior_analytics.social_messages > 0
+                ? 'Social Conversationalist'
+                : 'Early Stage Explorer';
+
+      const behavioralSignals: string[] = [];
+      if (behavior_analytics.web_pageviews > 0) {
+        behavioralSignals.push(
+          `Xem ${behavior_analytics.web_pageviews} lượt trang, cuộn sâu tối đa ${behavior_analytics.max_scroll_pct}%, thời gian hoạt động ${behavior_analytics.total_active_seconds}s.`
+        );
+      }
+      if (behavior_analytics.pricing_intent_hits > 0) {
+        behavioralSignals.push(
+          `Đã truy cập trang Bảng giá / Báo giá ${behavior_analytics.pricing_intent_hits} lần (tín hiệu chốt đơn cao).`
+        );
+      }
+      if (behavior_analytics.top_clicked_ctas.length > 0) {
+        const topCta = behavior_analytics.top_clicked_ctas[0];
+        behavioralSignals.push(`Click CTA nổi bật nhất: "${topCta.text}" (${topCta.count} lần).`);
+      }
+      if (behavior_analytics.emails_opened > 0 || behavior_analytics.emails_clicked > 0) {
+        behavioralSignals.push(
+          `Tương tác Email: mở ${behavior_analytics.emails_opened}/${behavior_analytics.emails_sent} thư, click ${behavior_analytics.emails_clicked} lần.`
+        );
+      }
+      if (behavior_analytics.social_messages > 0) {
+        behavioralSignals.push(`Đã trao đổi ${behavior_analytics.social_messages} tin nhắn Social.`);
+      }
+      if (behavioralSignals.length === 0) {
+        behavioralSignals.push('Chưa có đủ dữ liệu hành vi Web/Email; đề xuất kích hoạt chuỗi chạm đa kênh.');
+      }
+
+      const attributionInsight = ad_attribution.campaign_name
+        ? `Điểm chạm đầu từ ${ad_attribution.platform.toUpperCase()} — Chiến dịch "${ad_attribution.campaign_name}"${ad_attribution.ad_name ? ` (Bài QC: ${ad_attribution.ad_name})` : ''}${ad_attribution.landing_page ? ` tại ${ad_attribution.landing_page}` : ''}.`
+        : `Nguồn tiếp cận: ${ad_attribution.source}${ad_attribution.landing_page ? ` (${ad_attribution.landing_page})` : ''}.`;
+
+      const nextBestActions: string[] = [];
+      if (behavior_analytics.pricing_intent_hits > 0) {
+        nextBestActions.push('Gọi điện tư vấn ngay trong 15 phút và gửi bảng báo giá chi tiết kèm ưu đãi chốt sớm.');
+      } else if (behavior_analytics.web_clicks > 0 || behavior_analytics.max_scroll_pct >= 60) {
+        nextBestActions.push('Gửi Case Study thực tế đúng sản phẩm đang xem qua Zalo/Email và hẹn lịch Demo 1-1.');
+      } else {
+        nextBestActions.push('Đưa vào Automation Flow nuôi dưỡng 3 bước (Giá trị → Case Study → Ưu đãi dùng thử).');
+      }
+      if (lead.phone) {
+        nextBestActions.push('Kết nối Zalo ZNS / Gọi tư vấn trực tiếp để xác nhận nhu cầu & ngân sách.');
+      } else if (lead.email) {
+        nextBestActions.push('Gửi Email cá nhân hóa kèm nút đặt lịch tư vấn để thu thập thêm SĐT.');
+      }
+
+      const recommendedChannel =
+        behavior_analytics.social_messages > 0
+          ? 'Social Chat (Zalo/Messenger)'
+          : lead.phone && intentLevel === 'very_high'
+            ? 'Gọi trực tiếp + Zalo ZNS'
+            : lead.email
+              ? 'Email cá nhân hóa'
+              : 'Zalo OA / SMS';
+
+      let summary = `Khách hàng ${lead.name} đạt điểm hành vi ${score}/100 (${intentLabel} — ${personaTag}). ${attributionInsight}`;
+      let aiMarkdown: string | null = null;
+      let sourceMode: 'gemini_byok' | 'deterministic_engine' = 'deterministic_engine';
+
+      const canCallGemini =
+        aiUserBehaviorEnabled &&
+        aiCfg.aiLeadEvalEnabled !== false &&
+        Boolean(aiCfg.apiKey) &&
+        process.env.OUTBOUND_SILENT_MODE !== 'true';
+
+      if (canCallGemini) {
+        try {
+          const aiRes = await executeSharedGeminiAnalysis(
+            aiCfg.apiKey,
+            aiCfg.model || 'gemini-2.5-flash',
+            'lead',
+            {
+              contact_name: lead.name,
+              stage_name: lead.stage_name || lead.lifecycle_stage,
+              lead_score: lead.lead_score,
+              product_interest: lead.product_interest,
+              ad_attribution,
+              behavior_analytics,
+            },
+            'Phân tích hành vi người dùng (Web Scroll, CTA Clicks, Pricing Intent, Email, Social) và nguồn Quảng cáo của khách hàng này bằng tiếng Việt ngắn gọn, đưa ra chân dung ý định mua và 3 hành động chốt đơn ngay lập tức.'
+          );
+          if (aiRes && aiRes.success && aiRes.data?.plain_text && aiRes.data.plain_text.trim().length > 20) {
+            const text = aiRes.data.plain_text.trim();
+            aiMarkdown = text;
+            summary = text.split('\n').find((l) => l.trim().length > 20)?.replace(/^#+\s*/, '') || summary;
+            sourceMode = 'gemini_byok';
+          }
+        } catch {
+          // Graceful fallback to deterministic behavioral insights
+        }
+      }
+
+      res.json({
+        success: true,
+        data: {
+          contact_id: contactId,
+          engagement_score: score,
+          intent_level: intentLevel,
+          intent_label: intentLabel,
+          persona_tag: personaTag,
+          summary,
+          ai_markdown: aiMarkdown,
+          behavioral_signals: behavioralSignals,
+          attribution_insight: attributionInsight,
+          next_best_actions: nextBestActions,
+          recommended_channel: recommendedChannel,
+          source: sourceMode,
+          ai_enabled: aiUserBehaviorEnabled,
+          analyzed_at: new Date().toISOString(),
+        },
+      });
+    } catch (err: any) {
+      sendApiError(
+        res,
+        500,
+        'CRM_CONTACT_AI_PROFILE_FAILED',
+        err?.message || 'Không thể phân tích AI hành vi khách hàng.'
       );
     }
   }
@@ -1355,80 +2116,82 @@ contacts360Router.get(
         if (leadRes.rows.length === 0) return null;
         const lead = leadRes.rows[0];
 
+        let spSeq = 0;
         const safeQuery = async (sql: string, params: unknown[]) => {
+          const sp = `sp_omni_${++spSeq}`;
+          const isMaria = client.dialect === 'mariadb';
           try {
+            if (!isMaria) await client.query(`SAVEPOINT ${sp}`);
             const r = await client.query(sql, params);
+            if (!isMaria) await client.query(`RELEASE SAVEPOINT ${sp}`);
             return r.rows;
           } catch {
+            if (!isMaria) {
+              try {
+                await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+                await client.query(`RELEASE SAVEPOINT ${sp}`);
+              } catch {
+                // ignore rollback errors
+              }
+            }
             return [];
           }
         };
 
-        const [
-          emailClaims,
-          flowEnrollments,
-          surveyResponses,
-          voucherCodes,
-          webSessions,
-          socialConversations,
-          availableFlows,
-          availableVouchers,
-        ] = await Promise.all([
-          safeQuery(
-            `SELECT sc.id, sc.channel, sc.status, sc.sent_at, sc.opened_at, sc.clicked_at, c.name AS campaign_name
-             FROM mkt_send_claims sc
-             LEFT JOIN mkt_campaigns c ON c.tenant_id = sc.tenant_id AND c.id = sc.campaign_id
-             WHERE sc.tenant_id = $1 AND sc.lead_id = $2
-             ORDER BY sc.claimed_at DESC LIMIT 50`,
-            [ctx.tenantId, contactId]
-          ),
-          safeQuery(
-            `SELECT fe.id, fe.flow_id, fe.status, fe.current_step_id, fe.enrolled_at, fe.completed_at, f.name AS flow_name
-             FROM mkt_flow_enrollments fe
-             LEFT JOIN mkt_flows f ON f.tenant_id = fe.tenant_id AND f.id = fe.flow_id
-             WHERE fe.tenant_id = $1 AND fe.lead_id = $2
-             ORDER BY fe.enrolled_at DESC LIMIT 50`,
-            [ctx.tenantId, contactId]
-          ),
-          safeQuery(
-            `SELECT sr.id, sr.survey_id, sr.quiz_score, sr.nps_score, sr.answers_json, sr.created_at, s.title AS survey_title
-             FROM mkt_survey_responses sr
-             LEFT JOIN mkt_surveys s ON s.tenant_id = sr.tenant_id AND s.id = sr.survey_id
-             WHERE sr.tenant_id = $1 AND sr.lead_id = $2
-             ORDER BY sr.created_at DESC LIMIT 50`,
-            [ctx.tenantId, contactId]
-          ),
-          safeQuery(
-            `SELECT vc.id, vc.code, vc.status, vc.claimed_at, vc.redeemed_at, camp.name AS campaign_name, camp.discount_value
-             FROM mkt_voucher_codes vc
-             LEFT JOIN mkt_voucher_campaigns camp ON camp.tenant_id = vc.tenant_id AND camp.id = vc.campaign_id
-             WHERE vc.tenant_id = $1 AND vc.assigned_lead_id = $2
-             ORDER BY vc.created_at DESC LIMIT 50`,
-            [ctx.tenantId, contactId]
-          ),
-          safeQuery(
-            `SELECT id, visitor_id, landing_page, referrer, utm_source, utm_medium, utm_campaign, pageviews_count, duration_seconds, started_at
-             FROM mkt_web_sessions
-             WHERE tenant_id = $1 AND lead_id = $2
-             ORDER BY started_at DESC LIMIT 50`,
-            [ctx.tenantId, contactId]
-          ),
-          safeQuery(
-            `SELECT id, channel, external_user_name, status, last_message_preview, last_message_at
-             FROM mkt_social_conversations
-             WHERE tenant_id = $1 AND lead_id = $2
-             ORDER BY last_message_at DESC LIMIT 30`,
-            [ctx.tenantId, contactId]
-          ),
-          safeQuery(
-            "SELECT id, name, status FROM mkt_flows WHERE tenant_id = $1 AND status IN ('active', 'draft') ORDER BY created_at DESC LIMIT 50",
-            [ctx.tenantId]
-          ),
-          safeQuery(
-            'SELECT id, name, discount_type, discount_value FROM mkt_voucher_campaigns WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 50',
-            [ctx.tenantId]
-          ),
-        ]);
+        const emailClaims = await safeQuery(
+          `SELECT sc.id, sc.channel, sc.status, sc.sent_at, sc.opened_at, sc.clicked_at, c.name AS campaign_name
+           FROM mkt_send_claims sc
+           LEFT JOIN mkt_campaigns c ON c.tenant_id = sc.tenant_id AND c.id = sc.campaign_id
+           WHERE sc.tenant_id = $1 AND sc.lead_id = $2
+           ORDER BY sc.claimed_at DESC LIMIT 50`,
+          [ctx.tenantId, contactId]
+        );
+        const flowEnrollments = await safeQuery(
+          `SELECT fe.id, fe.flow_id, fe.status, fe.current_step_id, fe.enrolled_at, fe.completed_at, f.name AS flow_name
+           FROM mkt_flow_enrollments fe
+           LEFT JOIN mkt_flows f ON f.tenant_id = fe.tenant_id AND f.id = fe.flow_id
+           WHERE fe.tenant_id = $1 AND fe.lead_id = $2
+           ORDER BY fe.enrolled_at DESC LIMIT 50`,
+          [ctx.tenantId, contactId]
+        );
+        const surveyResponses = await safeQuery(
+          `SELECT sr.id, sr.survey_id, sr.quiz_score, sr.nps_score, sr.answers_json, sr.created_at, s.title AS survey_title
+           FROM mkt_survey_responses sr
+           LEFT JOIN mkt_surveys s ON s.tenant_id = sr.tenant_id AND s.id = sr.survey_id
+           WHERE sr.tenant_id = $1 AND sr.lead_id = $2
+           ORDER BY sr.created_at DESC LIMIT 50`,
+          [ctx.tenantId, contactId]
+        );
+        const voucherCodes = await safeQuery(
+          `SELECT vc.id, vc.code, vc.status, vc.claimed_at, vc.redeemed_at, camp.name AS campaign_name, camp.discount_value
+           FROM mkt_voucher_codes vc
+           LEFT JOIN mkt_voucher_campaigns camp ON camp.tenant_id = vc.tenant_id AND camp.id = vc.voucher_campaign_id
+           WHERE vc.tenant_id = $1 AND vc.lead_id = $2
+           ORDER BY vc.created_at DESC LIMIT 50`,
+          [ctx.tenantId, contactId]
+        );
+        const webSessions = await safeQuery(
+          `SELECT id, visitor_token AS visitor_id, entry_url AS landing_page, referrer, utm_source, utm_medium, utm_campaign, pageviews_count, duration_seconds, started_at
+           FROM mkt_web_sessions
+           WHERE tenant_id = $1 AND lead_id = $2
+           ORDER BY started_at DESC LIMIT 50`,
+          [ctx.tenantId, contactId]
+        );
+        const socialConversations = await safeQuery(
+          `SELECT id, channel, customer_name AS external_user_name, status, last_message_preview, last_message_at
+           FROM mkt_social_conversations
+           WHERE tenant_id = $1 AND lead_id = $2
+           ORDER BY last_message_at DESC LIMIT 30`,
+          [ctx.tenantId, contactId]
+        );
+        const availableFlows = await safeQuery(
+          "SELECT id, name, status FROM mkt_flows WHERE tenant_id = $1 AND status IN ('active', 'draft') ORDER BY created_at DESC LIMIT 50",
+          [ctx.tenantId]
+        );
+        const availableVouchers = await safeQuery(
+          'SELECT id, name, discount_type, discount_value FROM mkt_voucher_campaigns WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 50',
+          [ctx.tenantId]
+        );
 
         const filledFields = [
           lead.name,
@@ -1543,15 +2306,38 @@ contacts360Router.post(
         return { event_id: evtId, flow_name: flowName };
       });
 
+      const flowIdRaw = String(req.body?.flow_id || '').trim();
+      const validFlowId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(flowIdRaw)
+        ? flowIdRaw
+        : null;
+
+      let flowExecution: Record<string, unknown> | null = null;
+      if (validFlowId) {
+        try {
+          flowExecution = await executeFlowForLead(ctx.tenantId, validFlowId, contactId, {
+            actorId: ctx.userId,
+          });
+        } catch {
+          flowExecution = null;
+        }
+      }
+
       emitDomainEventDetached('marketing.engaged', {
         tenantId: ctx.tenantId,
         leadId: contactId,
         engagementType: 'flow_manual_enroll',
         channel: 'email',
         scoreDelta: 5,
+        metadata: { flowId: validFlowId || undefined, flowName },
       });
 
-      res.status(201).json({ success: true, data: result });
+      res.status(201).json({
+        success: true,
+        data: {
+          ...result,
+          ...(flowExecution ? { enrollment_id: flowExecution.enrollmentId, flow_status: flowExecution.status } : {}),
+        },
+      });
     } catch (err: any) {
       sendApiError(res, 500, 'CRM_FLOW_ENROLL_FAILED', err?.message || 'Không thể đưa khách hàng vào kịch bản.');
     }

@@ -58,11 +58,50 @@ function isValidUuid(val: unknown): boolean {
   return typeof val === 'string' && UUID_PATTERN.test(val.trim());
 }
 
+function isStandaloneMarketingPackage(resolved: ResolvedUserRbacResult): boolean {
+  const hasMkt =
+    hasModuleEntitlement(resolved.enabledModules, 'dom_marketing_copilot') ||
+    hasModuleEntitlement(resolved.enabledModules, 'mkt_ai_bot') ||
+    hasModuleEntitlement(resolved.enabledModules, 'mkt_campaigns') ||
+    hasModuleEntitlement(resolved.enabledModules, 'audiences');
+  const hasPromax = hasModuleEntitlement(resolved.enabledModules, 'dom_agent');
+  return hasMkt && !hasPromax;
+}
+
 function canCallerManageDomAgent(resolved: ResolvedUserRbacResult): boolean {
   if (resolved.userOrg?.is_tenant_owner) return true;
   if (resolved.effectivePermissions.settings?.actions.manage_config) return true;
   if (resolved.effectivePermissions.org_rbac?.actions.manage_config) return true;
   if (resolved.effectivePermissions.dom_agent?.actions.manage_config) return true;
+  if (resolved.effectivePermissions.dom_marketing_copilot?.actions.manage_config) return true;
+  if (resolved.effectivePermissions.mkt_ai_bot?.actions.manage_config) return true;
+  const role = String(resolved.userOrg?.role || '').trim().toLowerCase();
+  if (
+    isStandaloneMarketingPackage(resolved) &&
+    ['admin', 'tenant_admin', 'owner', 'superadmin', 'super_admin', 'manager'].includes(role)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function canCallerManageKnowledge(resolved: ResolvedUserRbacResult): boolean {
+  if (canCallerManageDomAgent(resolved)) return true;
+  if (resolved.effectivePermissions.dom_agent?.actions.create) return true;
+  if (resolved.effectivePermissions.dom_agent?.actions.edit) return true;
+  if (resolved.effectivePermissions.mkt_ai_bot?.actions.edit) return true;
+  if (resolved.effectivePermissions.mkt_ai_bot?.actions.create) return true;
+  if (resolved.effectivePermissions.mkt_social_bot?.actions.edit) return true;
+  if (resolved.effectivePermissions.mkt_social_bot?.actions.create) return true;
+  if (resolved.effectivePermissions.dom_marketing_copilot?.actions.edit) return true;
+  if (resolved.effectivePermissions.dom_marketing_copilot?.actions.create) return true;
+  const role = String(resolved.userOrg?.role || '').trim().toLowerCase();
+  if (
+    isStandaloneMarketingPackage(resolved) &&
+    ['admin', 'tenant_admin', 'owner', 'superadmin', 'super_admin', 'manager'].includes(role)
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -74,6 +113,16 @@ function canCallerUseDomAgentCopilot(resolved: ResolvedUserRbacResult): boolean 
     'dom_marketing_copilot',
     'leads',
     'audiences',
+    'mkt_campaigns',
+    'mkt_flows',
+    'mkt_ai_bot',
+    'mkt_social_bot',
+    'mkt_templates',
+    'mkt_forms',
+    'mkt_surveys',
+    'mkt_vouchers',
+    'mkt_web_tracking',
+    'dashboard_marketing',
   ];
   return candidateModules.some((k) => {
     const perm = resolved.effectivePermissions[k];
@@ -161,8 +210,9 @@ domAgentRouter.get('/bootstrap', async (_req, res) => {
       const tools = listDomAgentToolsForCaller(resolvedRbac);
 
       const canManage = canCallerManageDomAgent(resolvedRbac);
+      const canManageKnowledge = canCallerManageKnowledge(resolvedRbac);
       const visibleDocs = docsRes.rows
-        .filter((d) => canManage || canCallerAccessKnowledgeDoc(d.allowed_department_ids, resolvedRbac.userOrg))
+        .filter((d) => canManageKnowledge || canCallerAccessKnowledgeDoc(d.allowed_department_ids, resolvedRbac.userOrg))
         .map((d) => ({
           ...d,
           allowed_department_ids: parseJsonArray<string>(d.allowed_department_ids),
@@ -202,6 +252,7 @@ domAgentRouter.get('/bootstrap', async (_req, res) => {
         package_info: entSnap.package_info,
         terminology: entSnap.terminology,
         can_manage_agent: canManage,
+        can_manage_knowledge: canManageKnowledge,
         caller_department_id: resolvedRbac.userOrg?.department_id || null,
         specialists,
         tools,
@@ -878,7 +929,7 @@ domAgentRouter.get('/knowledge', async (_req, res) => {
     const ctx = getTenantContext();
     const docs = await withTenantTransaction(ctx.tenantId, async (client) => {
       const resolved = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
-      const canManage = canCallerManageDomAgent(resolved);
+      const canManageKnowledge = canCallerManageKnowledge(resolved);
       const r = await client.query(
         `SELECT * FROM tenant_ai_knowledge_docs
          WHERE tenant_id = $1
@@ -886,7 +937,7 @@ domAgentRouter.get('/knowledge', async (_req, res) => {
         [ctx.tenantId]
       );
       return r.rows
-        .filter((d) => canManage || canCallerAccessKnowledgeDoc(d.allowed_department_ids, resolved.userOrg))
+        .filter((d) => canManageKnowledge || canCallerAccessKnowledgeDoc(d.allowed_department_ids, resolved.userOrg))
         .map((d) => ({
           ...d,
           allowed_department_ids: parseJsonArray<string>(d.allowed_department_ids),
@@ -911,10 +962,7 @@ domAgentRouter.post('/knowledge', async (req, res) => {
 
     const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
       const resolved = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
-      const canCreate =
-        canCallerManageDomAgent(resolved) ||
-        Boolean(resolved.effectivePermissions.dom_agent?.actions.create);
-      if (!canCreate) {
+      if (!canCallerManageKnowledge(resolved)) {
         return { forbidden: true as const };
       }
       const doc = await upsertKnowledgeDocInTx(client, ctx.tenantId, ctx.userId, {
@@ -953,7 +1001,7 @@ const updateKnowledgeHandler = async (req: any, res: any) => {
     const b = req.body || {};
     const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
       const resolved = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
-      if (!canCallerManageDomAgent(resolved)) {
+      if (!canCallerManageKnowledge(resolved)) {
         return { status: 403 as const };
       }
       const existingRes = await client.query(
@@ -1012,7 +1060,7 @@ domAgentRouter.delete('/knowledge/:id', async (req, res) => {
     const ctx = getTenantContext();
     const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
       const resolved = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
-      if (!canCallerManageDomAgent(resolved)) {
+      if (!canCallerManageKnowledge(resolved)) {
         return { status: 403 as const };
       }
       const del = await client.query(
@@ -1049,7 +1097,7 @@ domAgentRouter.post('/knowledge/sync-policies', async (req, res) => {
 
     const outcome = await withTenantTransaction(ctx.tenantId, async (client) => {
       const resolved = await resolveUserEffectivePermissions(client, ctx.tenantId, ctx.userId);
-      if (!canCallerManageDomAgent(resolved)) {
+      if (!canCallerManageKnowledge(resolved)) {
         return { forbidden: true as const };
       }
       const synced = await syncPolicyDocumentsToKnowledgeInTx(client, ctx.tenantId, ctx.userId, {

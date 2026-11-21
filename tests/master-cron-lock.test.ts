@@ -200,7 +200,7 @@ describe('Milestone 1: Standalone Unified Master Cron & 6 DB-Backed Subroutines'
     assert.ok(runRes.stats.zaloRefreshedCount >= 1, 'Must refresh the token expiring in 2 hours');
   });
 
-  it('5. Subroutine D: Subscription & Trial Expiry Manager suspends expired tenants with zero wallet balance', async () => {
+  it('5. Subroutine D: Subscription & Trial Expiry Manager transitions expired zero-balance tenants active -> grace -> suspended', async () => {
     let expiredZeroTenantId = '';
     const expSlug = `exp-zero-${Date.now().toString(36)}`;
 
@@ -215,13 +215,34 @@ describe('Milestone 1: Standalone Unified Master Cron & 6 DB-Backed Subroutines'
     });
 
     try {
-      const runRes = await executeMasterCron({ subroutines: ['billing'], tenantId: expiredZeroTenantId });
-      assert.equal(runRes.locked, false);
-      assert.ok(runRes.stats.subscriptionsProcessed >= 1);
+      // Tick 1: active -> grace (grace_ends_at > now)
+      const runRes1 = await executeMasterCron({ subroutines: ['billing'], tenantId: expiredZeroTenantId });
+      assert.equal(runRes1.locked, false);
+      assert.ok(runRes1.stats.subscriptionsProcessed >= 1);
+
+      await withSystemPrivilege(async (client) => {
+        const t = await client.query<{ status: string; grace_ends_at: string | null }>(
+          'SELECT status, grace_ends_at FROM tenants WHERE id = $1',
+          [expiredZeroTenantId]
+        );
+        assert.equal(t.rows[0].status, 'grace', 'Expired zero-balance tenant must enter grace period first');
+        assert.ok(t.rows[0].grace_ends_at, 'grace_ends_at must be populated');
+
+        // Fast-forward grace_ends_at into the past
+        await client.query(
+          "UPDATE tenants SET grace_ends_at = clock_timestamp() - INTERVAL '1 hour' WHERE id = $1",
+          [expiredZeroTenantId]
+        );
+      });
+
+      // Tick 2: grace -> suspended
+      const runRes2 = await executeMasterCron({ subroutines: ['billing'], tenantId: expiredZeroTenantId });
+      assert.equal(runRes2.locked, false);
+      assert.ok(runRes2.stats.subscriptionsProcessed >= 1);
 
       await withSystemPrivilege(async (client) => {
         const t = await client.query<{ status: string }>('SELECT status FROM tenants WHERE id = $1', [expiredZeroTenantId]);
-        assert.equal(t.rows[0].status, 'suspended', 'Must suspend expired tenant without wallet balance');
+        assert.equal(t.rows[0].status, 'suspended', 'Must suspend tenant once grace_ends_at expires');
       });
     } finally {
       await withSystemPrivilege(async (client) => {

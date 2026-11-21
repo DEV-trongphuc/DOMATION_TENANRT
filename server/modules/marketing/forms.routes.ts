@@ -15,6 +15,7 @@ import {
   canUserUnmaskMarketingPii,
   generatePublicToken,
   parseJsonCol,
+  resolvePublicRequestOrigin,
   slugifyMarketingKey,
 } from './utils.ts';
 
@@ -33,6 +34,12 @@ export interface FormFieldSchemaDto {
 }
 
 function mapFormRow(row: Record<string, unknown>) {
+  const targetAudienceId = row.target_audience_id ? String(row.target_audience_id) : null;
+  const targetAudienceName = row.target_audience_name ? String(row.target_audience_name) : null;
+  const submissionCount = Math.max(
+    Number(row.submission_count || 0),
+    Number(row.computed_submission_count || 0)
+  );
   return {
     id: String(row.id),
     tenant_id: String(row.tenant_id),
@@ -41,8 +48,11 @@ function mapFormRow(row: Record<string, unknown>) {
     public_token: String(row.public_token || ''),
     status: String(row.status || 'active'),
     routing_mode: String(row.routing_mode || 'marketing_nurture') as 'marketing_nurture' | 'sale_round',
-    target_audience_id: row.target_audience_id ? String(row.target_audience_id) : null,
-    target_audience_name: row.target_audience_name ? String(row.target_audience_name) : null,
+    target_audience_id: targetAudienceId,
+    target_audience_name: targetAudienceName,
+    targetListId: targetAudienceId,
+    target_list_id: targetAudienceId,
+    targetListName: targetAudienceName,
     distribution_round_id: row.distribution_round_id ? String(row.distribution_round_id) : null,
     distribution_round_name: row.distribution_round_name ? String(row.distribution_round_name) : null,
     require_otp: Boolean(row.require_otp),
@@ -50,7 +60,11 @@ function mapFormRow(row: Record<string, unknown>) {
     fields: parseJsonCol<FormFieldSchemaDto[]>(row.fields_json, []),
     theme: parseJsonCol<Record<string, unknown>>(row.theme_json, {}),
     thank_you: parseJsonCol<Record<string, unknown>>(row.thank_you_json, {}),
-    submission_count: Number(row.submission_count || 0),
+    submission_count: submissionCount,
+    submissionCount,
+    stats: {
+      submissions: submissionCount,
+    },
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -142,7 +156,7 @@ formsRouter.get('/', requirePermission('mkt_forms', 'view'), async (_req, res) =
   try {
     const ctx = getTenantContext();
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const [formsRes, audRes, roundsRes, eventsRes, otpStatsRes] = await Promise.all([
+      const [formsRes, subCountsRes, leadFormCountsRes, audRes, roundsRes, eventsRes, otpStatsRes] = await Promise.all([
         client.query(
           `SELECT f.*,
                   a.name AS target_audience_name,
@@ -152,6 +166,20 @@ formsRouter.get('/', requirePermission('mkt_forms', 'view'), async (_req, res) =
            LEFT JOIN distribution_rounds r ON r.tenant_id = f.tenant_id AND r.id = f.distribution_round_id
            WHERE f.tenant_id = $1 AND f.status != 'archived'
            ORDER BY f.created_at DESC`,
+          [ctx.tenantId]
+        ),
+        client.query<{ form_id: string; cnt: number }>(
+          `SELECT form_id, COUNT(*)::int AS cnt
+           FROM mkt_form_submissions
+           WHERE tenant_id = $1
+           GROUP BY form_id`,
+          [ctx.tenantId]
+        ),
+        client.query<{ form_key: string; cnt: number }>(
+          `SELECT form_id AS form_key, COUNT(*)::int AS cnt
+           FROM leads
+           WHERE tenant_id = $1 AND is_deleted = false AND form_id IS NOT NULL AND form_id != ''
+           GROUP BY form_id`,
           [ctx.tenantId]
         ),
         client.query(
@@ -183,8 +211,32 @@ formsRouter.get('/', requirePermission('mkt_forms', 'view'), async (_req, res) =
         ),
       ]);
 
+      const subCountByFormId = new Map<string, number>();
+      for (const r of subCountsRes.rows) {
+        if (r.form_id) subCountByFormId.set(String(r.form_id), Number(r.cnt || 0));
+      }
+      const leadCountByFormKey = new Map<string, number>();
+      for (const r of leadFormCountsRes.rows) {
+        const k = String(r.form_key || '').trim();
+        if (k) leadCountByFormKey.set(k.toLowerCase(), (leadCountByFormKey.get(k.toLowerCase()) || 0) + Number(r.cnt || 0));
+      }
+
+      const items = formsRes.rows.map((row) => {
+        const fId = String(row.id || '');
+        const fName = String(row.name || '').trim().toLowerCase();
+        const themeMeta = parseJsonCol<Record<string, unknown>>(row.theme_json, {});
+        const legacyId = themeMeta?.legacy_form_id ? String(themeMeta.legacy_form_id).trim().toLowerCase() : '';
+        const computedSub = Math.max(
+          subCountByFormId.get(fId) || 0,
+          leadCountByFormKey.get(fId.toLowerCase()) || 0,
+          fName ? leadCountByFormKey.get(fName) || 0 : 0,
+          legacyId ? leadCountByFormKey.get(legacyId) || 0 : 0
+        );
+        return mapFormRow({ ...row, computed_submission_count: computedSub });
+      });
+
       return {
-        items: formsRes.rows.map(mapFormRow),
+        items,
         audiences: audRes.rows,
         rounds: roundsRes.rows,
         events: eventsRes.rows.map((ev) => ({
@@ -223,9 +275,11 @@ formsRouter.post('/', requirePermission('mkt_forms', 'create'), async (req, res)
           { id: 'f_phone', key: 'phone', label: 'Số điện thoại', type: 'phone', required: true, placeholder: '0909...' },
         ];
 
-    const hasContactField = rawFields.some(
-      (f) => f.key === 'phone' || f.type === 'phone' || f.key === 'email' || f.type === 'email'
-    );
+    const hasContactField = rawFields.some((f: any) => {
+      const k = String(f?.key || f?.dbField || '').toLowerCase();
+      const t = String(f?.type || '').toLowerCase();
+      return k === 'phone' || k === 'phonenumber' || t === 'phone' || t === 'tel' || k === 'email' || t === 'email';
+    });
     if (!hasContactField) {
       sendApiError(
         res,
@@ -237,7 +291,8 @@ formsRouter.post('/', requirePermission('mkt_forms', 'create'), async (req, res)
     }
 
     const routingMode = req.body?.routing_mode === 'sale_round' ? 'sale_round' : 'marketing_nurture';
-    const targetAudienceId = req.body?.target_audience_id ? String(req.body.target_audience_id) : null;
+    const rawTargetAud = req.body?.target_audience_id ?? req.body?.targetListId ?? req.body?.target_list_id;
+    const targetAudienceId = rawTargetAud ? String(rawTargetAud) : null;
     const distributionRoundId = req.body?.distribution_round_id ? String(req.body.distribution_round_id) : null;
     const requireOtp = Boolean(req.body?.require_otp);
     const otpChannel = req.body?.otp_channel === 'sms' ? 'sms' : 'email';
@@ -280,7 +335,14 @@ formsRouter.post('/', requirePermission('mkt_forms', 'create'), async (req, res)
           ctx.userId,
         ]
       );
-      const r = await client.query('SELECT * FROM mkt_forms WHERE tenant_id = $1 AND id = $2', [ctx.tenantId, id]);
+      const r = await client.query(
+        `SELECT f.*, a.name AS target_audience_name, r.name AS distribution_round_name
+         FROM mkt_forms f
+         LEFT JOIN tenant_audiences a ON a.tenant_id = f.tenant_id AND a.id = f.target_audience_id
+         LEFT JOIN distribution_rounds r ON r.tenant_id = f.tenant_id AND r.id = f.distribution_round_id
+         WHERE f.tenant_id = $1 AND f.id = $2`,
+        [ctx.tenantId, id]
+      );
       return mapFormRow(r.rows[0]);
     });
 
@@ -302,20 +364,34 @@ formsRouter.put('/:id', requirePermission('mkt_forms', 'edit'), async (req, res)
       const ex = exRes.rows[0];
       if (!ex) return null;
 
+      const routeHint = String(req.query?.route || req.body?.route || '').trim();
       const name = req.body?.name !== undefined ? String(req.body.name).trim() : String(ex.name);
       const description =
         req.body?.description !== undefined ? String(req.body.description).trim() : ex.description;
-      const status = req.body?.status !== undefined ? String(req.body.status) : String(ex.status);
+      const status =
+        routeHint === 'toggle_status' && req.body?.status === undefined
+          ? String(ex.status) === 'active'
+            ? 'inactive'
+            : 'active'
+          : req.body?.status !== undefined
+            ? String(req.body.status)
+            : String(ex.status);
       const routingMode =
         req.body?.routing_mode !== undefined
           ? req.body.routing_mode === 'sale_round'
             ? 'sale_round'
             : 'marketing_nurture'
           : String(ex.routing_mode);
-      const targetAudienceId =
+      const rawTargetAud =
         req.body?.target_audience_id !== undefined
           ? req.body.target_audience_id
-            ? String(req.body.target_audience_id)
+          : req.body?.targetListId !== undefined
+            ? req.body.targetListId
+            : req.body?.target_list_id;
+      const targetAudienceId =
+        rawTargetAud !== undefined
+          ? rawTargetAud
+            ? String(rawTargetAud)
             : null
           : ex.target_audience_id;
       const distributionRoundId =
@@ -376,10 +452,14 @@ formsRouter.put('/:id', requirePermission('mkt_forms', 'edit'), async (req, res)
         ]
       );
 
-      const r = await client.query('SELECT * FROM mkt_forms WHERE tenant_id = $1 AND id = $2', [
-        ctx.tenantId,
-        req.params.id,
-      ]);
+      const r = await client.query(
+        `SELECT f.*, a.name AS target_audience_name, r.name AS distribution_round_name
+         FROM mkt_forms f
+         LEFT JOIN tenant_audiences a ON a.tenant_id = f.tenant_id AND a.id = f.target_audience_id
+         LEFT JOIN distribution_rounds r ON r.tenant_id = f.tenant_id AND r.id = f.distribution_round_id
+         WHERE f.tenant_id = $1 AND f.id = $2`,
+        [ctx.tenantId, req.params.id]
+      );
       return mapFormRow(r.rows[0]);
     });
 
@@ -589,11 +669,12 @@ formsRouter.get('/:id/embed-config', requirePermission('mkt_forms', 'view'), asy
 
     const token = form.public_token;
     const primary = String((form.theme as Record<string, unknown>)?.primaryColor || '#1E40FF');
+    const publicOrigin = resolvePublicRequestOrigin(req, 'https://data.domation.net');
     const snippets = {
-      iframe: `<iframe src="https://app.domation.net/embed/form/${token}" width="100%" height="520" style="border:0;border-radius:16px;overflow:hidden;" loading="lazy"></iframe>`,
-      popup_modal: `<script src="https://app.domation.net/sdk/form-widget.js" data-form-token="${token}" data-mode="popup_modal" data-primary="${primary}" defer></script>`,
-      floating_bar: `<script src="https://app.domation.net/sdk/form-widget.js" data-form-token="${token}" data-mode="floating_bar" data-primary="${primary}" defer></script>`,
-      slide_in: `<script src="https://app.domation.net/sdk/form-widget.js" data-form-token="${token}" data-mode="slide_in" data-primary="${primary}" defer></script>`,
+      iframe: `<iframe src="${publicOrigin}/embed/form/${token}" width="100%" height="520" style="border:0;border-radius:16px;overflow:hidden;" loading="lazy"></iframe>`,
+      popup_modal: `<script src="${publicOrigin}/sdk/form-widget.js" data-form-token="${token}" data-mode="popup_modal" data-primary="${primary}" defer></script>`,
+      floating_bar: `<script src="${publicOrigin}/sdk/form-widget.js" data-form-token="${token}" data-mode="floating_bar" data-primary="${primary}" defer></script>`,
+      slide_in: `<script src="${publicOrigin}/sdk/form-widget.js" data-form-token="${token}" data-mode="slide_in" data-primary="${primary}" defer></script>`,
     };
 
     res.json({ success: true, data: { form, snippets } });
@@ -607,6 +688,12 @@ formsRouter.post('/events/:id/trigger', requirePermission('mkt_forms', 'create')
   try {
     const ctx = getTenantContext();
     const cfg = await getTenantSettingsCached(ctx.tenantId);
+    const phoneInput = req.body?.phone ? String(req.body.phone).trim() : '';
+    const emailInput = req.body?.email ? String(req.body.email).trim() : '';
+    if (!phoneInput && !emailInput) {
+      sendApiError(res, 422, 'CONTACT_REQUIRED', 'Vui lòng cung cấp ít nhất Số điện thoại hoặc Email để kích hoạt sự kiện.');
+      return;
+    }
     const amountVnd = Math.max(0, Math.round(Number(req.body?.amount_vnd || 0)));
 
     const txOut = await withTenantTransaction(ctx.tenantId, async (client) => {

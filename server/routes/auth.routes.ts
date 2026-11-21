@@ -9,6 +9,7 @@ import {
   signAccountToken,
   verifyAccountToken,
   verifyTenantAccessToken,
+  verifyTenantRefreshToken,
 } from '../core/crypto/jwt.ts';
 import { getTenantContext } from '../core/context/tenant-context.ts';
 import { tenantRedis } from '../core/cache/tenant-redis.ts';
@@ -47,6 +48,13 @@ export const authRouter = Router();
 const SLUG_REGEX = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function sanitizeAvatarUrl(raw: unknown): string | null {
+  const clean = String(raw || '').trim();
+  if (!clean || clean.length > 1024) return null;
+  if (/^https?:\/\//i.test(clean)) return clean;
+  return null;
+}
+
 function slugifyCompanyName(raw: string): string {
   const base = raw
     .normalize('NFD')
@@ -69,6 +77,7 @@ async function listWorkspacesForAccount(accountId: string | null, email: string)
       name: string;
       industry: string;
       plan_tier: 'starter' | 'growth' | 'enterprise';
+      package_code: string | null;
       status: string;
       trial_ends_at: string | null;
       subscription_expires_at: string | null;
@@ -76,20 +85,28 @@ async function listWorkspacesForAccount(accountId: string | null, email: string)
       billing_cycle: string | null;
       wallet_balance_vnd: string | number | null;
       crm_erp_upgrade_status: string | null;
+      grace_ends_at: string | null;
+      auto_renew: boolean | null;
+      cancel_at_period_end: boolean | null;
+      cancelled_at: string | null;
+      scheduled_plan_code: string | null;
+      scheduled_billing_cycle: string | null;
       settings: Record<string, unknown>;
       created_at: string;
       role: string;
       is_external_agency: boolean;
       profile_status: string | null;
     }>(
-      `SELECT t.id, t.slug, t.name, t.industry, t.plan_tier, t.status,
+      `SELECT t.id, t.slug, t.name, t.industry, t.plan_tier, t.package_code, t.status,
               t.trial_ends_at, t.subscription_expires_at, t.subscription_plan_code,
               t.billing_cycle, t.wallet_balance_vnd, t.crm_erp_upgrade_status,
+              t.grace_ends_at, t.auto_renew, t.cancel_at_period_end, t.cancelled_at,
+              t.scheduled_plan_code, t.scheduled_billing_cycle,
               t.settings, t.created_at, u.role, u.is_external_agency, p.status AS profile_status
        FROM tenants t
        INNER JOIN users u ON u.tenant_id = t.id
        LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
-       WHERE t.status IN ('active', 'trial')
+       WHERE t.status IN ('active', 'trial', 'grace')
          AND COALESCE(p.status, 'active') = 'active'
          AND (${accountId ? 'u.account_id = $1 OR ' : ''}LOWER(u.email) = ${accountId ? '$2' : '$1'})
        ORDER BY t.created_at DESC`,
@@ -120,9 +137,13 @@ async function listWorkspacesForAccount(accountId: string | null, email: string)
   });
 }
 
-function extractCallerIdentity(req: any): { email: string; accountId: string | null; name: string } | null {
+async function extractCallerIdentity(
+  req: any
+): Promise<{ email: string; accountId: string | null; name: string } | null> {
   const authHeader = String(req.header?.('Authorization') || '');
-  const bodyToken = String(req.body?.account_token || req.body?.google_provision_token || '').trim();
+  const bodyToken = String(
+    req.body?.account_token || req.body?.google_provision_token || req.body?.refresh_token || ''
+  ).trim();
   const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : bodyToken;
   if (!rawToken) return null;
 
@@ -136,8 +157,35 @@ function extractCallerIdentity(req: any): { email: string; accountId: string | n
     const claims = verifyTenantAccessToken(rawToken);
     return { email: claims.email.toLowerCase(), accountId: null, name: claims.name };
   } catch {
-    return null;
+    // Try Refresh JWT fallback
   }
+  const candidateRefresh = String(req.body?.refresh_token || rawToken).trim();
+  if (candidateRefresh) {
+    try {
+      const refClaims = verifyTenantRefreshToken(candidateRefresh);
+      const row = await withTenantTransaction(refClaims.tenantId, async (client) => {
+        const r = await client.query<{ email: string; full_name: string; account_id: string | null }>(
+          `SELECT u.email, u.full_name, u.account_id
+           FROM users u
+           LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
+           WHERE u.tenant_id = $1 AND u.id = $2 AND COALESCE(p.status, 'active') = 'active'
+           LIMIT 1`,
+          [refClaims.tenantId, refClaims.sub]
+        );
+        return r.rows[0] || null;
+      });
+      if (row?.email) {
+        return {
+          email: row.email.toLowerCase(),
+          accountId: row.account_id || null,
+          name: row.full_name || row.email.split('@')[0] || 'DOMATION User',
+        };
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 // 2.1 Check Tenant Slug Availability
@@ -381,6 +429,8 @@ authRouter.post(['/register', '/register-tenant'], async (req, res) => {
                    enabled_modules, entitlements, status,
                    trial_ends_at, subscription_expires_at, subscription_plan_code,
                    billing_cycle, wallet_balance_vnd, crm_erp_upgrade_status,
+                   grace_ends_at, auto_renew, cancel_at_period_end, cancelled_at,
+                   scheduled_plan_code, scheduled_billing_cycle,
                    settings, created_at`,
         [
           tenantId,
@@ -443,6 +493,7 @@ authRouter.post(['/register', '/register-tenant'], async (req, res) => {
 
     tenantRedis.setCachedTenantMeta(provisioned.tenant.id, {
       slug: provisioned.tenant.slug,
+      name: provisioned.tenant.name,
       status: provisioned.tenant.status,
       rawSettings: provisioned.tenant.settings as unknown as Record<string, unknown>,
       normalizedSettings: provisioned.tenant.settings,
@@ -552,6 +603,7 @@ authRouter.post('/login', async (req, res) => {
           domain: string | null;
           industry: string;
           plan_tier: 'starter' | 'growth' | 'enterprise';
+          package_code: string | null;
           status: string;
           trial_ends_at: string | null;
           subscription_expires_at: string | null;
@@ -559,12 +611,20 @@ authRouter.post('/login', async (req, res) => {
           billing_cycle: string | null;
           wallet_balance_vnd: string | number | null;
           crm_erp_upgrade_status: string | null;
+          grace_ends_at: string | null;
+          auto_renew: boolean | null;
+          cancel_at_period_end: boolean | null;
+          cancelled_at: string | null;
+          scheduled_plan_code: string | null;
+          scheduled_billing_cycle: string | null;
           settings: Record<string, unknown>;
           created_at: string;
         }>(
-          `SELECT id, slug, obfuscated_slug, name, domain, industry, plan_tier, status,
+          `SELECT id, slug, obfuscated_slug, name, domain, industry, package_code, plan_tier, status,
                   trial_ends_at, subscription_expires_at, subscription_plan_code,
                   billing_cycle, wallet_balance_vnd, crm_erp_upgrade_status,
+                  grace_ends_at, auto_renew, cancel_at_period_end, cancelled_at,
+                  scheduled_plan_code, scheduled_billing_cycle,
                   settings, created_at
            FROM tenants WHERE obfuscated_slug = $1 OR slug = $1 LIMIT 1`,
           [requestedSlug]
@@ -579,6 +639,7 @@ authRouter.post('/login', async (req, res) => {
         domain: string | null;
         industry: string;
         plan_tier: 'starter' | 'growth' | 'enterprise';
+        package_code: string | null;
         status: string;
         trial_ends_at: string | null;
         subscription_expires_at: string | null;
@@ -586,12 +647,20 @@ authRouter.post('/login', async (req, res) => {
         billing_cycle: string | null;
         wallet_balance_vnd: string | number | null;
         crm_erp_upgrade_status: string | null;
+        grace_ends_at: string | null;
+        auto_renew: boolean | null;
+        cancel_at_period_end: boolean | null;
+        cancelled_at: string | null;
+        scheduled_plan_code: string | null;
+        scheduled_billing_cycle: string | null;
         settings: Record<string, unknown>;
         created_at: string;
       }>(
-        `SELECT t.id, t.slug, t.name, t.domain, t.industry, t.plan_tier, t.status,
+        `SELECT t.id, t.slug, t.name, t.domain, t.industry, t.package_code, t.plan_tier, t.status,
                 t.trial_ends_at, t.subscription_expires_at, t.subscription_plan_code,
                 t.billing_cycle, t.wallet_balance_vnd, t.crm_erp_upgrade_status,
+                t.grace_ends_at, t.auto_renew, t.cancel_at_period_end, t.cancelled_at,
+                t.scheduled_plan_code, t.scheduled_billing_cycle,
                 t.settings, t.created_at
          FROM tenants t
          INNER JOIN users u ON u.tenant_id = t.id
@@ -756,6 +825,7 @@ authRouter.post('/login', async (req, res) => {
     const normalizedSettings = normalizeTenantSettings(targetTenant.settings);
     tenantRedis.setCachedTenantMeta(targetTenant.id, {
       slug: targetTenant.slug,
+      name: targetTenant.name,
       status: targetTenant.status,
       rawSettings: targetTenant.settings,
       normalizedSettings,
@@ -833,6 +903,7 @@ authRouter.post('/login', async (req, res) => {
           domain: targetTenant.domain,
           industry: targetTenant.industry,
           plan_tier: targetTenant.plan_tier,
+          package_code: targetTenant.package_code || targetTenant.plan_tier,
           status: targetTenant.status,
           trial_ends_at: targetTenant.trial_ends_at,
           subscription_expires_at: targetTenant.subscription_expires_at,
@@ -893,7 +964,7 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
 
     let googleEmail = '';
     let googleName = '';
-    let googleAvatar: string | null = rawAvatar ? String(rawAvatar).trim() : null;
+    let googleAvatar: string | null = sanitizeAvatarUrl(rawAvatar);
 
     if (tokenInput) {
       const parts = tokenInput.split('.');
@@ -915,7 +986,7 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
           }
           googleEmail = String(info.email || '').trim().toLowerCase();
           googleName = String(info.name || googleEmail.split('@')[0] || 'DOMATION User').trim();
-          googleAvatar = info.picture ? String(info.picture) : googleAvatar;
+          googleAvatar = sanitizeAvatarUrl(info.picture) || googleAvatar;
         } else {
           try {
             let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
@@ -923,7 +994,7 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
             const decoded = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')) as Record<string, any>;
             googleEmail = String(decoded.email || rawEmail || '').trim().toLowerCase();
             googleName = String(decoded.name || rawName || googleEmail.split('@')[0] || 'DOMATION User').trim();
-            googleAvatar = decoded.picture ? String(decoded.picture) : googleAvatar;
+            googleAvatar = sanitizeAvatarUrl(decoded.picture) || googleAvatar;
           } catch {
             sendApiError(res, 422, 'INVALID_GOOGLE_TOKEN', 'Token Google không hợp lệ.');
             return;
@@ -940,27 +1011,82 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
       return;
     }
 
+    const emailLocalLower = (googleEmail.split('@')[0] || '').toLowerCase();
+
     const gaRecord = await withSystemPrivilege(async (client) => {
-      const existing = await client.query<{ id: string; full_name: string; is_active: boolean }>(
-        'SELECT id, full_name, is_active FROM global_accounts WHERE LOWER(email) = $1 LIMIT 1',
+      const existing = await client.query<{
+        id: string;
+        full_name: string;
+        avatar_url: string | null;
+        is_active: boolean;
+      }>(
+        'SELECT id, full_name, avatar_url, is_active FROM global_accounts WHERE LOWER(email) = $1 LIMIT 1',
         [googleEmail]
       );
+      let gaRow: {
+        id: string;
+        full_name: string;
+        avatar_url: string | null;
+        is_active: boolean;
+      };
       if (existing.rows[0]) {
-        await client.query(
-          'UPDATE global_accounts SET last_login_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = $1',
-          [existing.rows[0].id]
+        const upd = await client.query<{
+          id: string;
+          full_name: string;
+          avatar_url: string | null;
+          is_active: boolean;
+        }>(
+          `UPDATE global_accounts
+           SET avatar_url = COALESCE(NULLIF($2, ''), avatar_url),
+               full_name = CASE
+                 WHEN COALESCE(TRIM(full_name), '') = '' OR LOWER(TRIM(full_name)) = $4
+                 THEN COALESCE(NULLIF($3, ''), full_name)
+                 ELSE full_name
+               END,
+               last_login_at = clock_timestamp(),
+               updated_at = clock_timestamp()
+           WHERE id = $1
+           RETURNING id, full_name, avatar_url, is_active`,
+          [existing.rows[0].id, googleAvatar || '', googleName || '', emailLocalLower]
         );
-        return existing.rows[0];
+        gaRow = upd.rows[0] || existing.rows[0];
+      } else {
+        const randomPassHash = await hashPassword(crypto.randomBytes(24).toString('hex'), APP_CONFIG.bcryptRounds);
+        const ins = await client.query<{
+          id: string;
+          full_name: string;
+          avatar_url: string | null;
+          is_active: boolean;
+        }>(
+          `INSERT INTO global_accounts (email, password_hash, full_name, avatar_url, is_active, last_login_at)
+           VALUES ($1, $2, $3, $4, true, clock_timestamp())
+           RETURNING id, full_name, avatar_url, is_active`,
+          [googleEmail, randomPassHash, googleName, googleAvatar]
+        );
+        gaRow = ins.rows[0];
       }
-      const randomPassHash = await hashPassword(crypto.randomBytes(24).toString('hex'), APP_CONFIG.bcryptRounds);
-      const ins = await client.query<{ id: string; full_name: string; is_active: boolean }>(
-        `INSERT INTO global_accounts (email, password_hash, full_name, is_active, last_login_at)
-         VALUES ($1, $2, $3, true, clock_timestamp())
-         RETURNING id, full_name, is_active`,
-        [googleEmail, randomPassHash, googleName]
-      );
-      return ins.rows[0];
+
+      const syncAvatar = sanitizeAvatarUrl(googleAvatar) || sanitizeAvatarUrl(gaRow.avatar_url) || '';
+      if (syncAvatar || googleName) {
+        await client.query(
+          `UPDATE users
+           SET account_id = COALESCE(account_id, $1),
+               avatar_url = CASE WHEN $2 <> '' THEN $2 ELSE avatar_url END,
+               full_name = CASE
+                 WHEN COALESCE(TRIM(full_name), '') = '' OR LOWER(TRIM(full_name)) = $4
+                 THEN COALESCE(NULLIF($3, ''), full_name)
+                 ELSE full_name
+               END,
+               updated_at = clock_timestamp()
+           WHERE account_id = $1 OR LOWER(email) = $5`,
+          [gaRow.id, syncAvatar, googleName || '', emailLocalLower, googleEmail]
+        );
+      }
+
+      return gaRow;
     });
+
+    const effectiveGoogleAvatar = sanitizeAvatarUrl(googleAvatar) || sanitizeAvatarUrl(gaRecord.avatar_url);
 
     if (!gaRecord.is_active) {
       sendApiError(res, 403, 'ACCOUNT_DEACTIVATED', 'Tài khoản Google này đã bị tạm khóa.');
@@ -986,7 +1112,7 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
             id: gaRecord.id,
             email: googleEmail,
             full_name: googleName || gaRecord.full_name,
-            avatar_url: googleAvatar,
+            avatar_url: effectiveGoogleAvatar,
             auth_provider: 'google',
           },
           workspaces: [],
@@ -996,7 +1122,10 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
     }
 
     const primaryWs = workspaces[0];
-    const loginPayload = await issueWorkspaceSessionForAccount(primaryWs.slug, googleEmail, gaRecord.id);
+    const loginPayload = await issueWorkspaceSessionForAccount(primaryWs.slug, googleEmail, gaRecord.id, {
+      avatarUrl: effectiveGoogleAvatar,
+      fullName: googleName || gaRecord.full_name,
+    });
     if (!loginPayload) {
       sendApiError(res, 500, 'WORKSPACE_SESSION_FAILED', 'Không thể khởi tạo phiên làm việc Workspace.');
       return;
@@ -1010,7 +1139,7 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
           id: gaRecord.id,
           email: googleEmail,
           full_name: googleName || gaRecord.full_name,
-          avatar_url: googleAvatar,
+          avatar_url: effectiveGoogleAvatar,
           auth_provider: 'google',
         },
         account_token: accountToken,
@@ -1023,7 +1152,12 @@ authRouter.post(['/google', '/google-login'], async (req, res) => {
   }
 });
 
-async function issueWorkspaceSessionForAccount(targetSlug: string, email: string, accountId?: string | null) {
+async function issueWorkspaceSessionForAccount(
+  targetSlug: string,
+  email: string,
+  accountId?: string | null,
+  googleProfile?: { avatarUrl?: string | null; fullName?: string | null }
+) {
   const billingCatalog = await getPlatformBillingCatalog();
   const tenantRow = await withSystemPrivilege(async (client) => {
     const r = await client.query<{
@@ -1033,6 +1167,7 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
       domain: string | null;
       industry: string;
       plan_tier: 'starter' | 'growth' | 'enterprise';
+      package_code: string | null;
       status: string;
       trial_ends_at: string | null;
       subscription_expires_at: string | null;
@@ -1040,12 +1175,20 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
       billing_cycle: string | null;
       wallet_balance_vnd: string | number | null;
       crm_erp_upgrade_status: string | null;
+      grace_ends_at: string | null;
+      auto_renew: boolean | null;
+      cancel_at_period_end: boolean | null;
+      cancelled_at: string | null;
+      scheduled_plan_code: string | null;
+      scheduled_billing_cycle: string | null;
       settings: Record<string, unknown>;
       created_at: string;
     }>(
-      `SELECT id, slug, name, domain, industry, plan_tier, status,
+      `SELECT id, slug, name, domain, industry, package_code, plan_tier, status,
               trial_ends_at, subscription_expires_at, subscription_plan_code,
               billing_cycle, wallet_balance_vnd, crm_erp_upgrade_status,
+              grace_ends_at, auto_renew, cancel_at_period_end, cancelled_at,
+              scheduled_plan_code, scheduled_billing_cycle,
               settings, created_at
        FROM tenants WHERE (slug = $1 OR obfuscated_slug = $1) LIMIT 1`,
       [targetSlug.toLowerCase()]
@@ -1053,16 +1196,20 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
     return r.rows[0] || null;
   });
 
-  if (!tenantRow || (tenantRow.status !== 'active' && tenantRow.status !== 'trial')) {
+  if (!tenantRow || (tenantRow.status !== 'active' && tenantRow.status !== 'trial' && tenantRow.status !== 'grace')) {
     return null;
   }
 
   const userRow = await withTenantTransaction(tenantRow.id, async (client) => {
     const r = await client.query<any>(
-      `SELECT u.id, u.email, u.full_name, u.phone, u.avatar_url, u.role, u.is_tenant_owner, u.is_external_agency,
+      `SELECT u.id, u.email, u.full_name, u.phone,
+              COALESCE(NULLIF(u.avatar_url, ''), ga.avatar_url) AS avatar_url,
+              u.avatar_url AS raw_user_avatar_url,
+              u.role, u.is_tenant_owner, u.is_external_agency,
               p.status AS profile_status, p.is_available, p.vacation_mode, p.skipped_credit, p.work_schedule, p.zalo_chat_id,
               ob.current_step, ob.completed_steps, ob.screen_tours, ob.is_completed, ob.dismissed_at
        FROM users u
+       LEFT JOIN global_accounts ga ON LOWER(ga.email) = LOWER(u.email)
        LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
        LEFT JOIN tenant_onboarding_progress ob ON ob.tenant_id = u.tenant_id
        WHERE u.tenant_id = $1 AND (${accountId ? 'u.account_id = $2 OR ' : ''}LOWER(u.email) = ${accountId ? '$3' : '$2'})
@@ -1070,10 +1217,24 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
       accountId ? [tenantRow.id, accountId, email.toLowerCase()] : [tenantRow.id, email.toLowerCase()]
     );
     if (r.rows[0]) {
-      await client.query('UPDATE users SET last_login_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2', [
-        tenantRow.id,
-        r.rows[0].id,
-      ]);
+      const incomingAvatar = sanitizeAvatarUrl(googleProfile?.avatarUrl) || sanitizeAvatarUrl(r.rows[0].avatar_url);
+      const emailLocal = String(r.rows[0].email || '').split('@')[0]?.toLowerCase() || '';
+      const incomingName =
+        googleProfile?.fullName &&
+        (!r.rows[0].full_name || String(r.rows[0].full_name).trim().toLowerCase() === emailLocal)
+          ? googleProfile.fullName.trim()
+          : '';
+      await client.query(
+        `UPDATE users
+         SET last_login_at = clock_timestamp(),
+             account_id = COALESCE(account_id, $3),
+             avatar_url = CASE WHEN $4 <> '' THEN $4 ELSE avatar_url END,
+             full_name = CASE WHEN $5 <> '' THEN $5 ELSE full_name END
+         WHERE tenant_id = $1 AND id = $2`,
+        [tenantRow.id, r.rows[0].id, accountId || null, incomingAvatar || '', incomingName]
+      );
+      if (incomingAvatar) r.rows[0].avatar_url = incomingAvatar;
+      if (incomingName) r.rows[0].full_name = incomingName;
     }
     return r.rows[0] || null;
   });
@@ -1085,6 +1246,7 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
   const normalizedSettings = normalizeTenantSettings(tenantRow.settings);
   tenantRedis.setCachedTenantMeta(tenantRow.id, {
     slug: tenantRow.slug,
+    name: tenantRow.name,
     status: tenantRow.status,
     rawSettings: tenantRow.settings,
     normalizedSettings,
@@ -1178,7 +1340,7 @@ async function issueWorkspaceSessionForAccount(targetSlug: string, email: string
 // 2.3c List Workspaces for Authenticated Account/User
 authRouter.get('/workspaces', async (req, res) => {
   try {
-    const caller = extractCallerIdentity(req);
+    const caller = await extractCallerIdentity(req);
     if (!caller) {
       sendApiError(res, 401, 'UNAUTHORIZED', 'Vui lòng đăng nhập để xem danh sách Workspace.');
       return;
@@ -1190,10 +1352,133 @@ authRouter.get('/workspaces', async (req, res) => {
   }
 });
 
+// 2.3c2 Silent Refresh Tenant & Account Session
+authRouter.post('/refresh', async (req, res) => {
+  try {
+    const authHeader = String(req.header?.('Authorization') || '');
+    const bearerTok = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const rawRefresh = String(req.body?.refresh_token || bearerTok || '').trim();
+    const rawAccountTok = String(req.body?.account_token || '').trim();
+    const requestedSlug = String(
+      req.body?.tenant_slug || req.body?.slug || extractRequestedTenantSlug(req) || ''
+    )
+      .trim()
+      .toLowerCase();
+
+    let resolvedEmail = '';
+    let resolvedAccountId: string | null = null;
+    let resolvedName = '';
+    let resolvedSlug = requestedSlug;
+
+    if (rawRefresh) {
+      try {
+        const refClaims = verifyTenantRefreshToken(rawRefresh);
+        const target = await withSystemPrivilege(async (client) => {
+          const tRes = await client.query<{ id: string; slug: string; status: string }>(
+            `SELECT id, slug, status FROM tenants WHERE id = $1 LIMIT 1`,
+            [refClaims.tenantId]
+          );
+          return tRes.rows[0] || null;
+        });
+        if (target && (target.status === 'active' || target.status === 'trial' || target.status === 'grace')) {
+          const userInfo = await withTenantTransaction(refClaims.tenantId, async (client) => {
+            const uRes = await client.query<{
+              email: string;
+              full_name: string;
+              account_id: string | null;
+            }>(
+              `SELECT u.email, u.full_name, u.account_id
+               FROM users u
+               LEFT JOIN tenant_user_profiles p ON p.tenant_id = u.tenant_id AND p.user_id = u.id
+               WHERE u.tenant_id = $1 AND u.id = $2 AND COALESCE(p.status, 'active') = 'active'
+               LIMIT 1`,
+              [refClaims.tenantId, refClaims.sub]
+            );
+            return uRes.rows[0] || null;
+          });
+          if (userInfo?.email) {
+            resolvedEmail = userInfo.email.toLowerCase();
+            resolvedAccountId = userInfo.account_id || null;
+            resolvedName = userInfo.full_name || resolvedEmail.split('@')[0] || 'DOMATION User';
+            if (!resolvedSlug) resolvedSlug = target.slug;
+          }
+        }
+      } catch {
+        // Fallback to account_token if provided
+      }
+    }
+
+    if (!resolvedEmail && (rawAccountTok || bearerTok)) {
+      try {
+        const acc = verifyAccountToken(rawAccountTok || bearerTok);
+        resolvedEmail = acc.email.toLowerCase();
+        resolvedAccountId = acc.sub;
+        resolvedName = acc.name;
+      } catch {
+        // Invalid/expired account token
+      }
+    }
+
+    if (!resolvedEmail) {
+      sendApiError(res, 401, 'REFRESH_TOKEN_EXPIRED', 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+      return;
+    }
+
+    const gaId =
+      resolvedAccountId ||
+      (await withSystemPrivilege(async (client) => {
+        const r = await client.query<{ id: string }>(
+          'SELECT id FROM global_accounts WHERE LOWER(email) = $1 LIMIT 1',
+          [resolvedEmail]
+        );
+        return r.rows[0]?.id || null;
+      }));
+
+    const workspaces = await listWorkspacesForAccount(gaId, resolvedEmail);
+    const effectiveSlug = resolvedSlug || workspaces[0]?.slug || '';
+    if (!effectiveSlug) {
+      sendApiError(res, 403, 'NO_ACTIVE_WORKSPACE', 'Không tìm thấy Workspace đang hoạt động cho tài khoản này.');
+      return;
+    }
+
+    const sessionPayload = await issueWorkspaceSessionForAccount(effectiveSlug, resolvedEmail, gaId);
+    if (!sessionPayload) {
+      sendApiError(
+        res,
+        403,
+        'WORKSPACE_ACCESS_DENIED',
+        'Bạn không có quyền truy cập Workspace này hoặc Workspace đã tạm khóa.'
+      );
+      return;
+    }
+
+    const nextAccountToken = gaId
+      ? signAccountToken({
+          sub: gaId,
+          email: resolvedEmail,
+          name: resolvedName || sessionPayload.user.full_name || resolvedEmail,
+          authProvider: 'password',
+        })
+      : undefined;
+
+    res.json({
+      success: true,
+      data: {
+        action: 'enter_workspace',
+        workspaces,
+        ...(nextAccountToken ? { account_token: nextAccountToken } : {}),
+        ...sessionPayload,
+      },
+    });
+  } catch (err: any) {
+    sendApiError(res, 500, 'REFRESH_SESSION_FAILED', err?.message || 'Không thể làm mới phiên đăng nhập.');
+  }
+});
+
 // 2.3d Switch Active Workspace
 authRouter.post('/switch-workspace', async (req, res) => {
   try {
-    const caller = extractCallerIdentity(req);
+    const caller = await extractCallerIdentity(req);
     if (!caller) {
       sendApiError(res, 401, 'UNAUTHORIZED', 'Phiên đăng nhập không hợp lệ.');
       return;
@@ -1227,7 +1512,7 @@ authRouter.post('/switch-workspace', async (req, res) => {
 // 2.3e Create Additional Workspace (or First Workspace after 0-workspace Login / Google OAuth)
 authRouter.post(['/create-workspace', '/google-create-workspace'], async (req, res) => {
   try {
-    const caller = extractCallerIdentity(req);
+    const caller = await extractCallerIdentity(req);
     if (!caller) {
       sendApiError(res, 401, 'UNAUTHORIZED', 'Vui lòng đăng nhập trước khi tạo Workspace.');
       return;
@@ -1268,8 +1553,13 @@ authRouter.post(['/create-workspace', '/google-create-workspace'], async (req, r
       }),
       getPlatformDefaultsCached(),
       withSystemPrivilege(async (client) => {
-        const r = await client.query<{ id: string; password_hash: string; phone: string | null }>(
-          'SELECT id, password_hash, phone FROM global_accounts WHERE LOWER(email) = $1 LIMIT 1',
+        const r = await client.query<{
+          id: string;
+          password_hash: string;
+          phone: string | null;
+          avatar_url: string | null;
+        }>(
+          'SELECT id, password_hash, phone, avatar_url FROM global_accounts WHERE LOWER(email) = $1 LIMIT 1',
           [caller.email]
         );
         return r.rows[0] || null;
@@ -1292,14 +1582,15 @@ authRouter.post(['/create-workspace', '/google-create-workspace'], async (req, r
 
     const passwordHash =
       gaRow?.password_hash || (await hashPassword(crypto.randomBytes(24).toString('hex'), APP_CONFIG.bcryptRounds));
+    const creatorAvatar = sanitizeAvatarUrl(gaRow?.avatar_url) || sanitizeAvatarUrl(req.body?.avatar_url);
     const accountId =
       gaRow?.id ||
       (await withSystemPrivilege(async (client) => {
         const newId = crypto.randomUUID();
         await client.query(
-          `INSERT INTO global_accounts (id, email, password_hash, full_name, is_active, last_login_at)
-           VALUES ($1, $2, $3, $4, true, clock_timestamp())`,
-          [newId, caller.email, passwordHash, cleanAdminName]
+          `INSERT INTO global_accounts (id, email, password_hash, full_name, avatar_url, is_active, last_login_at)
+           VALUES ($1, $2, $3, $4, $5, true, clock_timestamp())`,
+          [newId, caller.email, passwordHash, cleanAdminName, creatorAvatar]
         );
         return newId;
       }));
@@ -1324,9 +1615,9 @@ authRouter.post(['/create-workspace', '/google-create-workspace'], async (req, r
       );
 
       await client.query(
-        `INSERT INTO users (id, account_id, tenant_id, email, password_hash, full_name, phone, role, is_tenant_owner, is_external_agency)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'tenant_admin', true, false)`,
-        [adminUserId, accountId, tenantId, caller.email, passwordHash, cleanAdminName, cleanPhone]
+        `INSERT INTO users (id, account_id, tenant_id, email, password_hash, full_name, phone, avatar_url, role, is_tenant_owner, is_external_agency)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'tenant_admin', true, false)`,
+        [adminUserId, accountId, tenantId, caller.email, passwordHash, cleanAdminName, cleanPhone, creatorAvatar]
       );
 
       const seedInfo = await seedTenantWorkspace(client, {
@@ -1402,9 +1693,13 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
            t.trial_ends_at AS t_trial_ends_at, t.subscription_expires_at AS t_subscription_expires_at,
            t.subscription_plan_code AS t_subscription_plan_code, t.billing_cycle AS t_billing_cycle,
            t.wallet_balance_vnd AS t_wallet_balance_vnd, t.crm_erp_upgrade_status AS t_crm_erp_upgrade_status,
+           t.grace_ends_at AS t_grace_ends_at, t.auto_renew AS t_auto_renew,
+           t.cancel_at_period_end AS t_cancel_at_period_end, t.cancelled_at AS t_cancelled_at,
+           t.scheduled_plan_code AS t_scheduled_plan_code, t.scheduled_billing_cycle AS t_scheduled_billing_cycle,
            t.settings AS t_settings, t.created_at AS t_created_at,
            u.id AS u_id, u.email AS u_email, u.full_name AS u_full_name, u.phone AS u_phone,
-           u.role AS u_role, u.is_tenant_owner AS u_is_tenant_owner, u.is_external_agency AS u_is_external_agency, u.avatar_url AS u_avatar_url,
+           u.role AS u_role, u.is_tenant_owner AS u_is_tenant_owner, u.is_external_agency AS u_is_external_agency,
+           COALESCE(NULLIF(u.avatar_url, ''), ga.avatar_url) AS u_avatar_url,
            p.status AS p_status, p.is_available AS p_is_available, p.vacation_mode AS p_vacation_mode,
            p.skipped_credit AS p_skipped_credit, p.work_schedule AS p_work_schedule, p.zalo_chat_id AS p_zalo_chat_id,
            ob.current_step AS ob_current_step, ob.completed_steps AS ob_completed_steps,
@@ -1412,6 +1707,7 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
            ob.is_completed AS ob_is_completed, ob.dismissed_at AS ob_dismissed_at
          FROM tenants t
          LEFT JOIN users u ON u.tenant_id = t.id AND u.id = $2
+         LEFT JOIN global_accounts ga ON LOWER(ga.email) = LOWER(u.email)
          LEFT JOIN tenant_user_profiles p ON p.tenant_id = t.id AND p.user_id = u.id
          LEFT JOIN tenant_onboarding_progress ob ON ob.tenant_id = t.id
          WHERE t.id = $1
@@ -1460,6 +1756,8 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
           crm_erp_upgrade_status: r.t_crm_erp_upgrade_status || 'none',
           subscription: computeSubscriptionSnapshot(
             {
+              status: r.t_status,
+              package_code: r.t_package_code,
               plan_tier: r.t_plan_tier,
               created_at: r.t_created_at,
               trial_ends_at: r.t_trial_ends_at,
@@ -1468,6 +1766,12 @@ authRouter.get('/me', requireTenantAuth, async (_req, res) => {
               billing_cycle: r.t_billing_cycle,
               wallet_balance_vnd: r.t_wallet_balance_vnd,
               crm_erp_upgrade_status: r.t_crm_erp_upgrade_status,
+              grace_ends_at: r.t_grace_ends_at,
+              auto_renew: r.t_auto_renew,
+              cancel_at_period_end: r.t_cancel_at_period_end,
+              cancelled_at: r.t_cancelled_at,
+              scheduled_plan_code: r.t_scheduled_plan_code,
+              scheduled_billing_cycle: r.t_scheduled_billing_cycle,
             },
             billingCatalog
           ),
@@ -1580,13 +1884,23 @@ authRouter.patch('/tenant-settings', requireTenantAuth, requirePermission('setti
         'SELECT settings FROM tenants WHERE id = $1',
         [ctx.tenantId]
       );
+      const existingRaw = cur.rows[0]?.settings && typeof cur.rows[0].settings === 'object' ? cur.rows[0].settings : {};
+      const incomingSettings =
+        settings && typeof settings === 'object' ? { ...(settings as Record<string, unknown>) } : {};
+      if (incomingSettings.ses_password === '••••••••') {
+        delete incomingSettings.ses_password;
+      }
+      if (incomingSettings.resend_api_key === '••••••••') {
+        delete incomingSettings.resend_api_key;
+      }
       const rawMerged = reset_to_defaults
-        ? { ...(settings && typeof settings === 'object' ? settings : {}) }
+        ? incomingSettings
         : {
-            ...(cur.rows[0]?.settings || {}),
-            ...(settings && typeof settings === 'object' ? settings : {}),
+            ...existingRaw,
+            ...incomingSettings,
           };
       const normalized = normalizeTenantSettings(rawMerged, platformBase);
+      const finalStored = reset_to_defaults ? normalized : { ...rawMerged, ...normalized };
 
       const hasDomainUpdate = domain !== undefined;
       const nextDomain = hasDomainUpdate ? (domain ? String(domain).trim().toLowerCase() : null) : null;
@@ -1606,7 +1920,7 @@ authRouter.patch('/tenant-settings', requireTenantAuth, requirePermission('setti
           hasDomainUpdate,
           nextDomain,
           industry ? String(industry).trim() : null,
-          JSON.stringify(normalized),
+          JSON.stringify(finalStored),
         ]
       );
       await client.query(
@@ -1619,8 +1933,8 @@ authRouter.patch('/tenant-settings', requireTenantAuth, requirePermission('setti
           ctx.userId,
           ctx.userName || 'Admin',
           ctx.tenantId,
-          JSON.stringify(cur.rows[0]?.settings || {}),
-          JSON.stringify(normalized),
+          JSON.stringify(existingRaw),
+          JSON.stringify(finalStored),
           JSON.stringify({ reset_to_defaults: Boolean(reset_to_defaults) }),
         ]
       );
@@ -1714,6 +2028,7 @@ authRouter.patch('/tenant-settings', requireTenantAuth, requirePermission('setti
       const norm = normalizeTenantSettings(updated.settings);
       tenantRedis.setCachedTenantMeta(ctx.tenantId, {
         slug: updated.slug,
+        name: updated.name,
         status: updated.status,
         rawSettings: updated.settings,
         normalizedSettings: norm,

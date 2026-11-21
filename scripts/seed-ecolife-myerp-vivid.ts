@@ -552,13 +552,38 @@ export async function seedEcoLifeMyerpVivid() {
     // ---------------------------------------------------------------------------------------------------------------
     const seedPasswordHash = await hashPassword(SEED_PASSWORD);
 
+    const STAFF_AVATAR_BY_NAME: Record<string, string> = {
+      'Lê Hoàng Phúc': '/imgs/staff/avatar_1.webp',
+      'Đặng Thị Hồng Nhung': '/imgs/staff/avatar_5.webp',
+      'Phạm Thanh Hằng': '/imgs/staff/avatar_2.webp',
+      'Vũ Đức Thịnh': '/imgs/staff/avatar_3.webp',
+      'Nguyễn Thị Bảo Trân': '/imgs/staff/avatar_9.webp',
+      'Nguyễn Thùy Linh': '/imgs/staff/avatar_4.webp',
+      'Hoàng Gia Bảo': '/imgs/staff/avatar_6.webp',
+      'Đỗ Ngọc Anh': '/imgs/staff/avatar_7.webp',
+      'Bùi Anh Tuấn': '/imgs/staff/avatar_10.webp',
+      'Lý Mỹ Duyên': '/imgs/staff/avatar_11.webp',
+      'Trương Văn Hải': '/imgs/staff/avatar_14.webp',
+      'Mai Thị Khánh Vy': '/imgs/staff/avatar_13.webp',
+      'Đinh Quang Huy': '/imgs/staff/avatar_12.webp',
+      'Huỳnh Kim Ngân': '/imgs/staff/avatar_15.webp',
+      'Phan Minh Triết': '/imgs/staff/avatar_8.webp',
+      'Lương Thị Thu Thảo': '/imgs/staff/avatar_5.webp',
+    };
+    const avatarForName = (name: string, fallbackIdx = 0) =>
+      STAFF_AVATAR_BY_NAME[name] || `/imgs/staff/avatar_${(fallbackIdx % 16) + 1}.webp`;
+
     const ensureUser = async (email: string, fullName: string, role: 'tenant_admin' | 'manager' | 'sale', phone: string) => {
       const emailLower = email.toLowerCase();
+      const avatarUrl = avatarForName(fullName);
       const existing = await db.query<{ id: string }>(
         `SELECT id FROM users WHERE tenant_id = $1 AND LOWER(email) = $2 LIMIT 1`,
         [tenantId, emailLower]
       );
-      if (existing.rows[0]) return existing.rows[0].id;
+      if (existing.rows[0]) {
+        await db.query(`UPDATE users SET avatar_url = COALESCE(NULLIF(avatar_url, ''), $3) WHERE tenant_id = $1 AND id = $2`, [tenantId, existing.rows[0].id, avatarUrl]);
+        return existing.rows[0].id;
+      }
       const acc = await db.query<{ id: string }>(
         `INSERT INTO global_accounts (email, password_hash, full_name, is_active)
          VALUES ($1, $2, $3, true)
@@ -568,9 +593,9 @@ export async function seedEcoLifeMyerpVivid() {
       );
       const userId = uid(`user:${emailLower}`);
       await db.query(
-        `INSERT INTO users (id, tenant_id, account_id, email, password_hash, full_name, phone, role, is_external_agency)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)`,
-        [userId, tenantId, acc.rows[0].id, emailLower, seedPasswordHash, fullName, phone, role]
+        `INSERT INTO users (id, tenant_id, account_id, email, password_hash, full_name, phone, role, avatar_url, is_external_agency)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+        [userId, tenantId, acc.rows[0].id, emailLower, seedPasswordHash, fullName, phone, role, avatarUrl]
       );
       await db.query(
         `INSERT INTO tenant_user_profiles (tenant_id, user_id, status, is_available, vacation_mode, work_schedule, invite_status)
@@ -596,8 +621,9 @@ export async function seedEcoLifeMyerpVivid() {
     if ((await countRole('manager')) === 0) {
       await ensureUser('ecolife.manager.test@domation.net', STAFF_NAMES.manager[0], 'manager', '0906123402');
     }
+    await ensureUser('ecolife.manager2.test@domation.net', STAFF_NAMES.manager[1], 'manager', '0906123409');
     let internalSales = await countRole('sale', true);
-    for (let n = 1; internalSales < 4 && n <= 12; n++) {
+    for (let n = 1; internalSales < 8 && n <= 12; n++) {
       const email = `ecolife.sale${n}.test@domation.net`;
       const exists = await db.query(`SELECT 1 FROM users WHERE tenant_id = $1 AND LOWER(email) = $2`, [tenantId, email]);
       if (exists.rows.length) continue;
@@ -605,7 +631,7 @@ export async function seedEcoLifeMyerpVivid() {
       internalSales++;
     }
 
-    // Rename test users (keep emails/passwords) with authentic Vietnamese display names
+    // Rename test users (keep emails/passwords) with authentic Vietnamese display names & real corporate avatars
     const testUsers = await db.query<{ id: string; email: string; role: string; account_id: string | null }>(
       `SELECT id, email, role, account_id FROM users
         WHERE tenant_id = $1 AND LOWER(email) LIKE 'ecolife.%.test@domation.net'
@@ -618,8 +644,9 @@ export async function seedEcoLifeMyerpVivid() {
       const bucket = (u.role in STAFF_NAMES ? u.role : 'other') as keyof typeof STAFF_NAMES;
       const list = STAFF_NAMES[bucket];
       const name = list[bucketIdx[bucket] % list.length];
+      const avatarUrl = avatarForName(name, bucketIdx[bucket]);
       bucketIdx[bucket]++;
-      await db.query(`UPDATE users SET full_name = $3, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2`, [tenantId, u.id, name]);
+      await db.query(`UPDATE users SET full_name = $3, avatar_url = $4, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2`, [tenantId, u.id, name, avatarUrl]);
       if (u.account_id) {
         await db.query(`UPDATE global_accounts SET full_name = $2, updated_at = clock_timestamp() WHERE id = $1`, [u.account_id, name]);
       }
@@ -627,15 +654,18 @@ export async function seedEcoLifeMyerpVivid() {
     }
     bump('users(renamed)', renamed.length);
 
-    // Fix any assignee with a blank / "-" display name so avatars never render "-"
-    const blankUsers = await db.query<{ id: string; email: string }>(
-      `SELECT id, email FROM users WHERE tenant_id = $1 AND (btrim(full_name) IN ('', '-', '–'))`,
+    // Fix any assignee with a blank / "-" display name & ensure every active user in ecolife has a crisp avatar_url
+    const allEcolifeUsers = await db.query<{ id: string; email: string; full_name: string; avatar_url: string | null; phone: string | null; role: string }>(
+      `SELECT id, email, full_name, avatar_url, phone, role FROM users WHERE tenant_id = $1 ORDER BY created_at ASC`,
       [tenantId]
     );
-    for (const u of blankUsers.rows) {
-      const nm = STAFF_NAMES.other[hashInt(u.email) % STAFF_NAMES.other.length];
-      await db.query(`UPDATE users SET full_name = $3 WHERE tenant_id = $1 AND id = $2`, [tenantId, u.id, nm]);
-      bump('users(blank-name fixed)');
+    for (let idx = 0; idx < allEcolifeUsers.rows.length; idx++) {
+      const u = allEcolifeUsers.rows[idx];
+      const cleanName = ['','-', '–'].includes((u.full_name || '').trim())
+        ? STAFF_NAMES.other[hashInt(u.email) % STAFF_NAMES.other.length]
+        : u.full_name;
+      const av = u.avatar_url && u.avatar_url.startsWith('/imgs/staff/') ? u.avatar_url : avatarForName(cleanName, idx);
+      await db.query(`UPDATE users SET full_name = $3, avatar_url = $4 WHERE tenant_id = $1 AND id = $2`, [tenantId, u.id, cleanName, av]);
     }
 
     // Sale pool = active, available consultants (internal first), max 8
@@ -1705,10 +1735,13 @@ export async function seedEcoLifeMyerpVivid() {
     const feedComments: Array<[number, number, string]> = [
       [0, 0, 'Đã nhận thông tin, team em sẽ cập nhật bảng hàng trước 15h Thứ Sáu ạ!'],
       [0, 1, 'Anh chị lưu ý ưu đãi nội thất chỉ áp dụng cho 30 khách đầu tiên ký HĐ đặt cọc nhé.'],
+      [0, 2, '/stickers/dom/dom_2.webp'],
       [1, 0, 'Chính sách thưởng này quá hấp dẫn, cả team quyết tâm bứt phá cuối tháng!'],
       [1, 2, 'Em xin hỏi giao dịch chốt qua đại lý F1 có được tính thưởng nóng không ạ?'],
+      [1, 1, '/stickers/dom/dom_12.webp'],
       [2, 0, 'Cảm ơn chị Hằng và cả team đã hỗ trợ em rất nhiều trong tuần vừa qua ❤️'],
       [2, 1, 'Chúc mừng các bạn! Tuần sau cùng cố gắng nhé!'],
+      [2, 2, '/stickers/dom/dom_7.webp'],
     ];
     for (let c = 0; c < feedComments.length; c++) {
       const [pIdx, who, content] = feedComments[c];
@@ -1746,9 +1779,10 @@ export async function seedEcoLifeMyerpVivid() {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // 15. WorkChat (channels, members, messages, presence)
+    // 15. WorkChat (channels, members, messages with DOM Stickers, presence)
     // ---------------------------------------------------------------------------------------------------------------
-    type ChanDef = { key: string; name: string; type: 'group' | 'announcement' | 'project' | 'department'; topic: string; project?: number; messages: Array<[number, string]> };
+    type ChatMsgTuple = [number, string, ('text' | 'sticker')?, string?];
+    type ChanDef = { key: string; name: string; type: 'group' | 'announcement' | 'project' | 'department'; topic: string; project?: number; messages: ChatMsgTuple[] };
     const everyone = staffAll;
     const chanDefs: ChanDef[] = [
       {
@@ -1759,10 +1793,12 @@ export async function seedEcoLifeMyerpVivid() {
         messages: [
           [0, 'Chào cả nhà, sáng nay có 4 khách hẹn xem nhà mẫu 9h30 – 10h30, em đã đặt lịch trên CRM. Ai rảnh hỗ trợ đón khách giúp em nhé.'],
           [1, 'Em hỗ trợ khung 9h30 được ạ. Khách Trần Quốc Khánh đi cùng bố mẹ nên em sẽ chuẩn bị ghế nghỉ và nước.'],
+          [1, '/stickers/dom/dom_2.webp', 'sticker', 'dom_2'],
           [2, 'Chị Hằng ơi, khách Võ Thảo Nguyên xin chiết khấu thêm 2%, em đã tạo phiếu xin duyệt ECO-APR-0004 rồi ạ.'],
           [3, 'Chị đã thấy, chiều nay chị trao đổi với anh Phúc rồi báo lại em trước 16h nhé.'],
           [0, 'Căn A-1205 vừa có khách giữ chỗ, anh chị tư vấn cho khách khác đừng chào căn này nữa nhé!'],
           [4, 'Tin vui: khách Ngô Thanh Hằng vừa ký HĐMB căn B-0803 🎉'],
+          [3, '/stickers/dom/dom_4.webp', 'sticker', 'dom_4'],
         ],
       },
       {
@@ -1773,6 +1809,7 @@ export async function seedEcoLifeMyerpVivid() {
         messages: [
           [5, 'Thông báo: Sự kiện mở bán Giai đoạn 2 diễn ra Thứ Bảy 8h00 – 19h00 tại Sales Gallery. Toàn bộ đội sale có mặt trước 7h30, trang phục đồng phục.'],
           [5, 'Lưu ý: bảng hàng mới đã cập nhật trên CRM lúc 17h hôm qua. Mọi báo giá cũ hết hiệu lực từ 0h ngày mai.'],
+          [0, '/stickers/dom/dom_3.webp', 'sticker', 'dom_3'],
           [3, 'Nhắc lịch họp tuần 15h00 Thứ Hai tại phòng họp tầng 3: rà soát pipeline và chỉ tiêu tháng 11.'],
         ],
       },
@@ -1787,6 +1824,7 @@ export async function seedEcoLifeMyerpVivid() {
           [1, 'Pháp lý báo mẫu phiếu cọc bản mới đã duyệt, mọi người tải trong thư mục Quy trình bán hàng nhé.'],
           [2, 'Kế toán xác nhận UNC trong 4 giờ làm việc, sale nhớ nhập mã giao dịch lên phiếu cọc trên ERP.'],
           [0, 'Hôm nay Meta Ads mang về 38 lead, 29 lead hợp lệ, CPL 298k – tốt hơn tuần trước.'],
+          [2, '/stickers/dom/dom_11.webp', 'sticker', 'dom_11'],
         ],
       },
       {
@@ -1798,6 +1836,7 @@ export async function seedEcoLifeMyerpVivid() {
           [4, 'Feedback data hôm qua: nhóm TikTok Lead có 6/20 số sai hoặc không nghe máy, đề nghị Marketing rà lại form.'],
           [3, 'Ghi nhận, bên em sẽ bật xác thực OTP trên form TikTok và bổ sung câu hỏi lọc ngân sách.'],
           [0, 'Data Zalo OA tuần này chất lượng nhất: tỷ lệ booking 24%. Đề nghị tăng ngân sách chăm sóc Zalo OA.'],
+          [3, '/stickers/dom/dom_16.webp', 'sticker', 'dom_16'],
         ],
       },
     ];
@@ -1817,7 +1856,7 @@ export async function seedEcoLifeMyerpVivid() {
         created_by: admin.id,
         is_archived: false,
         last_message_at: hoursAgo(1 + c * 3),
-        last_message_preview: lastMsg[1].slice(0, 120),
+        last_message_preview: lastMsg[2] === 'sticker' ? '[Nhãn dán DOM Mascot]' : lastMsg[1].slice(0, 120),
         created_at: hoursAgo(24 * 20),
       }, 'id', ['created_at']);
       for (const u of everyone) {
@@ -1831,7 +1870,7 @@ export async function seedEcoLifeMyerpVivid() {
         }, 'tenant_id, channel_id, user_id');
       }
       for (let m = 0; m < ch.messages.length; m++) {
-        const [who, text] = ch.messages[m];
+        const [who, text, msgType = 'text', stickerId] = ch.messages[m];
         const s = sender(who);
         await upsert(db, 'tenant_workchat_messages', {
           id: uid(`msg:${ch.key}:${m}`),
@@ -1840,8 +1879,10 @@ export async function seedEcoLifeMyerpVivid() {
           sender_user_id: s.id,
           sender_name: s.full_name,
           parent_message_id: null,
-          message_type: 'text',
+          message_type: msgType,
           content: text,
+          sticker_pack_id: msgType === 'sticker' ? 'dom' : null,
+          sticker_id: msgType === 'sticker' ? (stickerId || null) : null,
           attachments_json: J([]),
           reactions_json: J(m % 2 === 0 ? { '👍': [everyone[(who + 1) % everyone.length].id] } : {}),
           is_pinned: ch.type === 'announcement' && m === 0,
@@ -1859,6 +1900,266 @@ export async function seedEcoLifeMyerpVivid() {
         status_text: u % 4 === 3 ? 'Đang đón khách tại Sales Gallery' : u % 5 === 4 ? 'Đang họp với khách' : 'Sẵn sàng tư vấn',
         last_seen_at: hoursAgo(0.05 * (u + 1)),
       }, 'tenant_id, user_id');
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // 15B. Org Structure, HRM Employees, Shifts & 21-day GPS Attendance Logs
+    // ---------------------------------------------------------------------------------------------------------------
+    const branchIdHQ = uid('branch:hq-danang');
+    const branchIdHN = uid('branch:vp-hanoi');
+    await upsert(db, 'tenant_branches', {
+      id: branchIdHQ,
+      tenant_id: tenantId,
+      code: 'CN-DN-HQ',
+      name: 'Trụ sở EcoLife Signature Đà Nẵng',
+      legal_entity_name: 'Công ty CP Đầu tư BĐS EcoLife Miền Trung',
+      tax_code: '0401999888',
+      representative_name: admin.full_name,
+      representative_title: 'Giám đốc Điều hành',
+      address: '268 Võ Nguyên Giáp, Ngũ Hành Sơn, Đà Nẵng',
+      phone: '02363888999',
+      email: 'office.dn@ecolifesignature.vn',
+      gps_lat: 16.054407,
+      gps_lng: 108.248120,
+      gps_radius_meters: 250,
+      work_schedule: J({ start: '08:30', end: '17:30' }),
+      is_headquarters: true,
+      is_active: true,
+    });
+    await upsert(db, 'tenant_branches', {
+      id: branchIdHN,
+      tenant_id: tenantId,
+      code: 'CN-HN-VP',
+      name: 'Văn phòng Kinh doanh Hà Nội',
+      legal_entity_name: 'Chi nhánh EcoLife Capital House Hà Nội',
+      tax_code: '0401999888-002',
+      representative_name: manager.full_name,
+      representative_title: 'Giám đốc Kinh doanh',
+      address: 'Tầng 12, Tòa Capital Tower, Tây Hồ, Hà Nội',
+      phone: '02437778899',
+      email: 'office.hn@ecolifesignature.vn',
+      gps_lat: 21.059812,
+      gps_lng: 105.802145,
+      gps_radius_meters: 250,
+      work_schedule: J({ start: '08:30', end: '17:30' }),
+      is_headquarters: false,
+      is_active: true,
+    });
+
+    const deptDefs = [
+      { code: 'DEPT-BOD', name: 'Ban Giám Đốc & Điều Hành', mgr: admin.id, order: 1 },
+      { code: 'DEPT-SALE', name: 'Khối Kinh Doanh & Sàn F1', mgr: manager.id, order: 2 },
+      { code: 'DEPT-MKT', name: 'Marketing & AutoData', mgr: manager.id, order: 3 },
+      { code: 'DEPT-FIN', name: 'Kế Toán, Pháp Lý & Vận Hành', mgr: admin.id, order: 4 },
+    ];
+    const deptIds: string[] = [];
+    for (const d of deptDefs) {
+      const did = uid(`dept:${d.code}`);
+      deptIds.push(did);
+      await upsert(db, 'tenant_departments', {
+        id: did,
+        tenant_id: tenantId,
+        branch_id: branchIdHQ,
+        parent_department_id: null,
+        code: d.code,
+        name: d.name,
+        description: `Phòng ban ${d.name} – EcoLife Signature`,
+        manager_user_id: d.mgr,
+        sort_order: d.order,
+        is_active: true,
+      });
+    }
+
+    const posDefs = [
+      { code: 'POS-CEO', name: 'Giám đốc Điều hành', dept: 0, rank: 10 },
+      { code: 'POS-SM', name: 'Trưởng phòng Kinh doanh', dept: 1, rank: 8 },
+      { code: 'POS-SC', name: 'Chuyên viên Tư vấn BĐS Cao cấp', dept: 1, rank: 5 },
+      { code: 'POS-MKT', name: 'Chuyên viên Performance Ads & CRM', dept: 2, rank: 5 },
+      { code: 'POS-ACC', name: 'Kế toán Tổng hợp & Pháp chế', dept: 3, rank: 6 },
+    ];
+    const posIds: string[] = [];
+    for (const p of posDefs) {
+      const pid = uid(`pos:${p.code}`);
+      posIds.push(pid);
+      await upsert(db, 'tenant_positions', {
+        id: pid,
+        tenant_id: tenantId,
+        department_id: deptIds[p.dept],
+        code: p.code,
+        name: p.name,
+        level_rank: p.rank,
+        is_active: true,
+      });
+    }
+
+    const shiftStdId = uid('shift:STD');
+    const shiftGalleryId = uid('shift:GAL');
+    await upsert(db, 'tenant_hr_shifts', {
+      id: shiftStdId,
+      tenant_id: tenantId,
+      code: 'CA-HC',
+      name: 'Ca Hành Chính Chuẩn (08:30 – 17:30)',
+      start_time: '08:30',
+      end_time: '17:30',
+      break_start_time: '12:00',
+      break_end_time: '13:00',
+      break_minutes: 60,
+      grace_late_minutes: 15,
+      grace_early_leave_minutes: 15,
+      require_gps: true,
+      require_selfie: true,
+      working_days: J([1, 2, 3, 4, 5, 6]),
+      is_default: true,
+      is_active: true,
+    });
+    await upsert(db, 'tenant_hr_shifts', {
+      id: shiftGalleryId,
+      tenant_id: tenantId,
+      code: 'CA-SG',
+      name: 'Ca Sàn Sales Gallery (08:00 – 17:30)',
+      start_time: '08:00',
+      end_time: '17:30',
+      break_start_time: '12:00',
+      break_end_time: '13:30',
+      break_minutes: 90,
+      grace_late_minutes: 15,
+      grace_early_leave_minutes: 15,
+      require_gps: true,
+      require_selfie: true,
+      working_days: J([1, 2, 3, 4, 5, 6, 0]),
+      is_default: false,
+      is_active: true,
+    });
+
+    const hrEmpRows = allEcolifeUsers.rows;
+    const empIdByUser = new Map<string, string>();
+    for (let i = 0; i < hrEmpRows.length; i++) {
+      const u = hrEmpRows[i];
+      const empId = uid(`hremp:${u.id}`);
+      empIdByUser.set(u.id, empId);
+      const isDir = u.role === 'tenant_admin';
+      const isMgr = u.role === 'manager';
+      const deptIdx = isDir ? 0 : isMgr ? (i % 2 === 0 ? 1 : 2) : i % 4 === 3 ? 3 : 1;
+      const posIdx = isDir ? 0 : isMgr ? 1 : deptIdx === 2 ? 3 : deptIdx === 3 ? 4 : 2;
+      const empCode = `ECO-${String(i + 1).padStart(3, '0')}`;
+      const baseSalary = isDir ? 48_000_000 : isMgr ? 28_000_000 : 14_000_000 + (i % 4) * 2_000_000;
+      await upsert(db, 'tenant_hr_employees', {
+        id: empId,
+        tenant_id: tenantId,
+        user_id: u.id,
+        employee_code: empCode,
+        full_name: u.full_name,
+        work_email: u.email,
+        phone: u.phone || `090512${String(3400 + i)}`,
+        gender: /Linh|Hằng|Nhung|Ngọc Anh|Duyên|Vy|Trân|Ngân|Thảo/.test(u.full_name) ? 'female' : 'male',
+        branch_id: i % 5 === 4 ? branchIdHN : branchIdHQ,
+        department_id: deptIds[deptIdx],
+        position_id: posIds[posIdx],
+        manager_user_id: isDir ? null : isMgr ? admin.id : manager.id,
+        employment_status: 'active',
+        employment_type: 'full_time',
+        join_date: dateOnly(-(120 + i * 25)),
+        base_salary_vnd: baseSalary,
+        insurance_salary_vnd: Math.min(baseSalary, 22_000_000),
+        insurance_enrolled: true,
+        allowances_json: J({ lunch_vnd: 1_000_000, phone_vnd: 500_000, transport_vnd: isMgr || isDir ? 2_000_000 : 800_000 }),
+        bank_name: 'Vietcombank',
+        bank_account_number: `1018${String(440000 + i * 197)}`,
+        bank_account_holder: stripVi(u.full_name).toUpperCase(),
+        annual_leave_quota: 14,
+        annual_leave_used: i % 3,
+      }, 'tenant_id, employee_code');
+
+      await upsert(db, 'tenant_hr_contracts', {
+        id: uid(`hrcontract:${empCode}`),
+        tenant_id: tenantId,
+        employee_id: empId,
+        contract_number: `HDLD-2026-${String(i + 1).padStart(3, '0')}`,
+        contract_type: isDir || isMgr ? 'indefinite' : 'fixed_term',
+        status: 'active',
+        start_date: dateOnly(-(120 + i * 25)),
+        base_salary_vnd: baseSalary,
+        insurance_salary_vnd: Math.min(baseSalary, 22_000_000),
+        allowances_json: J({ lunch_vnd: 1_000_000, phone_vnd: 500_000 }),
+        signed_by_employee: true,
+        signed_by_employer: true,
+        employer_signer_name: admin.full_name,
+        signed_at: hoursAgo(24 * 60),
+      }, 'tenant_id, contract_number');
+
+      // Seed 21 days of attendance logs cleanly
+      const activeShiftId = u.role === 'sale' ? shiftGalleryId : shiftStdId;
+      for (let dOffset = 0; dOffset < 21; dOffset++) {
+        const dt = new Date(NOW - dOffset * 86_400_000);
+        const day = dt.getDay();
+        if (day === 0 && u.role !== 'sale') continue;
+        const wDate = dt.toISOString().slice(0, 10);
+        const seedKey = (i * 31 + dOffset * 7) % 19;
+        const isLeave = dOffset > 2 && seedKey === 17;
+        const isLate = !isLeave && (seedKey === 3 || seedKey === 11);
+        const lateMins = isLate ? 6 + ((i + dOffset) % 14) : 0;
+        const otHrs = !isLeave && !isLate && (dOffset % 5 === 1 && u.role === 'sale') ? 1.5 : 0;
+        const ciHour = u.role === 'sale' ? 8 : 8;
+        const ciMin = (u.role === 'sale' ? 0 : 22) + (isLate ? 20 + lateMins : ((i + dOffset) % 8));
+        const checkInIso = new Date(`${wDate}T${String(ciHour + Math.floor(ciMin / 60)).padStart(2, '0')}:${String(ciMin % 60).padStart(2, '0')}:00.000Z`).toISOString();
+        const checkOutIso = dOffset === 0 ? null : new Date(`${wDate}T${otHrs > 0 ? '19:00' : '17:38'}:00.000Z`).toISOString();
+
+        await upsert(db, 'tenant_hr_attendance_logs', {
+          id: uid(`attlog:${u.id}:${wDate}`),
+          tenant_id: tenantId,
+          user_id: u.id,
+          employee_id: empId,
+          branch_id: i % 5 === 4 ? branchIdHN : branchIdHQ,
+          shift_id: activeShiftId,
+          work_date: wDate,
+          attendance_code: isLeave ? 'P' : otHrs > 0 ? 'X+OT' : 'X',
+          check_in_at: isLeave ? null : checkInIso,
+          check_out_at: isLeave ? null : checkOutIso,
+          latitude: 16.0544 + ((i % 5) * 0.00012),
+          longitude: 108.2481 + ((dOffset % 4) * 0.00011),
+          distance_meters: 18 + ((i * dOffset) % 45),
+          within_geofence: true,
+          device_info: i % 2 === 0 ? 'iPhone 16 Pro • DOM ERP App' : 'Web GPS Verified',
+          late_minutes: lateMins,
+          early_leave_minutes: 0,
+          worked_hours: isLeave ? 0 : dOffset === 0 ? 4.5 : 8.0 + otHrs,
+          overtime_hours: otHrs,
+          work_units: isLeave ? 1 : 1,
+          status: isLeave ? 'leave' : isLate ? 'late' : 'valid',
+          note: isLeave ? 'Nghỉ phép năm đã duyệt' : isLate ? `Đi muộn ${lateMins} phút (kẹt xe cầu Rồng)` : otHrs > 0 ? 'Trực mở bán Gallery OT 1.5h' : 'Chấm công GPS hợp lệ',
+        }, 'tenant_id, user_id, work_date');
+      }
+    }
+
+    const periodMonth = new Date(NOW).toISOString().slice(0, 7);
+    const batchId = uid(`attbatch:${periodMonth}`);
+    await upsert(db, 'tenant_attendance_confirmation_batches', {
+      id: batchId,
+      tenant_id: tenantId,
+      title: `Xác nhận bảng công tháng ${periodMonth.split('-').reverse().join('/')}`,
+      period_month: periodMonth,
+      from_date: `${periodMonth}-01`,
+      to_date: dateOnly(0),
+      deadline_at: hoursAhead(72),
+      status: 'open',
+      created_by: admin.id,
+    });
+    for (let i = 0; i < hrEmpRows.length; i++) {
+      const u = hrEmpRows[i];
+      await upsert(db, 'tenant_attendance_confirmations', {
+        id: uid(`attconf:${periodMonth}:${u.id}`),
+        tenant_id: tenantId,
+        batch_id: batchId,
+        user_id: u.id,
+        employee_id: empIdByUser.get(u.id) || null,
+        total_work_units: 18 + (i % 3),
+        late_count: i % 3 === 0 ? 1 : 0,
+        early_count: 0,
+        overtime_hours: u.role === 'sale' ? 4.5 : 1.5,
+        status: i % 4 === 0 ? 'pending' : 'confirmed',
+        confirmed_at: i % 4 === 0 ? null : hoursAgo(6 + i),
+        confirmed_by_type: i % 4 === 0 ? null : 'employee',
+      }, 'tenant_id, batch_id, user_id');
     }
 
     // Compensation logs for vivid rounds (admin approved data-error compensation tickets)

@@ -5,7 +5,7 @@ import {
   type TenantSettings,
 } from '../../core/settings/tenant-settings.ts';
 import {
-  buildLegacyDateFilter,
+  buildLegacyDateFilterFromParams,
   DOMATION_PALETTE,
   formatDateTimeVnSql,
   formatPctDelta,
@@ -74,10 +74,9 @@ export async function handleLegacyAnalytics(
   const tenantTz = resolveSafeTimezone(cfg.timezone_name);
 
   if (action === 'get_dashboard_stats') {
-    const dateStr = params.get('date') || 'Tháng này';
     const chartMode = String(params.get('chart_mode') || 'day');
     const chartMetric = String(params.get('chart_metric') || 'lead');
-    const dateFilter = buildLegacyDateFilter(dateStr);
+    const dateFilter = buildLegacyDateFilterFromParams(params, 'Tháng này');
 
     const leadParams: unknown[] = [ctx.tenantId];
     const currDateCond = dateFilter.bindSql('l.created_at', leadParams);
@@ -462,7 +461,7 @@ export async function handleLegacyAnalytics(
   }
 
   if (action === 'get_fair_share_stats') {
-    const dateFilter = buildLegacyDateFilter(params.get('date') || 'Tháng này');
+    const dateFilter = buildLegacyDateFilterFromParams(params, 'Tháng này');
     const requestedRoundId = params.get('round_id') || '';
 
     const roundsRes = await client.query<{ id: string; name: string }>(
@@ -608,9 +607,11 @@ export async function handleLegacyAnalytics(
   }
 
   if (action === 'get_gatekeeper_stats') {
-    const dateFilter = buildLegacyDateFilter(params.get('date') || 'Tháng này');
+    const dateFilter = buildLegacyDateFilterFromParams(params, 'Tháng này');
     const qParams: unknown[] = [ctx.tenantId];
     const cond = dateFilter.bindSql('created_at', qParams);
+    const roundParams: unknown[] = [ctx.tenantId];
+    const roundCond = dateFilter.bindSql('h.created_at', roundParams);
 
     const [heldStats, blacklistRes, roundsRes] = await Promise.all([
       client.query(
@@ -636,9 +637,9 @@ export async function handleLegacyAnalytics(
         `SELECT COALESCE(r.name, 'Chưa phân vòng') AS round_name, COUNT(h.id)::int AS count
          FROM held_leads h
          LEFT JOIN distribution_rounds r ON r.tenant_id = h.tenant_id AND r.id = h.round_id
-         WHERE h.tenant_id = $1
+         WHERE h.tenant_id = $1 AND (${roundCond})
          GROUP BY r.name`,
-        [ctx.tenantId]
+        roundParams
       ),
     ]);
 
@@ -690,6 +691,10 @@ export async function handleLegacyAnalytics(
   }
 
   if (action === 'get_ads_performance_dashboard' || action === 'get_ads_analytics_breakdowns') {
+    const hasExplicitDate = Boolean(
+      params.get('since') || params.get('until') || params.get('start_date') || params.get('end_date') || params.get('date')
+    );
+    const adsDateFilter = hasExplicitDate ? buildLegacyDateFilterFromParams(params, 'all') : null;
     const rawAcctFilter = String(params.get('ad_account_id') || '').trim();
     const acctFilter = rawAcctFilter && rawAcctFilter !== 'all' ? normalizeAdAccountId(rawAcctFilter) : '';
     const insParams: unknown[] = [ctx.tenantId];
@@ -698,6 +703,16 @@ export async function handleLegacyAnalytics(
       insParams.push(acctFilter);
       acctWhere = `AND ad_account_id = $${insParams.length}`;
     }
+    let insDateWhere = '';
+    if (adsDateFilter && adsDateFilter.preset !== 'all' && adsDateFilter.sinceIso && adsDateFilter.untilIso) {
+      insParams.push(adsDateFilter.sinceIso, adsDateFilter.untilIso);
+      insDateWhere = `AND date_start >= $${insParams.length - 1} AND date_start <= $${insParams.length}`;
+    }
+    const leadQueryParams: unknown[] = [ctx.tenantId];
+    const leadDateWhere =
+      adsDateFilter && adsDateFilter.preset !== 'all'
+        ? `AND (${adsDateFilter.bindSql('created_at', leadQueryParams)})`
+        : '';
 
     const adsStages = (
       Array.isArray(cfg.pipeline_capi_stages) && cfg.pipeline_capi_stages.length > 0
@@ -736,7 +751,7 @@ export async function handleLegacyAnalytics(
                 MAX(creative_title) AS creative_title, MAX(creative_body) AS creative_body,
                 MAX(story_id) AS story_id, MAX(optimization_goal) AS optimization_goal
          FROM meta_ads_insights
-         WHERE tenant_id = $1 ${acctWhere}
+         WHERE tenant_id = $1 ${acctWhere} ${insDateWhere}
          GROUP BY ad_id
          ORDER BY spend DESC`,
         insParams
@@ -746,9 +761,9 @@ export async function handleLegacyAnalytics(
                 LOWER(COALESCE(quality_status, 'unrated')) AS qstatus,
                 COUNT(*)::int AS cnt
          FROM leads
-         WHERE tenant_id = $1 AND is_deleted = false
+         WHERE tenant_id = $1 AND is_deleted = false ${leadDateWhere}
          GROUP BY COALESCE(ad_id, 'unattributed'), LOWER(COALESCE(quality_status, 'unrated'))`,
-        [ctx.tenantId]
+        leadQueryParams
       ),
       getMetaAdsConfigSummary(client, ctx.tenantId),
     ]);
@@ -875,11 +890,16 @@ export async function handleLegacyAnalytics(
     };
 
     if (action === 'get_ads_analytics_breakdowns') {
+      const bdParams: unknown[] = [ctx.tenantId];
+      const bdDateWhere =
+        adsDateFilter && adsDateFilter.preset !== 'all'
+          ? `AND (${adsDateFilter.bindSql('created_at', bdParams)})`
+          : '';
       const leadRowsRes = await client.query<{ created_at: Date | string; quality_status: string | null }>(
         `SELECT created_at, quality_status
          FROM leads
-         WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived'`,
-        [ctx.tenantId]
+         WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived' ${bdDateWhere}`,
+        bdParams
       );
       const dailyMap = new Map<string, { date: string; total_leads: number; positive_leads: number }>();
       for (const row of leadRowsRes.rows) {
@@ -916,19 +936,93 @@ export async function handleLegacyAnalytics(
   }
 
   if (action === 'get_capi_dashboard') {
-    const [logsRes, capiDashboard] = await Promise.all([
+    const [logsRes, capiStatsRes, leadMetaCoverageRes, pendingBackfillRes, capiDashboard] = await Promise.all([
       client.query(
-        `SELECT cl.id, cl.lead_id, l.name AS lead_name, cl.dataset_id, cl.event_name,
-                cl.action_source, cl.response_status, cl.sent_at
+        `SELECT cl.id, cl.lead_id, l.name AS lead_name, l.phone AS lead_phone,
+                l.quality_status, l.meta_lead_id AS lead_meta_id, l.ad_id,
+                l.campaign AS lead_campaign_name, l.custom_fields->>'ad_name' AS lead_ad_name,
+                cl.dataset_id, cl.event_name, cl.event_id, cl.action_source,
+                cl.match_keys, cl.sent_payload, cl.response_status, cl.response_body, cl.sent_at
          FROM capi_logs cl
          LEFT JOIN leads l ON l.tenant_id = cl.tenant_id AND l.id = cl.lead_id
          WHERE cl.tenant_id = $1
          ORDER BY cl.sent_at DESC
-         LIMIT 50`,
+         LIMIT 200`,
+        [ctx.tenantId]
+      ),
+      client.query<{
+        total_sent_ok: number;
+        positive_sent_ok: number;
+        spam_sent_ok: number;
+        failed_count: number;
+        total_logs: number;
+      }>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN cl.response_status >= 200 AND cl.response_status < 300 THEN 1 ELSE 0 END), 0)::int AS total_sent_ok,
+           COALESCE(SUM(CASE
+             WHEN cl.response_status >= 200 AND cl.response_status < 300 AND (
+               LOWER(COALESCE(l.quality_status, '')) IN ('qualified', 'booked', 'booking', 'deposited', 'closed', 'good')
+               OR (COALESCE(l.quality_status, '') = '' AND cl.event_name IN ('Lead', 'Schedule', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase'))
+             ) THEN 1 ELSE 0 END), 0)::int AS positive_sent_ok,
+           COALESCE(SUM(CASE
+             WHEN cl.response_status >= 200 AND cl.response_status < 300 AND (
+               LOWER(COALESCE(l.quality_status, '')) IN ('notlead', 'spam')
+               OR cl.event_name = 'DisqualifiedLead'
+             ) THEN 1 ELSE 0 END), 0)::int AS spam_sent_ok,
+           COALESCE(SUM(CASE WHEN cl.response_status < 200 OR cl.response_status >= 300 THEN 1 ELSE 0 END), 0)::int AS failed_count,
+           COUNT(*)::int AS total_logs
+         FROM capi_logs cl
+         LEFT JOIN leads l ON l.tenant_id = cl.tenant_id AND l.id = cl.lead_id
+         WHERE cl.tenant_id = $1`,
+        [ctx.tenantId]
+      ),
+      client.query<{
+        leads_with_meta_id: number;
+        leads_with_fbclid: number;
+        leads_with_ad_id: number;
+      }>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN NULLIF(TRIM(meta_lead_id), '') IS NOT NULL THEN 1 ELSE 0 END), 0)::int AS leads_with_meta_id,
+           COALESCE(SUM(CASE WHEN NULLIF(TRIM(fbclid), '') IS NOT NULL THEN 1 ELSE 0 END), 0)::int AS leads_with_fbclid,
+           COALESCE(SUM(CASE WHEN NULLIF(TRIM(ad_id), '') IS NOT NULL THEN 1 ELSE 0 END), 0)::int AS leads_with_ad_id
+         FROM leads
+         WHERE tenant_id = $1 AND is_deleted = false AND status != 'archived'`,
+        [ctx.tenantId]
+      ),
+      client.query<{
+        pending_positive: number;
+        pending_spam: number;
+      }>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN LOWER(COALESCE(l.quality_status, '')) IN ('qualified', 'booked', 'booking', 'deposited', 'closed', 'good') THEN 1 ELSE 0 END), 0)::int AS pending_positive,
+           COALESCE(SUM(CASE WHEN LOWER(COALESCE(l.quality_status, '')) IN ('notlead', 'spam') THEN 1 ELSE 0 END), 0)::int AS pending_spam
+         FROM leads l
+         WHERE l.tenant_id = $1 AND l.is_deleted = false AND l.status != 'archived'
+           AND LOWER(COALESCE(l.quality_status, '')) IN ('qualified', 'booked', 'booking', 'deposited', 'closed', 'good', 'notlead', 'spam')
+           AND NOT EXISTS (
+             SELECT 1 FROM capi_logs cl
+             WHERE cl.tenant_id = l.tenant_id AND cl.lead_id = l.id
+               AND cl.response_status >= 200 AND cl.response_status < 300
+           )`,
         [ctx.tenantId]
       ),
       getMetaCapiDashboardConfig(client, ctx.tenantId, cfg.dual_capi_enabled),
     ]);
+
+    const sRow = capiStatsRes.rows[0] || {
+      total_sent_ok: 0,
+      positive_sent_ok: 0,
+      spam_sent_ok: 0,
+      failed_count: 0,
+      total_logs: 0,
+    };
+    const mRow = leadMetaCoverageRes.rows[0] || {
+      leads_with_meta_id: 0,
+      leads_with_fbclid: 0,
+      leads_with_ad_id: 0,
+    };
+    const pRow = pendingBackfillRes.rows[0] || { pending_positive: 0, pending_spam: 0 };
+
     return {
       success: true,
       config: capiDashboard.config,
@@ -939,10 +1033,51 @@ export async function handleLegacyAnalytics(
       closed_value_vnd: capiDashboard.config.capi_closed_value_vnd,
       event_triggers: capiDashboard.config.capi_event_triggers,
       custom_events: capiDashboard.config.capi_custom_events,
-      logs: logsRes.rows.map((r) => ({ ...r, sent_at: formatDateTimeVnSql(r.sent_at) })),
+      logs: logsRes.rows.map((r) => {
+        const matchKeysStr =
+          typeof r.match_keys === 'string'
+            ? r.match_keys
+            : r.match_keys && typeof r.match_keys === 'object'
+              ? Object.keys(r.match_keys).join(', ')
+              : '';
+        const payloadObj =
+          r.sent_payload && typeof r.sent_payload === 'object' ? r.sent_payload : null;
+        const derivedTrigger =
+          payloadObj?.trigger_source ||
+          (['Notlead', 'Spam'].includes(String(r.quality_status || '')) ||
+          r.event_name === 'DisqualifiedLead'
+            ? 'gatekeeper_spam'
+            : 'sale_portal');
+        return {
+          ...r,
+          lead_phone:
+            ctx.isExternalAgency && r.lead_phone ? maskPhoneString(r.lead_phone, cfg) : r.lead_phone,
+          trigger_source: derivedTrigger,
+          match_keys: matchKeysStr,
+          sent_payload:
+            typeof r.sent_payload === 'string'
+              ? r.sent_payload
+              : JSON.stringify(r.sent_payload || {}),
+          response_body:
+            typeof r.response_body === 'string'
+              ? r.response_body
+              : JSON.stringify(r.response_body || {}),
+          sent_at: formatDateTimeVnSql(r.sent_at),
+        };
+      }),
       stats: {
-        total_sent: logsRes.rows.length,
-        success_count: logsRes.rows.filter((r) => Number(r.response_status) === 200).length,
+        total_sent: Number(sRow.total_logs || logsRes.rows.length),
+        success_count: Number(sRow.total_sent_ok || 0),
+        total_sent_ok: Number(sRow.total_sent_ok || 0),
+        positive_sent_ok: Number(sRow.positive_sent_ok || 0),
+        spam_sent_ok: Number(sRow.spam_sent_ok || 0),
+        pending_backfill_total: Number(pRow.pending_positive || 0) + Number(pRow.pending_spam || 0),
+        pending_backfill_positive: Number(pRow.pending_positive || 0),
+        pending_backfill_spam: Number(pRow.pending_spam || 0),
+        leads_with_meta_id: Number(mRow.leads_with_meta_id || 0),
+        leads_with_fbclid: Number(mRow.leads_with_fbclid || 0),
+        leads_with_ad_id: Number(mRow.leads_with_ad_id || 0),
+        failed_count: Number(sRow.failed_count || 0),
       },
     };
   }

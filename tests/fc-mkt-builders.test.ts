@@ -76,6 +76,9 @@ describe('Stage 3B Full-Clone Marketing Visual Builders Backend & 32-Table RLS S
 
     // Unlock Growth Suite (`growth_combo`) on both tenants
     for (const t of [tenantA, tenantB]) {
+      await withTenantTransaction(t.id, async (client) => {
+        await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [t.id]);
+      });
       const sw = await apiRequest(harness.baseUrl, '/api/v1/billing/switch-package', {
         method: 'POST',
         token: t.token,

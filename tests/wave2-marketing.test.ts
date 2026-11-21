@@ -82,7 +82,13 @@ describe('Wave 2 Phase 2: Full Marketing Automation Suite & Kernel RLS Zero-Leak
     assert.equal(blocked.status, 403);
     assert.equal(blocked.json.error.code, 'MODULE_NOT_ENTITLED');
 
-    // Switch Tenant B to Gói 2 (`marketing_standalone`) and Tenant A to Gói 3 (`growth_combo`)
+    // Fund & Switch Tenant B to Gói 2 (`marketing_standalone`) and Tenant A to Gói 3 (`growth_combo`)
+    await withTenantTransaction(tenantB.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantB.id]);
+    });
+    await withTenantTransaction(tenantA.id, async (client) => {
+      await client.query('UPDATE tenants SET wallet_balance_vnd = 10000000 WHERE id = $1', [tenantA.id]);
+    });
     const swB = await apiRequest(harness.baseUrl, '/api/v1/billing/switch-package', {
       method: 'POST',
       token: tenantB.token,

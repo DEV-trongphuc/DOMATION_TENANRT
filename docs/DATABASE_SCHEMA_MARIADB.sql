@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS tenants (
     status VARCHAR(50) NOT NULL DEFAULT 'active',
     trial_ends_at DATETIME(6) NULL,
     subscription_expires_at DATETIME(6) NULL,
+    grace_ends_at DATETIME(6) NULL,
+    auto_renew TINYINT(1) NOT NULL DEFAULT 1,
+    cancel_at_period_end TINYINT(1) NOT NULL DEFAULT 0,
+    cancelled_at DATETIME(6) NULL,
+    scheduled_plan_code VARCHAR(80) NULL,
+    scheduled_billing_cycle VARCHAR(30) NULL,
     subscription_plan_code VARCHAR(80) NOT NULL DEFAULT 'trial_1m',
     billing_cycle VARCHAR(30) NOT NULL DEFAULT 'trial',
     wallet_balance_vnd BIGINT NOT NULL DEFAULT 0,
@@ -59,7 +65,8 @@ CREATE TABLE IF NOT EXISTS tenants (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     INDEX idx_tenants_slug (slug),
     INDEX idx_tenants_obfuscated_slug (obfuscated_slug),
-    INDEX idx_tenants_status (status)
+    INDEX idx_tenants_status (status),
+    INDEX idx_tenants_subscription_expiry (status, subscription_expires_at, trial_ends_at, grace_ends_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_onboarding_progress (
@@ -308,9 +315,15 @@ CREATE TABLE IF NOT EXISTS leads (
     INDEX idx_leads_tenant_status (tenant_id, status),
     INDEX idx_leads_tenant_assigned (tenant_id, assigned_to),
     INDEX idx_leads_tenant_created (tenant_id, created_at DESC),
+    INDEX idx_leads_tenant_created_at (tenant_id, created_at DESC),
     INDEX idx_leads_tenant_assigned_status_created (tenant_id, assigned_to, status, created_at DESC),
     INDEX idx_leads_tenant_round_created (tenant_id, round_id, created_at DESC),
     INDEX idx_leads_tenant_campaign_ad (tenant_id, campaign_id, ad_id),
+    INDEX idx_leads_tenant_ad_id (tenant_id, ad_id),
+    INDEX idx_leads_tenant_adset_id (tenant_id, adset_id),
+    INDEX idx_leads_tenant_adset_created (tenant_id, adset_id, created_at DESC),
+    INDEX idx_leads_tenant_email (tenant_id, email),
+    INDEX idx_leads_tenant_updated (tenant_id, updated_at DESC),
     INDEX idx_leads_tenant_pipeline_created (tenant_id, pipeline_id, created_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -394,10 +407,14 @@ CREATE TABLE IF NOT EXISTS capi_logs (
     sent_payload JSON NOT NULL,
     response_status INT NOT NULL,
     response_body JSON NULL,
+    retry_count INT NOT NULL DEFAULT 0,
+    next_retry_at DATETIME(6) NULL,
     sent_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     CONSTRAINT fk_capi_logs_lead FOREIGN KEY (tenant_id, lead_id) REFERENCES leads(tenant_id, id) ON DELETE CASCADE,
     INDEX idx_capi_logs_lookup (tenant_id, lead_id, sent_at DESC),
-    INDEX idx_capi_logs_tenant_sent (tenant_id, sent_at DESC)
+    INDEX idx_capi_logs_tenant_sent (tenant_id, sent_at DESC),
+    INDEX idx_capi_logs_lead_event_status (tenant_id, lead_id, event_name, response_status),
+    INDEX idx_capi_logs_retry_next (response_status, next_retry_at, sent_at ASC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS data_reports (
@@ -417,7 +434,8 @@ CREATE TABLE IF NOT EXISTS data_reports (
     CONSTRAINT fk_data_reports_reporter FOREIGN KEY (tenant_id, reporter_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE,
     CONSTRAINT fk_data_reports_resolver FOREIGN KEY (tenant_id, resolved_by) REFERENCES users(tenant_id, id) ON DELETE SET NULL,
     INDEX idx_data_reports_tenant (tenant_id, status, created_at DESC),
-    INDEX idx_data_reports_tenant_created (tenant_id, created_at DESC)
+    INDEX idx_data_reports_tenant_created (tenant_id, created_at DESC),
+    INDEX idx_data_reports_tenant_lead_created (tenant_id, lead_id, created_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_billing_transactions (
@@ -428,8 +446,12 @@ CREATE TABLE IF NOT EXISTS tenant_billing_transactions (
     billing_cycle VARCHAR(30) NULL,
     months_added INT NOT NULL DEFAULT 0,
     amount_vnd BIGINT NOT NULL DEFAULT 0,
+    proration_credit_vnd BIGINT NOT NULL DEFAULT 0,
     discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
     payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+    provider VARCHAR(40) NOT NULL DEFAULT 'manual_bank_transfer',
+    external_tx_id VARCHAR(160) NULL,
+    idempotency_key VARCHAR(120) NULL,
     status VARCHAR(30) NOT NULL DEFAULT 'pending',
     reference_code VARCHAR(80) NULL,
     note TEXT NULL,
@@ -439,8 +461,13 @@ CREATE TABLE IF NOT EXISTS tenant_billing_transactions (
     processed_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     CONSTRAINT fk_billing_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+    UNIQUE INDEX uk_billing_tx_tenant_idempotency (tenant_id, idempotency_key),
+    UNIQUE INDEX uk_billing_tx_provider_ext (provider, external_tx_id),
+    UNIQUE INDEX uk_billing_tx_reference_code (reference_code),
     INDEX idx_billing_tx_tenant_created (tenant_id, created_at DESC),
-    INDEX idx_billing_tx_status_created (status, created_at DESC)
+    INDEX idx_billing_tx_status_created (status, created_at DESC),
+    INDEX idx_billing_tx_tenant_status_created (tenant_id, status, created_at DESC),
+    INDEX idx_billing_tx_tenant_type_created (tenant_id, tx_type, created_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS consultant_managers (
@@ -562,7 +589,8 @@ CREATE TABLE IF NOT EXISTS meta_ads_insights (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     CONSTRAINT uk_meta_ads_tenant_ad_date UNIQUE (tenant_id, ad_id, date_start, date_stop),
     CONSTRAINT fk_meta_ads_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-    INDEX idx_meta_ads_tenant_date (tenant_id, date_start DESC)
+    INDEX idx_meta_ads_tenant_date (tenant_id, date_start DESC),
+    INDEX idx_meta_ads_tenant_ad_stop (tenant_id, ad_id, date_stop DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS lead_import_batches (
@@ -1512,8 +1540,10 @@ CREATE TABLE IF NOT EXISTS mkt_email_templates (
     preheader VARCHAR(255) NOT NULL DEFAULT '',
     category VARCHAR(60) NOT NULL DEFAULT 'general',
     blocks_json JSON NOT NULL,
+    saved_blocks_json JSON NULL,
     body_style JSON NOT NULL,
     compiled_html MEDIUMTEXT NOT NULL,
+    thumbnail_url TEXT NULL,
     spam_score INT NOT NULL DEFAULT 0,
     merge_tags JSON NOT NULL,
     visibility VARCHAR(30) NOT NULL DEFAULT 'company',
@@ -1571,6 +1601,7 @@ CREATE TABLE IF NOT EXISTS mkt_custom_events (
     event_category VARCHAR(30) NOT NULL DEFAULT 'custom',
     description TEXT NULL,
     schema_json JSON NOT NULL,
+    webhook_secret VARCHAR(120) NULL,
     trigger_count INT NOT NULL DEFAULT 0,
     total_revenue_vnd BIGINT NOT NULL DEFAULT 0,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
@@ -1592,6 +1623,7 @@ CREATE TABLE IF NOT EXISTS mkt_otp_verifications (
     verified TINYINT(1) NOT NULL DEFAULT 0,
     expires_at DATETIME(6) NOT NULL,
     verified_at DATETIME(6) NULL,
+    consumed_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     UNIQUE KEY uk_mkt_otp_verifications_tenant_id (tenant_id, id),
     INDEX idx_mkt_otp_lookup (tenant_id, recipient, created_at)
@@ -1608,6 +1640,8 @@ CREATE TABLE IF NOT EXISTS mkt_surveys (
     blocks_json JSON NOT NULL,
     theme_json JSON NOT NULL,
     settings_json JSON NOT NULL,
+    redirect_rules_json JSON NULL,
+    thank_you_json JSON NULL,
     response_count INT NOT NULL DEFAULT 0,
     avg_score DECIMAL(6,2) NOT NULL DEFAULT 0,
     created_by VARCHAR(36) NULL,
@@ -1648,6 +1682,11 @@ CREATE TABLE IF NOT EXISTS mkt_campaigns (
     sender_name VARCHAR(150) NULL,
     sender_email VARCHAR(255) NULL,
     reminder_config JSON NOT NULL,
+    fallback_vars_json JSON NULL,
+    throttle_per_minute INT NOT NULL DEFAULT 0,
+    ab_winner_criteria VARCHAR(40) NOT NULL DEFAULT 'open_rate',
+    ab_test_hours INT NOT NULL DEFAULT 4,
+    pre_send_score INT NOT NULL DEFAULT 100,
     scheduled_at DATETIME(6) NULL,
     sent_at DATETIME(6) NULL,
     total_targeted INT NOT NULL DEFAULT 0,
@@ -1706,6 +1745,7 @@ CREATE TABLE IF NOT EXISTS mkt_flows (
     trigger_type VARCHAR(60) NOT NULL DEFAULT 'form_submitted',
     trigger_config JSON NOT NULL,
     steps_json JSON NOT NULL,
+    settings_json JSON NULL,
     version INT NOT NULL DEFAULT 1,
     enrolled_count INT NOT NULL DEFAULT 0,
     completed_count INT NOT NULL DEFAULT 0,
@@ -1853,6 +1893,11 @@ CREATE TABLE IF NOT EXISTS mkt_web_sessions (
     utm_medium VARCHAR(100) NULL,
     utm_campaign VARCHAR(150) NULL,
     device_type VARCHAR(30) NOT NULL DEFAULT 'desktop',
+    geo_country VARCHAR(60) NOT NULL DEFAULT 'VN',
+    geo_city VARCHAR(100) NULL,
+    browser VARCHAR(60) NULL,
+    os VARCHAR(60) NULL,
+    duration_seconds INT NOT NULL DEFAULT 0,
     pageviews_count INT NOT NULL DEFAULT 1,
     pricing_intent_detected TINYINT(1) NOT NULL DEFAULT 0,
     started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -2147,7 +2192,8 @@ CREATE TABLE IF NOT EXISTS tenant_tasks (
       completed_at DATETIME(6) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_tasks_tenant_id UNIQUE (tenant_id, id)
+      CONSTRAINT uk_tenant_tasks_tenant_id UNIQUE (tenant_id, id),
+      INDEX idx_tenant_tasks_assignee_status (tenant_id, assignee_user_id, status_key, due_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_pomodoro_sessions (
@@ -2189,7 +2235,9 @@ CREATE TABLE IF NOT EXISTS tenant_helpdesk_tickets (
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_helpdesk_tickets_tenant_id UNIQUE (tenant_id, id),
-      CONSTRAINT uk_tenant_helpdesk_code UNIQUE (tenant_id, ticket_code)
+      CONSTRAINT uk_tenant_helpdesk_code UNIQUE (tenant_id, ticket_code),
+      INDEX idx_helpdesk_lead (tenant_id, lead_id, created_at),
+      INDEX idx_helpdesk_assignee_status (tenant_id, assignee_user_id, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_helpdesk_comments (
@@ -2354,7 +2402,9 @@ CREATE TABLE IF NOT EXISTS tenant_deals (
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_deals_tenant_id UNIQUE (tenant_id, id),
-      CONSTRAINT uk_tenant_deals_code UNIQUE (tenant_id, deal_code)
+      CONSTRAINT uk_tenant_deals_code UNIQUE (tenant_id, deal_code),
+      INDEX idx_tenant_deals_owner_stage (tenant_id, owner_user_id, stage),
+      INDEX idx_tenant_deals_company (tenant_id, company_id, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_suppliers (
@@ -2818,14 +2868,17 @@ CREATE TABLE IF NOT EXISTS tenant_invoices (
       deposit_id VARCHAR(36) NULL,
       company_id VARCHAR(36) NULL,
       lead_id VARCHAR(36) NULL,
+      deal_id VARCHAR(36) NULL,
       supplier_id VARCHAR(36) NULL,
       branch_id VARCHAR(36) NULL,
-      customer_name VARCHAR(200) NOT NULL,
+      customer_name VARCHAR(200) NOT NULL DEFAULT '',
       customer_tax_code VARCHAR(60) NULL,
+      tax_code VARCHAR(50) NULL,
       customer_address TEXT NULL,
       customer_email VARCHAR(255) NULL,
       status VARCHAR(30) NOT NULL DEFAULT 'issued',
-      issue_date DATE NOT NULL,
+      issue_date DATE NULL,
+      issued_at DATETIME(6) NULL,
       due_date DATE NULL,
       items_json JSON NULL,
       subtotal_vnd BIGINT NOT NULL DEFAULT 0,
@@ -2842,7 +2895,8 @@ CREATE TABLE IF NOT EXISTS tenant_invoices (
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_invoices_tenant_id UNIQUE (tenant_id, id),
-      CONSTRAINT uk_tenant_invoices_code UNIQUE (tenant_id, invoice_code)
+      CONSTRAINT uk_tenant_invoices_code UNIQUE (tenant_id, invoice_code),
+      INDEX idx_crm360_invoices_lead (tenant_id, lead_id, created_at DESC)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_invoice_items (
@@ -3032,13 +3086,16 @@ CREATE TABLE IF NOT EXISTS tenant_task_dependencies (
       tenant_id VARCHAR(36) NOT NULL,
       project_id VARCHAR(36) NULL,
       task_id VARCHAR(36) NOT NULL,
-      predecessor_task_id VARCHAR(36) NOT NULL,
-      dependency_type VARCHAR(10) NOT NULL DEFAULT 'FS',
+      predecessor_task_id VARCHAR(36) NULL,
+      depends_on_task_id VARCHAR(36) NULL,
+      dependency_type VARCHAR(30) NOT NULL DEFAULT 'FS',
       lag_days INT NOT NULL DEFAULT 0,
+      note TEXT NULL,
       created_by VARCHAR(36) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_task_deps_tenant_id UNIQUE (tenant_id, id),
-      CONSTRAINT uk_task_dep_pair UNIQUE (tenant_id, task_id, predecessor_task_id)
+      CONSTRAINT uk_task_dep_pair UNIQUE (tenant_id, task_id, predecessor_task_id),
+      INDEX idx_task_deps_lookup (tenant_id, task_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_task_comments (
@@ -3046,13 +3103,15 @@ CREATE TABLE IF NOT EXISTS tenant_task_comments (
       tenant_id VARCHAR(36) NOT NULL,
       task_id VARCHAR(36) NOT NULL,
       author_user_id VARCHAR(36) NULL,
-      author_name VARCHAR(150) NOT NULL,
+      author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên',
       content TEXT NOT NULL,
       mentions_json JSON NULL,
       attachments_json JSON NULL,
+      edit_history_json JSON NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id)
+      CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id),
+      INDEX idx_task_comments_lookup (tenant_id, task_id, created_at ASC)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_task_attachments (
@@ -3063,10 +3122,12 @@ CREATE TABLE IF NOT EXISTS tenant_task_attachments (
       file_url TEXT NOT NULL,
       mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
       size_bytes BIGINT NOT NULL DEFAULT 0,
+      cloud_file_id VARCHAR(36) NULL,
       uploaded_by VARCHAR(36) NULL,
       uploaded_by_name VARCHAR(150) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_task_attachments_tenant_id UNIQUE (tenant_id, id)
+      CONSTRAINT uk_tenant_task_attachments_tenant_id UNIQUE (tenant_id, id),
+      INDEX idx_task_attachments_lookup (tenant_id, task_id, created_at DESC)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_task_whiteboard_snapshots (
@@ -3364,7 +3425,8 @@ CREATE TABLE IF NOT EXISTS tenant_custom_fields (
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_custom_fields_tenant_id UNIQUE (tenant_id, id),
       CONSTRAINT uk_tenant_custom_fields_key UNIQUE (tenant_id, entity_type, field_key),
-      INDEX idx_custom_fields_tenant_entity (tenant_id, entity_type, sort_order)
+      INDEX idx_custom_fields_tenant_entity (tenant_id, entity_type, sort_order),
+      INDEX idx_custom_fields_lookup (tenant_id, entity_type, is_active, sort_order)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_lead_scoring_rules (
@@ -3432,24 +3494,30 @@ CREATE TABLE IF NOT EXISTS tenant_entity_tabs (
       tenant_id VARCHAR(36) NOT NULL,
       entity_type VARCHAR(40) NOT NULL DEFAULT 'lead',
       tab_key VARCHAR(80) NOT NULL,
-      label VARCHAR(140) NOT NULL,
+      label VARCHAR(140) NOT NULL DEFAULT '',
+      tab_label VARCHAR(150) NOT NULL DEFAULT '',
       icon_name VARCHAR(60) NOT NULL DEFAULT 'Layers',
       tab_type VARCHAR(30) NOT NULL DEFAULT 'fields',
       config_json JSON NOT NULL,
+      fields_json JSON NULL,
       allowed_role_ids JSON NOT NULL,
+      allowed_roles JSON NULL,
       sort_order INT NOT NULL DEFAULT 0,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
+      created_by VARCHAR(36) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_entity_tabs_tenant_id UNIQUE (tenant_id, id),
       CONSTRAINT uk_tenant_entity_tabs_key UNIQUE (tenant_id, entity_type, tab_key),
-      INDEX idx_entity_tabs_tenant_entity (tenant_id, entity_type, sort_order)
+      INDEX idx_entity_tabs_tenant_entity (tenant_id, entity_type, sort_order),
+      INDEX idx_entity_tabs_lookup (tenant_id, entity_type, is_active, sort_order)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_cron_runs (
       id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
+      tenant_id VARCHAR(36) NULL,
       subroutine_key VARCHAR(80) NOT NULL,
+      run_key VARCHAR(120) NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'success',
       items_processed INT NOT NULL DEFAULT 0,
       duration_ms INT NOT NULL DEFAULT 0,
@@ -3460,7 +3528,10 @@ CREATE TABLE IF NOT EXISTS tenant_cron_runs (
       finished_at DATETIME(6) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       CONSTRAINT uk_tenant_cron_runs_tenant_id UNIQUE (tenant_id, id),
-      INDEX idx_cron_runs_tenant_sub (tenant_id, subroutine_key, started_at)
+      UNIQUE INDEX uk_cron_runs_tenant_sub_run_key (tenant_id, subroutine_key, run_key),
+      INDEX idx_cron_runs_tenant_sub (tenant_id, subroutine_key, started_at),
+      INDEX idx_cron_runs_tenant_sub_status (tenant_id, subroutine_key, status, started_at),
+      INDEX idx_cron_runs_sub_started (subroutine_key, started_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tenant_deal_stage_history (
@@ -3483,38 +3554,7 @@ CREATE TABLE IF NOT EXISTS tenant_deal_stage_history (
       CONSTRAINT uk_tenant_deal_stage_history_tenant_id UNIQUE (tenant_id, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS tenant_entity_tabs (
-      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
-      entity_type VARCHAR(40) NOT NULL DEFAULT 'contact',
-      tab_key VARCHAR(64) NOT NULL,
-      tab_label VARCHAR(150) NOT NULL,
-      icon_name VARCHAR(50) NOT NULL DEFAULT 'Layers',
-      sort_order INT NOT NULL DEFAULT 0,
-      fields_json JSON NULL,
-      allowed_roles JSON NULL,
-      is_active TINYINT(1) NOT NULL DEFAULT 1,
-      created_by VARCHAR(36) NULL,
-      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_entity_tabs_tenant_id UNIQUE (tenant_id, id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS tenant_custom_fields (
-      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
-      entity_type VARCHAR(40) NOT NULL DEFAULT 'contact',
-      field_key VARCHAR(64) NOT NULL,
-      field_label VARCHAR(150) NOT NULL,
-      field_type VARCHAR(30) NOT NULL DEFAULT 'text',
-      is_required TINYINT(1) NOT NULL DEFAULT 0,
-      options_json JSON NULL,
-      sort_order INT NOT NULL DEFAULT 0,
-      is_active TINYINT(1) NOT NULL DEFAULT 1,
-      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_custom_fields_tenant_id UNIQUE (tenant_id, id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- Canonical definitions for tenant_entity_tabs and tenant_custom_fields merged into Section 11 above.
 
 CREATE TABLE IF NOT EXISTS tenant_crm_activities (
       id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
@@ -3542,47 +3582,7 @@ CREATE TABLE IF NOT EXISTS tenant_crm_activities (
       CONSTRAINT uk_tenant_crm_activities_tenant_id UNIQUE (tenant_id, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS tenant_task_dependencies (
-      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
-      task_id VARCHAR(36) NOT NULL,
-      depends_on_task_id VARCHAR(36) NOT NULL,
-      dependency_type VARCHAR(30) NOT NULL DEFAULT 'blocked_by',
-      note TEXT NULL,
-      created_by VARCHAR(36) NULL,
-      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_task_dependencies_tenant_id UNIQUE (tenant_id, id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS tenant_task_comments (
-      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
-      task_id VARCHAR(36) NOT NULL,
-      author_user_id VARCHAR(36) NULL,
-      author_name VARCHAR(150) NOT NULL DEFAULT 'Thành viên',
-      content TEXT NOT NULL,
-      mentions_json JSON NULL,
-      attachments_json JSON NULL,
-      edit_history_json JSON NULL,
-      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_task_comments_tenant_id UNIQUE (tenant_id, id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS tenant_task_attachments (
-      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
-      task_id VARCHAR(36) NOT NULL,
-      file_name VARCHAR(255) NOT NULL,
-      file_url TEXT NOT NULL,
-      mime_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
-      size_bytes BIGINT NOT NULL DEFAULT 0,
-      cloud_file_id VARCHAR(36) NULL,
-      uploaded_by VARCHAR(36) NULL,
-      uploaded_by_name VARCHAR(150) NULL,
-      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_task_attachments_tenant_id UNIQUE (tenant_id, id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- Canonical definitions for tenant_task_dependencies, tenant_task_comments, and tenant_task_attachments merged into ERP-Ops section above.
 
 CREATE TABLE IF NOT EXISTS tenant_workspace_task_groups (
       id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
@@ -3628,34 +3628,7 @@ CREATE TABLE IF NOT EXISTS tenant_contact_files (
       CONSTRAINT uk_tenant_contact_files_tenant_id UNIQUE (tenant_id, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS tenant_invoices (
-      id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
-      tenant_id VARCHAR(36) NOT NULL,
-      invoice_code VARCHAR(50) NOT NULL,
-      sales_order_id VARCHAR(36) NULL,
-      quote_id VARCHAR(36) NULL,
-      lead_id VARCHAR(36) NULL,
-      company_id VARCHAR(36) NULL,
-      deal_id VARCHAR(36) NULL,
-      customer_name VARCHAR(200) NOT NULL DEFAULT '',
-      tax_code VARCHAR(50) NULL,
-      status VARCHAR(30) NOT NULL DEFAULT 'issued',
-      subtotal_vnd BIGINT NOT NULL DEFAULT 0,
-      discount_vnd BIGINT NOT NULL DEFAULT 0,
-      tax_vnd BIGINT NOT NULL DEFAULT 0,
-      total_vnd BIGINT NOT NULL DEFAULT 0,
-      paid_vnd BIGINT NOT NULL DEFAULT 0,
-      due_date DATE NULL,
-      issued_at DATETIME(6) NULL,
-      items_json JSON NULL,
-      notes TEXT NULL,
-      created_by VARCHAR(36) NULL,
-      created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-      updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-      CONSTRAINT uk_tenant_invoices_tenant_id UNIQUE (tenant_id, id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-ALTER TABLE tenant_cron_runs MODIFY COLUMN tenant_id VARCHAR(36) NULL;
+-- Canonical definition for tenant_invoices merged into ERP-Ops section above.
 
 -- =============================================================================
 

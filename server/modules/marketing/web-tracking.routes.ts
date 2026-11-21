@@ -17,6 +17,8 @@ import {
 
 export const webTrackingRouter = Router();
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 webTrackingRouter.use(requireEntitlement('mkt_web_tracking'));
 
 // List Tracked Web Properties + Live Sessions KPI + Pricing Intent Alerts
@@ -168,78 +170,145 @@ webTrackingRouter.get('/sessions', requirePermission('mkt_web_tracking', 'view')
 webTrackingRouter.get('/heatmap', requirePermission('mkt_web_tracking', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
-    const propertyId = req.query.property_id ? String(req.query.property_id) : null;
-    const pageUrl = req.query.page_url ? String(req.query.page_url).trim() : '';
+    const rawPropertyId = String(req.query.property_id || req.query.id || '').trim();
+    const propertyId = rawPropertyId || null;
+    const pageUrl = String(req.query.page_url || req.query.url || '').trim();
+    const rawDevice = String(req.query.device || '').trim().toLowerCase();
+    const deviceFilter = rawDevice && rawDevice !== 'all' ? rawDevice : null;
+
+    if (propertyId && !UUID_REGEX.test(propertyId)) {
+      res.json({
+        success: true,
+        data: {
+          click_points: [],
+          scroll_reach_pct: { depth_25: 0, depth_50: 0, depth_75: 0, depth_100: 0 },
+          tracked_pages: [],
+          recent_events: [],
+        },
+      });
+      return;
+    }
 
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
-      let sql = `
-        SELECT id, event_type, page_url, element_selector, x_pct, y_pct, scroll_depth_pct, metadata, created_at
-        FROM mkt_web_events
-        WHERE tenant_id = $1 AND event_type IN ('click', 'scroll')
-      `;
       const params: unknown[] = [ctx.tenantId];
+      let joinSql = '';
+      let whereSql = `e.tenant_id = $1 AND e.event_type IN ('click', 'outbound_click', 'scroll')`;
+
+      if (deviceFilter) {
+        params.push(deviceFilter);
+        joinSql = `INNER JOIN mkt_web_sessions s ON s.tenant_id = e.tenant_id AND s.id = e.session_id`;
+        whereSql += ` AND LOWER(COALESCE(s.device_type, 'desktop')) = $${params.length}`;
+      }
       if (propertyId) {
         params.push(propertyId);
-        sql += ` AND property_id = $${params.length}`;
+        whereSql += ` AND e.property_id = $${params.length}`;
       }
       if (pageUrl) {
         params.push(`%${pageUrl.toLowerCase()}%`);
-        sql += ` AND LOWER(page_url) LIKE $${params.length}`;
+        whereSql += ` AND LOWER(e.page_url) LIKE $${params.length}`;
       }
-      sql += ` ORDER BY created_at DESC LIMIT 500`;
+
+      const sql = `
+        SELECT e.id, e.event_type, e.page_url, e.element_selector, e.x_pct, e.y_pct,
+               e.scroll_depth_pct, e.metadata, e.created_at
+        FROM mkt_web_events e
+        ${joinSql}
+        WHERE ${whereSql}
+        ORDER BY e.created_at DESC
+        LIMIT 500
+      `;
+
+      const pageParams: unknown[] = [ctx.tenantId];
+      let pageJoinSql = '';
+      let pageWhereSql = 'e.tenant_id = $1';
+      if (propertyId) {
+        pageParams.push(propertyId);
+        pageWhereSql += ` AND e.property_id = $${pageParams.length}`;
+      }
+      if (deviceFilter) {
+        pageParams.push(deviceFilter);
+        pageJoinSql = `INNER JOIN mkt_web_sessions s ON s.tenant_id = e.tenant_id AND s.id = e.session_id`;
+        pageWhereSql += ` AND LOWER(COALESCE(s.device_type, 'desktop')) = $${pageParams.length}`;
+      }
 
       const [eventsRes, pagesRes] = await Promise.all([
         client.query(sql, params),
         client.query<{ page_url: string; cnt: number }>(
-          `SELECT page_url, COUNT(*)::int AS cnt
-           FROM mkt_web_events
-           WHERE tenant_id = $1
-           GROUP BY page_url
+          `SELECT e.page_url, COUNT(*)::int AS cnt
+           FROM mkt_web_events e
+           ${pageJoinSql}
+           WHERE ${pageWhereSql}
+           GROUP BY e.page_url
            ORDER BY cnt DESC
            LIMIT 30`,
-          [ctx.tenantId]
+          pageParams
         ),
       ]);
 
       const clickPoints = eventsRes.rows
-        .filter((e) => e.event_type === 'click' && e.x_pct !== null && e.y_pct !== null)
-        .map((e) => ({
-          id: String(e.id),
-          x_pct: Number(e.x_pct),
-          y_pct: Number(e.y_pct),
-          element_selector: e.element_selector ? String(e.element_selector) : 'element',
-          page_url: String(e.page_url),
-        }));
+        .filter((e) => (e.event_type === 'click' || e.event_type === 'outbound_click') && e.x_pct !== null && e.y_pct !== null)
+        .map((e) => {
+          const meta = parseJsonCol<Record<string, unknown>>(e.metadata, {});
+          return {
+            id: String(e.id),
+            x_pct: Number(e.x_pct),
+            y_pct: Number(e.y_pct),
+            element_selector: e.element_selector ? String(e.element_selector) : 'element',
+            element_text: String(meta.element_text || meta.text || '').trim() || null,
+            element_tag: meta.element_tag ? String(meta.element_tag) : null,
+            href: meta.href ? String(meta.href) : null,
+            data_cta: meta.data_cta ? String(meta.data_cta) : null,
+            page_url: String(e.page_url),
+          };
+        });
+
+      const ctaCounts = new Map<string, { element_text: string; element_selector: string; href: string | null; count: number }>();
+      for (const cp of clickPoints) {
+        const label = cp.element_text || cp.element_selector;
+        const key = `${label}|${cp.element_selector}`;
+        const prev = ctaCounts.get(key);
+        if (prev) prev.count += 1;
+        else ctaCounts.set(key, { element_text: label, element_selector: cp.element_selector, href: cp.href, count: 1 });
+      }
 
       const scrollEvents = eventsRes.rows.filter(
         (e) => e.event_type === 'scroll' && e.scroll_depth_pct !== null
       );
-      const buckets = { pct25: 0, pct50: 0, pct75: 0, pct100: 0 };
+      const buckets = { pct25: 0, pct50: 0, pct75: 0, pct90: 0, pct100: 0 };
       for (const s of scrollEvents) {
         const d = Number(s.scroll_depth_pct || 0);
         if (d >= 25) buckets.pct25++;
         if (d >= 50) buckets.pct50++;
         if (d >= 75) buckets.pct75++;
+        if (d >= 90) buckets.pct90++;
         if (d >= 95) buckets.pct100++;
       }
       const denom = Math.max(1, scrollEvents.length);
 
       return {
         click_points: clickPoints,
+        top_ctas: Array.from(ctaCounts.values()).sort((a, b) => b.count - a.count).slice(0, 15),
         scroll_reach_pct: {
           depth_25: scrollEvents.length ? Math.round((buckets.pct25 / denom) * 100) : 0,
           depth_50: scrollEvents.length ? Math.round((buckets.pct50 / denom) * 100) : 0,
           depth_75: scrollEvents.length ? Math.round((buckets.pct75 / denom) * 100) : 0,
+          depth_90: scrollEvents.length ? Math.round((buckets.pct90 / denom) * 100) : 0,
           depth_100: scrollEvents.length ? Math.round((buckets.pct100 / denom) * 100) : 0,
         },
         tracked_pages: pagesRes.rows.map((p) => ({
           page_url: String(p.page_url),
           event_count: Number(p.cnt || 0),
         })),
-        recent_events: eventsRes.rows.slice(0, 30).map((e) => ({
-          ...e,
-          metadata: parseJsonCol(e.metadata, {}),
-        })),
+        recent_events: eventsRes.rows.slice(0, 30).map((e) => {
+          const meta = parseJsonCol<Record<string, unknown>>(e.metadata, {});
+          return {
+            ...e,
+            element_text: meta.element_text || meta.text || null,
+            href: meta.href || null,
+            active_duration_seconds: Number(meta.active_duration_seconds || meta.duration_seconds || 0),
+            metadata: meta,
+          };
+        }),
       };
     });
 
@@ -285,7 +354,7 @@ webTrackingRouter.get('/visitors/:sessionId', requirePermission('mkt_web_trackin
       if (!sRes.rows[0]) return null;
 
       const evRes = await client.query(
-        `SELECT id, event_type, page_url, element_selector, x_pct, y_pct, scroll_depth_pct, metadata, created_at
+        `SELECT id, lead_id, event_type, page_url, element_selector, x_pct, y_pct, scroll_depth_pct, metadata, created_at
          FROM mkt_web_events
          WHERE tenant_id = $1 AND session_id = $2
          ORDER BY created_at ASC
@@ -293,12 +362,40 @@ webTrackingRouter.get('/visitors/:sessionId', requirePermission('mkt_web_trackin
         [ctx.tenantId, req.params.sessionId]
       );
 
-      return {
-        session: maskContactPiiIfDisallowed(sRes.rows[0], canUnmask, cfg),
-        events: evRes.rows.map((e) => ({
+      let maxScrollPct = 0;
+      let ctaClicksCount = 0;
+      let eventDurationSum = 0;
+      const mappedEvents = evRes.rows.map((e) => {
+        const meta = parseJsonCol<Record<string, unknown>>(e.metadata, {});
+        const evDur = Number(meta.active_duration_seconds || meta.duration_seconds || 0);
+        if (Number.isFinite(evDur) && evDur > 0) eventDurationSum += Math.min(1800, evDur);
+        const sd = e.scroll_depth_pct !== null && e.scroll_depth_pct !== undefined
+          ? Number(e.scroll_depth_pct)
+          : Number(meta.max_scroll_pct || meta.percent || 0);
+        if (Number.isFinite(sd) && sd > maxScrollPct) maxScrollPct = Math.min(100, Math.round(sd));
+        if (e.event_type === 'click' || e.event_type === 'outbound_click') ctaClicksCount++;
+        return {
           ...e,
-          metadata: parseJsonCol(e.metadata, {}),
-        })),
+          element_text: meta.element_text || meta.text || null,
+          element_tag: meta.element_tag || null,
+          href: meta.href || null,
+          data_cta: meta.data_cta || null,
+          active_duration_seconds: evDur,
+          metadata: meta,
+        };
+      });
+
+      const sessionMasked = maskContactPiiIfDisallowed(sRes.rows[0], canUnmask, cfg);
+      const activeDurationSec = Math.max(Number(sRes.rows[0].duration_seconds || 0), eventDurationSum);
+
+      return {
+        session: {
+          ...sessionMasked,
+          active_duration_seconds: activeDurationSec,
+          max_scroll_pct: maxScrollPct,
+          cta_clicks_count: ctaClicksCount,
+        },
+        events: mappedEvents,
       };
     });
 
@@ -391,33 +488,73 @@ webTrackingRouter.get('/page-details', requirePermission('mkt_web_tracking', 'vi
       const uniqueSess = new Set<string>();
       const uniqueLeads = new Set<string>();
       const selectorCounts: Record<string, number> = {};
+      const ctaMap = new Map<string, { element_text: string; element_selector: string; href: string | null; count: number }>();
+      const scrollBuckets = { d25: 0, d50: 0, d75: 0, d90: 0, d100: 0 };
       let pageviews = 0;
       let clicks = 0;
+      let outboundClicks = 0;
+      let formFocusCount = 0;
       let scrollSum = 0;
       let scrollCnt = 0;
+      let activeDurSum = 0;
+      let activeDurCnt = 0;
 
       for (const e of evRes.rows) {
+        const meta = parseJsonCol<Record<string, unknown>>(e.metadata, {});
         if (e.session_id) uniqueSess.add(String(e.session_id));
         if (e.lead_id) uniqueLeads.add(String(e.lead_id));
         if (e.event_type === 'pageview' || e.event_type === 'pricing_intent') pageviews++;
-        if (e.event_type === 'click') {
+        if (e.event_type === 'outbound_click') outboundClicks++;
+        if (e.event_type === 'form_focus') formFocusCount++;
+        if (e.event_type === 'click' || e.event_type === 'outbound_click') {
           clicks++;
           const sel = String(e.element_selector || 'ELEMENT');
-          selectorCounts[sel] = (selectorCounts[sel] || 0) + 1;
+          const elText = String(meta.element_text || meta.text || '').trim();
+          const href = meta.href ? String(meta.href) : null;
+          selectorCounts[elText || sel] = (selectorCounts[elText || sel] || 0) + 1;
+          const ctaKey = `${elText || sel}|${sel}`;
+          const prev = ctaMap.get(ctaKey);
+          if (prev) prev.count += 1;
+          else ctaMap.set(ctaKey, { element_text: elText || sel, element_selector: sel, href, count: 1 });
         }
         if (e.scroll_depth_pct !== null && e.scroll_depth_pct !== undefined) {
-          scrollSum += Number(e.scroll_depth_pct);
+          const sd = Number(e.scroll_depth_pct);
+          scrollSum += sd;
           scrollCnt++;
+          if (sd >= 25) scrollBuckets.d25++;
+          if (sd >= 50) scrollBuckets.d50++;
+          if (sd >= 75) scrollBuckets.d75++;
+          if (sd >= 90) scrollBuckets.d90++;
+          if (sd >= 95) scrollBuckets.d100++;
+        }
+        const evDur = Number(meta.active_duration_seconds || meta.duration_seconds || 0);
+        if (Number.isFinite(evDur) && evDur > 0) {
+          activeDurSum += Math.min(1800, evDur);
+          activeDurCnt++;
         }
       }
 
+      const scrollDenom = Math.max(1, scrollCnt);
       return {
         page_url: targetUrl || 'Tất cả trang',
         pageviews,
         clicks,
+        outbound_clicks: outboundClicks,
+        form_focus_count: formFocusCount,
         unique_sessions: uniqueSess.size,
         identified_leads: uniqueLeads.size,
         avg_scroll_depth_pct: scrollCnt > 0 ? Math.round(scrollSum / scrollCnt) : 0,
+        avg_active_duration_seconds: activeDurCnt > 0 ? Math.round(activeDurSum / activeDurCnt) : 0,
+        scroll_distribution: {
+          depth_25: scrollCnt > 0 ? Math.round((scrollBuckets.d25 / scrollDenom) * 100) : 0,
+          depth_50: scrollCnt > 0 ? Math.round((scrollBuckets.d50 / scrollDenom) * 100) : 0,
+          depth_75: scrollCnt > 0 ? Math.round((scrollBuckets.d75 / scrollDenom) * 100) : 0,
+          depth_90: scrollCnt > 0 ? Math.round((scrollBuckets.d90 / scrollDenom) * 100) : 0,
+          depth_100: scrollCnt > 0 ? Math.round((scrollBuckets.d100 / scrollDenom) * 100) : 0,
+        },
+        top_ctas: Array.from(ctaMap.values())
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 15),
         top_elements: Object.entries(selectorCounts)
           .map(([selector, count]) => ({ selector, count }))
           .sort((a, b) => b.count - a.count)
@@ -475,18 +612,35 @@ webTrackingRouter.post('/heatmaps', requirePermission('mkt_web_tracking', 'creat
     const id = crypto.randomUUID();
 
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
+      const clickParams: unknown[] = [ctx.tenantId, propertyId, `%${pagePattern.toLowerCase()}%`];
+      let deviceJoinSql = '';
+      if (deviceFilter !== 'all') {
+        clickParams.push(deviceFilter);
+        deviceJoinSql = `INNER JOIN mkt_web_sessions ws ON ws.tenant_id = e.tenant_id AND ws.id = e.session_id AND ws.device_type = $${clickParams.length}`;
+      }
       const cntRes = await client.query<{ cnt: number }>(
-        `SELECT COUNT(*)::int AS cnt FROM mkt_web_events
-         WHERE tenant_id = $1 AND property_id = $2 AND event_type = 'click' AND LOWER(page_url) LIKE $3`,
-        [ctx.tenantId, propertyId, `%${pagePattern.toLowerCase()}%`]
+        `SELECT COUNT(*)::int AS cnt
+         FROM mkt_web_events e
+         ${deviceJoinSql}
+         WHERE e.tenant_id = $1 AND e.property_id = $2 AND e.event_type = 'click' AND LOWER(e.page_url) LIKE $3`,
+        clickParams
       );
       const clickCnt = Number(cntRes.rows[0]?.cnt || 0);
+
+      const scrollRes = await client.query<{ avg_scroll: number }>(
+        `SELECT COALESCE(ROUND(AVG(e.scroll_depth_pct)), 0)::int AS avg_scroll
+         FROM mkt_web_events e
+         ${deviceJoinSql}
+         WHERE e.tenant_id = $1 AND e.property_id = $2 AND e.scroll_depth_pct IS NOT NULL AND LOWER(e.page_url) LIKE $3`,
+        clickParams
+      );
+      const scrollAvgPct = Math.min(100, Math.max(0, Number(scrollRes.rows[0]?.avg_scroll || 0)));
 
       await client.query(
         `INSERT INTO mkt_web_heatmaps (
            id, tenant_id, property_id, name, page_url_pattern, device_filter,
-           snapshot_html, viewport_width, viewport_height, click_count, is_active, metadata_json
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, $11::jsonb)`,
+           snapshot_html, viewport_width, viewport_height, click_count, scroll_avg_pct, is_active, metadata_json
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12::jsonb)`,
         [
           id,
           ctx.tenantId,
@@ -498,6 +652,7 @@ webTrackingRouter.post('/heatmaps', requirePermission('mkt_web_tracking', 'creat
           viewportWidth,
           viewportHeight,
           clickCnt,
+          scrollAvgPct,
           JSON.stringify(req.body?.metadata || {}),
         ]
       );

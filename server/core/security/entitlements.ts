@@ -305,8 +305,18 @@ const DOMATION_PROMAX_MODULES: SaasModuleKey[] = Array.from(
   ])
 );
 
+export interface PlanLimitsDefinition {
+  max_sales: number;
+  max_managers: number;
+  max_users: number;
+  max_rounds: number;
+  monthly_lead_quota: number;
+}
+
 export interface SaasPackageDefinition {
   code: SaasPackageCode;
+  plan_code: string;
+  legacy_tier: LegacyPlanTier;
   order: number;
   name: string;
   short_name: string;
@@ -314,6 +324,7 @@ export interface SaasPackageDefinition {
   tagline: string;
   monthly_price_vnd: number;
   annual_discount_pct: number;
+  limits: PlanLimitsDefinition;
   default_modules: SaasModuleKey[];
   tour_suite: 'autodata_crm_tour' | 'marketing_tour' | 'growth_combo_tour' | 'promax_enterprise_tour';
   connect_wizard_suite: 'crm_connectors' | 'marketing_connectors' | 'unified_growth_connectors' | 'enterprise_connectors';
@@ -324,6 +335,8 @@ export interface SaasPackageDefinition {
 export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinition> = {
   autodata_crm: {
     code: 'autodata_crm',
+    plan_code: 'autodata_standard',
+    legacy_tier: 'starter',
     order: 1,
     name: 'Auto Data & CRM',
     short_name: 'Auto Data & CRM',
@@ -331,6 +344,13 @@ export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinitio
     tagline: 'Chia lead công bằng theo giây, quản lý phễu CRM, chống trễ SLA, ZaloBot & Meta CAPI v21.0.',
     monthly_price_vnd: 1_500_000,
     annual_discount_pct: 15,
+    limits: {
+      max_sales: 20,
+      max_managers: 5,
+      max_users: 25,
+      max_rounds: 5,
+      monthly_lead_quota: 15_000,
+    },
     default_modules: AUTODATA_CRM_MODULES,
     tour_suite: 'autodata_crm_tour',
     connect_wizard_suite: 'crm_connectors',
@@ -343,6 +363,8 @@ export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinitio
   },
   marketing_standalone: {
     code: 'marketing_standalone',
+    plan_code: 'marketing_standalone',
+    legacy_tier: 'starter',
     order: 2,
     name: 'Marketing Automation Standalone',
     short_name: 'Marketing Automation',
@@ -350,6 +372,13 @@ export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinitio
     tagline: 'Thu thập Lead qua Form Card, phân Tệp Data / Tệp Logic động, gửi Email/ZNS & Automation Flow.',
     monthly_price_vnd: 1_800_000,
     annual_discount_pct: 15,
+    limits: {
+      max_sales: 20,
+      max_managers: 5,
+      max_users: 25,
+      max_rounds: 5,
+      monthly_lead_quota: 50_000,
+    },
     default_modules: MARKETING_STANDALONE_MODULES,
     tour_suite: 'marketing_tour',
     connect_wizard_suite: 'marketing_connectors',
@@ -362,13 +391,22 @@ export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinitio
   },
   growth_combo: {
     code: 'growth_combo',
+    plan_code: 'autodata_growth',
+    legacy_tier: 'growth',
     order: 3,
     name: 'Growth Suite (CRM + Marketing)',
     short_name: 'Growth Suite',
     badge: 'Gói 3 • Khép Kín Doanh Thu',
     tagline: 'Hợp nhất 100% từ Quảng cáo/Form -> Tệp Logic nuôi dưỡng -> Chia vòng Sale -> Đo ROAS thực.',
-    monthly_price_vnd: 2_900_000,
+    monthly_price_vnd: 3_000_000,
     annual_discount_pct: 15,
+    limits: {
+      max_sales: 85,
+      max_managers: 15,
+      max_users: 100,
+      max_rounds: 30,
+      monthly_lead_quota: 100_000,
+    },
     default_modules: GROWTH_COMBO_MODULES,
     tour_suite: 'growth_combo_tour',
     connect_wizard_suite: 'unified_growth_connectors',
@@ -381,13 +419,22 @@ export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinitio
   },
   domation_promax: {
     code: 'domation_promax',
+    plan_code: 'domation_crm_erp',
+    legacy_tier: 'enterprise',
     order: 4,
     name: 'DOMATION PROMAX (Full Suite ERP)',
     short_name: 'DOMATION PROMAX',
     badge: 'Gói 4 • Quản Trị Toàn Diện + DOM Agent',
     tagline: 'Vận hành toàn doanh nghiệp: Nhân sự, Chấm công GPS, Lương, Phê duyệt động, Dự án, Tài chính, Kho & DOM Agent.',
-    monthly_price_vnd: 5_900_000,
+    monthly_price_vnd: 6_000_000,
     annual_discount_pct: 15,
+    limits: {
+      max_sales: 9_999,
+      max_managers: 9_999,
+      max_users: 9_999,
+      max_rounds: 999,
+      monthly_lead_quota: 1_000_000,
+    },
     default_modules: DOMATION_PROMAX_MODULES,
     tour_suite: 'promax_enterprise_tour',
     connect_wizard_suite: 'enterprise_connectors',
@@ -406,6 +453,54 @@ export const SAAS_PACKAGES_CATALOG: Record<SaasPackageCode, SaasPackageDefinitio
     ],
   },
 };
+
+export interface CanonicalBillingIdentity {
+  package_code: SaasPackageCode;
+  plan_code: string;
+  legacy_tier: LegacyPlanTier;
+  step_order: number;
+  default_monthly_price_vnd: number;
+  default_limits: PlanLimitsDefinition;
+}
+
+const CANONICAL_BILLING_ALIAS_MAP: Record<string, SaasPackageCode> = {
+  autodata_standard: 'autodata_crm',
+  starter: 'autodata_crm',
+  autodata_crm: 'autodata_crm',
+  autodata: 'autodata_crm',
+  data: 'autodata_crm',
+  crm: 'autodata_crm',
+  marketing_standalone: 'marketing_standalone',
+  marketing: 'marketing_standalone',
+  autodata_growth: 'growth_combo',
+  growth: 'growth_combo',
+  growth_combo: 'growth_combo',
+  domation_crm_erp: 'domation_promax',
+  enterprise: 'domation_promax',
+  domation_promax: 'domation_promax',
+  dom_erp: 'domation_promax',
+  'dom-erp': 'domation_promax',
+  dom_erp_promax: 'domation_promax',
+  promax: 'domation_promax',
+  crm_erp_suite: 'domation_promax',
+  crm_erp_bundle: 'domation_promax',
+};
+
+export function resolveCanonicalBillingIdentity(rawCode?: unknown): CanonicalBillingIdentity | null {
+  const key = String(rawCode || '').trim().toLowerCase();
+  if (!key) return null;
+  const pkgCode = CANONICAL_BILLING_ALIAS_MAP[key];
+  if (!pkgCode) return null;
+  const def = SAAS_PACKAGES_CATALOG[pkgCode];
+  return {
+    package_code: pkgCode,
+    plan_code: def.plan_code,
+    legacy_tier: def.legacy_tier,
+    step_order: def.order,
+    default_monthly_price_vnd: def.monthly_price_vnd,
+    default_limits: { ...def.limits },
+  };
+}
 
 export interface TenantTerminology {
   industry_key: IndustryKey;
@@ -705,19 +800,22 @@ export function resolvePackageCodeFromTenant(tenantRow: {
   subscription_plan_code?: unknown;
   crm_erp_upgrade_status?: unknown;
 }): SaasPackageCode {
-  const explicitPkg = String(tenantRow.package_code || '').trim().toLowerCase();
-  if (VALID_PACKAGE_CODES.includes(explicitPkg as SaasPackageCode)) {
-    return explicitPkg as SaasPackageCode;
-  }
+  const pkgId = resolveCanonicalBillingIdentity(tenantRow.package_code);
+  const rawPlanCode = String(tenantRow.subscription_plan_code || '').trim().toLowerCase();
+  const planId =
+    rawPlanCode && !rawPlanCode.startsWith('trial_')
+      ? resolveCanonicalBillingIdentity(rawPlanCode)
+      : null;
+  const tierId = resolveCanonicalBillingIdentity(tenantRow.plan_tier);
 
-  const tier = String(tenantRow.plan_tier || '').trim().toLowerCase();
-  if (VALID_PACKAGE_CODES.includes(tier as SaasPackageCode)) {
-    return tier as SaasPackageCode;
+  if (pkgId && pkgId.package_code !== 'autodata_crm') {
+    return pkgId.package_code;
   }
-
-  const planCode = String(tenantRow.subscription_plan_code || '').trim().toLowerCase();
-  if (VALID_PACKAGE_CODES.includes(planCode as SaasPackageCode)) {
-    return planCode as SaasPackageCode;
+  if (planId && planId.package_code !== 'autodata_crm') {
+    return planId.package_code;
+  }
+  if (tierId && tierId.package_code !== 'autodata_crm') {
+    return tierId.package_code;
   }
 
   const upgStatus = String(tenantRow.crm_erp_upgrade_status || '').trim().toLowerCase();
@@ -727,12 +825,8 @@ export function resolvePackageCodeFromTenant(tenantRow: {
   if (upgStatus.startsWith('active_crm')) {
     return 'growth_combo';
   }
-  if (tier === 'enterprise' && planCode === 'domation_crm_erp') {
-    return 'domation_promax';
-  }
 
-  // Default for existing Auto Data starter/growth tenants -> seamless Package 1 (autodata_crm)
-  return 'autodata_crm';
+  return pkgId?.package_code || planId?.package_code || tierId?.package_code || 'autodata_crm';
 }
 
 export function buildModulesForPackage(

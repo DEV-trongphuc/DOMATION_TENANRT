@@ -1,14 +1,18 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createDatabasePool, setDatabasePool, type DatabasePool } from '../server/core/database/db-adapter.ts';
 import { verifyPassword } from '../server/core/crypto/password.ts';
 import {
+  DEFAULT_ECOLIFE_SQL_PATH,
   migrateEcoLifeData,
   ECOLIFE_ADMIN_EMAIL,
   ECOLIFE_ADMIN_PASSWORD,
 } from '../scripts/migrate-ecolife-data.ts';
 
-describe('EcoLife Real SQL Dump (yinpzoab_data.sql) Migration & Integrity', () => {
+const hasEcoLifeDump = fs.existsSync(DEFAULT_ECOLIFE_SQL_PATH);
+
+describe('EcoLife Real SQL Dump (yinpzoab_data.sql) Migration & Integrity', { skip: !hasEcoLifeDump ? 'Optional EcoLife SQL dump not present' : false }, () => {
   let pool: DatabasePool;
   let tenantId: string;
 

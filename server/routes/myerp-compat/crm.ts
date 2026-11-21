@@ -1,5 +1,13 @@
 ﻿import crypto from 'node:crypto';
 import { Router } from 'express';
+import { getTenantContext } from '../../core/context/tenant-context.ts';
+import { tenantRedis } from '../../core/cache/tenant-redis.ts';
+import { getTenantSettingsCached } from '../../core/settings/tenant-cache.ts';
+import { emitDomainEvent } from '../../core/events/event-bus.ts';
+import {
+  dispatchStageCapiEventDetached,
+  resolveCapiEventForQualityOrStage,
+} from '../../services/capi.service.ts';
 import { crm360Router } from '../../modules/crm-360/index.ts';
 import { orgRbacRouter } from '../../modules/org-rbac/index.ts';
 import { ensureErpOpsSchema } from '../../modules/erp-ops/schema.ts';
@@ -36,6 +44,15 @@ const normalizeContactAliases = (row: any) =>
     pipeline_status: (r) => r.pipeline_status || r.stage_key || r.lifecycle_stage || 'new_lead',
     program: (r) => r.program || r.product_interest || r.custom_fields?.program || '',
     note: (r) => r.note || r.quality_note || r.custom_fields?.note || '',
+    ad_id: (r) => r.ad_id || r.meta_ad_id || r.custom_fields?.ad_id || r.custom_fields?.meta_ad_id || '',
+    meta_ad_id: (r) => r.meta_ad_id || r.ad_id || r.custom_fields?.ad_id || r.custom_fields?.meta_ad_id || '',
+    ad_name: (r) => r.ad_name || r.meta_ad_name || r.custom_fields?.ad_name || r.custom_fields?.meta_ad_name || '',
+    meta_ad_name: (r) => r.meta_ad_name || r.ad_name || r.custom_fields?.ad_name || r.custom_fields?.meta_ad_name || '',
+    adset_id: (r) => r.adset_id || r.custom_fields?.adset_id || '',
+    campaign_id: (r) => r.campaign_id || r.meta_campaign_id || r.custom_fields?.campaign_id || r.custom_fields?.meta_campaign_id || '',
+    meta_campaign_id: (r) => r.meta_campaign_id || r.campaign_id || r.custom_fields?.campaign_id || r.custom_fields?.meta_campaign_id || '',
+    campaign_name: (r) => r.campaign_name || r.campaign || r.custom_fields?.campaign_name || '',
+    utm_campaign: (r) => r.utm_campaign || r.custom_fields?.utm_campaign || r.campaign || r.campaign_name || '',
   });
 
 // ---- Contacts fixed routes (MUST precede /contacts/:id) ----
@@ -335,8 +352,96 @@ crmCompatRouter.post(
 crmCompatRouter.post(
   '/contacts/match-domation-sync',
   requirePermission('leads', 'edit'),
-  handler('COMPAT_CONTACTS_MATCH_SYNC', async (_req, res) => {
-    ok(res, { matched: 0, synced: 0 });
+  handler('COMPAT_CONTACTS_MATCH_SYNC', async (req, res) => {
+    const syncRes = await tx(async (client, ctx) => {
+      const subRes = await client.query<{ cnt: number }>(
+        `SELECT COUNT(DISTINCT l.id)::int AS cnt
+         FROM leads l
+         INNER JOIN tenant_audience_members tam ON tam.tenant_id = l.tenant_id AND tam.lead_id = l.id
+         WHERE l.tenant_id = $1 AND l.is_deleted = false`,
+        [ctx.tenantId]
+      );
+      const actRes = await client.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt
+         FROM lead_timeline_events te
+         INNER JOIN leads l ON l.tenant_id = te.tenant_id AND l.id = te.lead_id
+         WHERE te.tenant_id = $1 AND l.is_deleted = false`,
+        [ctx.tenantId]
+      );
+      const flowRes = await client.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt
+         FROM mkt_flow_enrollments fe
+         INNER JOIN leads l ON l.tenant_id = fe.tenant_id AND l.id = fe.lead_id
+         WHERE fe.tenant_id = $1 AND l.is_deleted = false`,
+        [ctx.tenantId]
+      );
+      const visRes = await client.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt
+         FROM mkt_web_sessions ws
+         INNER JOIN leads l ON l.tenant_id = ws.tenant_id AND l.id = ws.lead_id
+         WHERE ws.tenant_id = $1 AND l.is_deleted = false`,
+        [ctx.tenantId]
+      );
+      const unmVisRes = await client.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt
+         FROM mkt_web_sessions
+         WHERE tenant_id = $1 AND lead_id IS NULL`,
+        [ctx.tenantId]
+      );
+      const syncAudRes = await client.query<{ id: string }>(
+        `SELECT id FROM tenant_audiences
+         WHERE tenant_id = $1 AND audience_type = 'sync_data' AND is_active = true`,
+        [ctx.tenantId]
+      );
+
+      let unmatchedContacts = 0;
+      const rawContacts = Array.isArray(req.body?.contacts) ? req.body.contacts : [];
+      for (const item of rawContacts.slice(0, 200)) {
+        if (!item || typeof item !== 'object') continue;
+        const email = item.email ? String(item.email).trim().toLowerCase() : '';
+        const phone = item.phone ? String(item.phone).trim() : '';
+        if (!email && !phone) {
+          unmatchedContacts++;
+          continue;
+        }
+        const match = await client.query<{ id: string }>(
+          `SELECT id FROM leads
+           WHERE tenant_id = $1 AND is_deleted = false
+             AND (($2 != '' AND LOWER(email) = $2) OR ($3 != '' AND phone = $3))
+           LIMIT 1`,
+          [ctx.tenantId, email, phone]
+        );
+        if (!match.rows[0]) unmatchedContacts++;
+      }
+
+      if (syncAudRes.rows.length > 0) {
+        await client.query(
+          `UPDATE tenant_audiences
+           SET last_evaluated_at = clock_timestamp(), updated_at = clock_timestamp()
+           WHERE tenant_id = $1 AND audience_type = 'sync_data' AND is_active = true`,
+          [ctx.tenantId]
+        );
+      }
+
+      const matched_subscribers = Number(subRes.rows[0]?.cnt || 0);
+      const matched_activities = Number(actRes.rows[0]?.cnt || 0);
+      const matched_flows = Number(flowRes.rows[0]?.cnt || 0);
+      const matched_visitors = Number(visRes.rows[0]?.cnt || 0);
+      const unmatched_skipped = Number(unmVisRes.rows[0]?.cnt || 0) + unmatchedContacts;
+      const totalMatched = matched_subscribers + matched_activities + matched_flows + matched_visitors;
+
+      return {
+        matched: totalMatched,
+        synced: totalMatched,
+        matched_subscribers,
+        matched_activities,
+        matched_flows,
+        matched_visitors,
+        unmatched_skipped,
+        sync_audiences_refreshed: syncAudRes.rows.length,
+      };
+    });
+    ok(res, syncRes);
   })
 );
 
@@ -489,6 +594,7 @@ crmCompatRouter.post(
       fail(res, 404, 'CONTACT_NOT_FOUND', 'Không tìm thấy khách hàng nguồn để nhân bản.');
       return;
     }
+    tenantRedis.incrementTenantMonthlyLeadCount(getTenantContext().tenantId, 1);
     ok(res, cloned, 'Đã nhân bản hồ sơ khách hàng thành công.', 201);
   })
 );
@@ -551,7 +657,8 @@ crmCompatRouter.post(
       fail(res, 400, 'INVALID_ASSIGN_PAYLOAD', 'ID khách hàng hoặc nhân viên phụ trách không hợp lệ.');
       return;
     }
-    const updated = await tx(async (client, ctx) => {
+    const ctx = getTenantContext();
+    const updated = await tx(async (client) => {
       const r = await client.query(
         `UPDATE leads SET assigned_to = $1, status = 'assigned', updated_at = clock_timestamp()
          WHERE tenant_id = $2 AND id = $3 RETURNING *`,
@@ -563,6 +670,12 @@ crmCompatRouter.post(
       fail(res, 404, 'CONTACT_NOT_FOUND', 'Không tìm thấy khách hàng.');
       return;
     }
+    await emitDomainEvent('lead.updated', {
+      tenantId: ctx.tenantId,
+      leadId: id,
+      changedFields: ['assigned_to', 'status'],
+      actorId: ctx.userId,
+    });
     ok(res, normalizeContactAliases(updated), 'Đã cập nhật người phụ trách.');
   })
 );
@@ -576,9 +689,17 @@ crmCompatRouter.put(
       fail(res, 400, 'INVALID_ID', 'ID không hợp lệ.');
       return;
     }
+    const ctx = getTenantContext();
     const stageId = isUuid(req.body?.stage_id) ? req.body.stage_id : null;
     const pipelineStatus = bstr(req.body, 'pipeline_status', 'lifecycle_stage');
-    const updated = await tx(async (client, ctx) => {
+    const out = await tx(async (client) => {
+      const prevRes = await client.query<{ stage_id: string | null }>(
+        'SELECT stage_id FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+        [ctx.tenantId, id]
+      );
+      if (!prevRes.rows[0]) return null;
+      const previousStageId = prevRes.rows[0].stage_id;
+
       const r = await client.query(
         `UPDATE leads
          SET stage_id = COALESCE($1, stage_id),
@@ -587,13 +708,91 @@ crmCompatRouter.put(
          WHERE tenant_id = $3 AND id = $4 RETURNING *`,
         [stageId, pipelineStatus, ctx.tenantId, id]
       );
-      return r.rows[0] || null;
+      const lead = r.rows[0];
+      if (!lead) return null;
+
+      let stageRow: Record<string, any> | null = null;
+      const effStageId = lead.stage_id ? String(lead.stage_id) : null;
+      if (effStageId) {
+        const sRes = await client.query(
+          'SELECT id, pipeline_id, stage_key, stage_name, is_won_stage, capi_event_mapping FROM tenant_pipeline_stages WHERE tenant_id = $1 AND id = $2 LIMIT 1',
+          [ctx.tenantId, effStageId]
+        );
+        stageRow = sRes.rows[0] || null;
+      }
+      return { lead, previousStageId, stageRow };
     });
-    if (!updated) {
+    if (!out) {
       fail(res, 404, 'CONTACT_NOT_FOUND', 'Không tìm thấy khách hàng.');
       return;
     }
-    ok(res, normalizeContactAliases(updated), 'Đã chuyển bước phễu.');
+
+    const { lead, previousStageId, stageRow } = out;
+    if (stageRow && stageId) {
+      const cfg = await getTenantSettingsCached(ctx.tenantId);
+      const isWonStage = Boolean(stageRow.is_won_stage);
+      const capiEvent = resolveCapiEventForQualityOrStage({
+        stageCapiMapping: stageRow.capi_event_mapping,
+        tenantSettings: cfg,
+      });
+      if (capiEvent) {
+        await dispatchStageCapiEventDetached({
+          tenantId: ctx.tenantId,
+          tenantSlug: ctx.tenantSlug,
+          eventName: capiEvent,
+          tenantSettings: cfg,
+          lead: {
+            leadId: String(lead.id),
+            name: lead.name,
+            phone: lead.phone,
+            email: lead.email,
+            fbc: lead.fbc,
+            fbp: lead.fbp,
+            fbclid: lead.fbclid,
+            metaLeadId: lead.meta_lead_id,
+            dealValue: Number(lead.total_revenue_vnd || 0) || undefined,
+            customFields: lead.custom_fields,
+          },
+          timelineAudit: {
+            actorId: ctx.userId,
+            actorRole: ctx.userRole,
+            stageName: stageRow.stage_name || stageRow.stage_key,
+          },
+        }).catch(() => {});
+      }
+
+      await emitDomainEvent('lead.stage_changed', {
+        tenantId: ctx.tenantId,
+        leadId: id,
+        pipelineId: stageRow.pipeline_id || lead.pipeline_id || null,
+        previousStageId,
+        currentStageId: String(stageRow.id),
+        currentStageKey: stageRow.stage_key,
+        isWonStage,
+        willEmitDealWon: isWonStage,
+        dealValueVnd: Number(lead.total_revenue_vnd || 0) || null,
+        actorId: ctx.userId,
+      });
+
+      if (isWonStage) {
+        await emitDomainEvent('deal.won', {
+          tenantId: ctx.tenantId,
+          leadId: id,
+          amountVnd: Number(lead.total_revenue_vnd || 0),
+          sourceEntity: 'lead_stage',
+          actorId: ctx.userId,
+        });
+      }
+    } else {
+      await emitDomainEvent('lead.updated', {
+        tenantId: ctx.tenantId,
+        leadId: id,
+        changedFields: ['lifecycle_stage'],
+        actorId: ctx.userId,
+      });
+    }
+
+    ok(res, normalizeContactAliases(lead), 'Đã chuyển bước phễu.');
   })
 );
 
@@ -632,10 +831,12 @@ crmCompatRouter.post(
       fail(res, 400, 'INVALID_ID', 'ID không hợp lệ.');
       return;
     }
+    const ctx = getTenantContext();
     const rawTags = Array.isArray(req.body?.tags) ? req.body.tags : req.body?.tag ? [req.body.tag] : [];
-    const saved = await tx(async (client, ctx) => {
+    const saved = await tx(async (client) => {
       await client.query('DELETE FROM lead_tags WHERE tenant_id = $1 AND lead_id = $2', [ctx.tenantId, id]);
       const names: string[] = [];
+      const tagIds: string[] = [];
       for (const item of rawTags) {
         const tagName = typeof item === 'string' ? item.trim() : String(item?.name || '').trim();
         if (!tagName) continue;
@@ -654,15 +855,32 @@ crmCompatRouter.post(
             [tagId, ctx.tenantId, tagName.slice(0, 100), slug.slice(0, 100)]
           );
         }
+        tagIds.push(tagId);
         await client.query(
           `INSERT INTO lead_tags (id, tenant_id, lead_id, tag_id, assigned_by)
            VALUES ($1, $2, $3, $4, $5)`,
           [crypto.randomUUID(), ctx.tenantId, id, tagId, ctx.userId]
         );
       }
-      return names;
+      return { names, tagIds };
     });
-    ok(res, { id, tags: saved });
+
+    await emitDomainEvent('lead.updated', {
+      tenantId: ctx.tenantId,
+      leadId: id,
+      changedFields: ['tags'],
+      actorId: ctx.userId,
+    });
+    if (saved.tagIds.length > 0) {
+      await emitDomainEvent('marketing.engaged', {
+        tenantId: ctx.tenantId,
+        leadId: id,
+        engagementType: 'tag_added',
+        scoreDelta: 0,
+        metadata: { tagIds: saved.tagIds, tagNames: saved.names },
+      });
+    }
+    ok(res, { id, tags: saved.names });
   })
 );
 
@@ -975,6 +1193,7 @@ crmCompatRouter.post(
       );
       return r.rows[0];
     });
+    tenantRedis.invalidateDistributionSnapshot(getTenantContext().tenantId);
     ok(res, created, 'Đã tạo bước phễu.', 201);
   })
 );
@@ -1004,6 +1223,7 @@ crmCompatRouter.put(
       );
       return r.rows[0] || null;
     });
+    tenantRedis.invalidateDistributionSnapshot(getTenantContext().tenantId);
     ok(res, updated);
   })
 );
@@ -1023,6 +1243,7 @@ crmCompatRouter.delete(
     await tx(async (client, ctx) => {
       await client.query('DELETE FROM tenant_pipeline_stages WHERE tenant_id = $1 AND id = $2', [ctx.tenantId, id]);
     });
+    tenantRedis.invalidateDistributionSnapshot(getTenantContext().tenantId);
     ok(res, { id, deleted: true });
   })
 );

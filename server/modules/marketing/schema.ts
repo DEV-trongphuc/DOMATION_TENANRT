@@ -148,6 +148,7 @@ const POSTGRES_MARKETING_DDL = `
     verified BOOLEAN NOT NULL DEFAULT false,
     expires_at TIMESTAMPTZ NOT NULL,
     verified_at TIMESTAMPTZ,
+    consumed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT uk_mkt_otp_verifications_tenant_id UNIQUE (tenant_id, id)
   );
@@ -728,6 +729,23 @@ const POSTGRES_MARKETING_DDL = `
   ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
   ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS matched_count INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS converted_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE mkt_otp_verifications ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
+
+  -- Performance composite indexes for high-frequency Flow Cron, Web Tracking, Campaign & Customer 360 queries
+  CREATE INDEX IF NOT EXISTS idx_mkt_flow_enroll_due ON mkt_flow_enrollments(tenant_id, status, next_run_at);
+  CREATE INDEX IF NOT EXISTS idx_mkt_flow_enroll_step ON mkt_flow_enrollments(tenant_id, flow_id, current_step_id, status);
+  CREATE INDEX IF NOT EXISTS idx_mkt_flow_enroll_lead ON mkt_flow_enrollments(tenant_id, lead_id, enrolled_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_websess_lead ON mkt_web_sessions(tenant_id, lead_id, last_seen_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_websess_prop_started ON mkt_web_sessions(tenant_id, property_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_websess_pricing ON mkt_web_sessions(tenant_id, pricing_intent_detected, last_seen_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_webevt_session ON mkt_web_events(tenant_id, session_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_webevt_prop_created ON mkt_web_events(tenant_id, property_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_send_claims_lead ON mkt_send_claims(tenant_id, lead_id, sent_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_send_claims_camp_sent ON mkt_send_claims(tenant_id, campaign_id, sent_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_socconv_lead ON mkt_social_conversations(tenant_id, lead_id, last_message_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_form_sub_lead ON mkt_form_submissions(tenant_id, lead_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_srv_resp_lead ON mkt_survey_responses(tenant_id, lead_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_mkt_vcode_lead ON mkt_voucher_codes(tenant_id, lead_id, claimed_at DESC);
 
   DO $$
   DECLARE
@@ -890,6 +908,7 @@ const MARIADB_MARKETING_STATEMENTS: string[] = [
     verified TINYINT(1) NOT NULL DEFAULT 0,
     expires_at DATETIME(6) NOT NULL,
     verified_at DATETIME(6) NULL,
+    consumed_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     UNIQUE KEY uk_mkt_otp_verifications_tenant_id (tenant_id, id),
     INDEX idx_mkt_otp_lookup (tenant_id, recipient, created_at)
@@ -1415,6 +1434,21 @@ const MARIADB_MARKETING_ALTERS: string[] = [
   "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1",
   "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS matched_count INT NOT NULL DEFAULT 0",
   "ALTER TABLE mkt_automation_scenarios ADD COLUMN IF NOT EXISTS converted_count INT NOT NULL DEFAULT 0",
+  "ALTER TABLE mkt_otp_verifications ADD COLUMN IF NOT EXISTS consumed_at DATETIME(6) NULL",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_flow_enroll_due ON mkt_flow_enrollments(tenant_id, status, next_run_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_flow_enroll_step ON mkt_flow_enrollments(tenant_id, flow_id, current_step_id, status)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_flow_enroll_lead ON mkt_flow_enrollments(tenant_id, lead_id, enrolled_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_websess_lead ON mkt_web_sessions(tenant_id, lead_id, last_seen_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_websess_prop_started ON mkt_web_sessions(tenant_id, property_id, started_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_websess_pricing ON mkt_web_sessions(tenant_id, pricing_intent_detected, last_seen_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_webevt_session ON mkt_web_events(tenant_id, session_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_webevt_prop_created ON mkt_web_events(tenant_id, property_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_send_claims_lead ON mkt_send_claims(tenant_id, lead_id, sent_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_send_claims_camp_sent ON mkt_send_claims(tenant_id, campaign_id, sent_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_socconv_lead ON mkt_social_conversations(tenant_id, lead_id, last_message_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_form_sub_lead ON mkt_form_submissions(tenant_id, lead_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_srv_resp_lead ON mkt_survey_responses(tenant_id, lead_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_mkt_vcode_lead ON mkt_voucher_codes(tenant_id, lead_id, claimed_at)",
 ];
 
 async function runSchemaInitOnClient(client: DbClient, isMariaDb: boolean): Promise<void> {

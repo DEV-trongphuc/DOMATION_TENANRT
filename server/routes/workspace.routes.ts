@@ -14,6 +14,7 @@ import { normalizeTenantSettings } from '../core/settings/tenant-settings.ts';
 import {
   getPlatformBillingCatalog,
   computeSubscriptionSnapshot,
+  isIdempotencyUniqueViolation,
   switchTenantSaasPackageInTx,
 } from '../services/billing.service.ts';
 import {
@@ -35,6 +36,23 @@ const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
 
 function vnMidnightUtc(year: number, month: number, day: number): Date {
   return new Date(Date.UTC(year, month, day, 0, 0, 0, 0) - VN_OFFSET_MS);
+}
+
+function vnEndOfDayUtc(year: number, month: number, day: number): Date {
+  return new Date(Date.UTC(year, month, day, 23, 59, 59, 999) - VN_OFFSET_MS);
+}
+
+export function isValidIsoDateString(raw?: string | null): raw is string {
+  if (!raw || typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
 }
 
 /**
@@ -146,12 +164,33 @@ export function getZonedDateParts(
 export function resolveDateBounds(
   preset: string,
   startDate?: string | null,
-  endDate?: string | null
-): { clause: string; params: unknown[] } {
+  endDate?: string | null,
+  nowRef?: Date
+): { clause: string; params: unknown[]; sinceIso?: string | null; untilIso?: string | null } {
   const norm = String(preset || 'this_month').trim().toLowerCase();
-  if (norm === 'all') return { clause: '1=1', params: [] };
 
-  const nowMs = Date.now();
+  // Explicit valid since/until (or startDate/endDate) always takes highest priority
+  const cleanStart = startDate ? String(startDate).trim() : '';
+  const cleanEnd = endDate ? String(endDate).trim() : '';
+  if (isValidIsoDateString(cleanStart) && isValidIsoDateString(cleanEnd)) {
+    const [sIso, eIso] = cleanStart <= cleanEnd ? [cleanStart, cleanEnd] : [cleanEnd, cleanStart];
+    const startDt = new Date(`${sIso}T00:00:00+07:00`);
+    const endDt = new Date(`${eIso}T23:59:59.999+07:00`);
+    if (!Number.isNaN(startDt.getTime()) && !Number.isNaN(endDt.getTime())) {
+      return {
+        clause: 'created_at >= $DATE_START AND created_at <= $DATE_END',
+        params: [startDt, endDt],
+        sinceIso: sIso,
+        untilIso: eIso,
+      };
+    }
+  }
+
+  if (norm === 'all' || norm === 'tất cả' || norm === 'tất cả thời gian' || norm === 'toàn bộ lịch sử') {
+    return { clause: '1=1', params: [], sinceIso: null, untilIso: null };
+  }
+
+  const nowMs = nowRef ? nowRef.getTime() : Date.now();
   const vnNow = new Date(nowMs + VN_OFFSET_MS);
   const y = vnNow.getUTCFullYear();
   const m = vnNow.getUTCMonth();
@@ -159,56 +198,66 @@ export function resolveDateBounds(
   const utcDay = vnNow.getUTCDay();
   const isoDow = utcDay === 0 ? 7 : utcDay;
 
+  const toIso = (yr: number, mo: number, dy: number): string => {
+    const dt = new Date(Date.UTC(yr, mo, dy));
+    return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+  };
+
+  const makeBounded = (sy: number, sm: number, sd: number, ey: number, em: number, ed: number) => ({
+    clause: 'created_at >= $DATE_START AND created_at <= $DATE_END',
+    params: [vnMidnightUtc(sy, sm, sd), vnEndOfDayUtc(ey, em, ed)],
+    sinceIso: toIso(sy, sm, sd),
+    untilIso: toIso(ey, em, ed),
+  });
+
   if (norm === 'today' || norm === 'hôm nay') {
-    return { clause: 'created_at >= $DATE_START', params: [vnMidnightUtc(y, m, d)] };
+    return makeBounded(y, m, d, y, m, d);
   }
   if (norm === 'yesterday' || norm === 'hôm qua') {
-    return {
-      clause: 'created_at >= $DATE_START AND created_at < $DATE_END',
-      params: [vnMidnightUtc(y, m, d - 1), vnMidnightUtc(y, m, d)],
-    };
+    return makeBounded(y, m, d - 1, y, m, d - 1);
+  }
+  if (
+    norm === 'yesterday_to_today' ||
+    norm === 'hôm qua - hôm nay' ||
+    norm === 'hôm qua – hôm nay' ||
+    norm === 'yesterday - today'
+  ) {
+    return makeBounded(y, m, d - 1, y, m, d);
   }
   if (norm === 'this_week' || norm === 'tuần này') {
-    return {
-      clause: 'created_at >= $DATE_START',
-      params: [vnMidnightUtc(y, m, d - (isoDow - 1))],
-    };
+    return makeBounded(y, m, d - (isoDow - 1), y, m, d);
   }
   if (norm === 'last_week' || norm === 'tuần trước') {
-    const thisWeekStart = vnMidnightUtc(y, m, d - (isoDow - 1));
-    const lastWeekStart = vnMidnightUtc(y, m, d - (isoDow - 1) - 7);
-    return {
-      clause: 'created_at >= $DATE_START AND created_at < $DATE_END',
-      params: [lastWeekStart, thisWeekStart],
-    };
+    const monOffset = d - (isoDow - 1);
+    return makeBounded(y, m, monOffset - 7, y, m, monOffset - 1);
   }
-  if (norm === '7_days' || norm === '7 ngày qua') {
-    return { clause: 'created_at >= $DATE_START', params: [new Date(nowMs - 7 * 86400_000)] };
+  if (
+    norm === '7_days' ||
+    norm === '7days' ||
+    norm === 'last_7days' ||
+    norm === 'last_7_days' ||
+    norm === 'last 7 days' ||
+    norm === '7 ngày qua' ||
+    norm === '7 ngày gần nhất'
+  ) {
+    return makeBounded(y, m, d - 6, y, m, d);
   }
-  if (norm === '30_days' || norm === '30 ngày qua') {
-    return { clause: 'created_at >= $DATE_START', params: [new Date(nowMs - 30 * 86400_000)] };
+  if (
+    norm === '30_days' ||
+    norm === '30days' ||
+    norm === 'last_30days' ||
+    norm === 'last_30_days' ||
+    norm === 'last 30 days' ||
+    norm === '30 ngày qua' ||
+    norm === '30 ngày gần nhất'
+  ) {
+    return makeBounded(y, m, d - 29, y, m, d);
   }
   if (norm === 'last_month' || norm === 'tháng trước') {
-    return {
-      clause: 'created_at >= $DATE_START AND created_at < $DATE_END',
-      params: [vnMidnightUtc(y, m - 1, 1), vnMidnightUtc(y, m, 1)],
-    };
+    return makeBounded(y, m - 1, 1, y, m, 0);
   }
-  if (norm === 'custom' && startDate && endDate) {
-    const startDt = new Date(`${startDate}T00:00:00+07:00`);
-    const endDt = new Date(`${endDate}T23:59:59.999+07:00`);
-    if (!Number.isNaN(startDt.getTime()) && !Number.isNaN(endDt.getTime())) {
-      return {
-        clause: 'created_at >= $DATE_START AND created_at <= $DATE_END',
-        params: [startDt, endDt],
-      };
-    }
-  }
-  // Default: this_month
-  return {
-    clause: 'created_at >= $DATE_START',
-    params: [vnMidnightUtc(y, m, 1)],
-  };
+  // Default: this_month (1st of month 00:00:00+07:00 to today 23:59:59.999+07:00)
+  return makeBounded(y, m, 1, y, m, d);
 }
 
 export function bindDateParams(rawClause: string, params: unknown[], dateInfo: { clause: string; params: unknown[] }): string {
@@ -245,13 +294,17 @@ workspaceRouter.get('/bootstrap', async (_req, res) => {
              t.trial_ends_at AS t_trial_ends_at, t.subscription_expires_at AS t_subscription_expires_at,
              t.subscription_plan_code AS t_subscription_plan_code, t.billing_cycle AS t_billing_cycle,
              t.wallet_balance_vnd AS t_wallet_balance_vnd, t.crm_erp_upgrade_status AS t_crm_erp_upgrade_status,
+             t.grace_ends_at AS t_grace_ends_at, t.auto_renew AS t_auto_renew,
+             t.cancel_at_period_end AS t_cancel_at_period_end, t.cancelled_at AS t_cancelled_at,
+             t.scheduled_plan_code AS t_scheduled_plan_code, t.scheduled_billing_cycle AS t_scheduled_billing_cycle,
              t.settings AS t_settings, t.created_at AS t_created_at,
              u.id AS u_id, u.email AS u_email, u.full_name AS u_full_name, u.phone AS u_phone,
              u.role AS u_role, u.role_id AS u_role_id, u.branch_id AS u_branch_id,
              u.department_id AS u_department_id, u.team_id AS u_team_id, u.position_id AS u_position_id,
              u.reports_to_user_id AS u_reports_to_user_id, u.is_tenant_owner AS u_is_tenant_owner,
              u.is_system_bot AS u_is_system_bot,
-             u.is_external_agency AS u_is_external_agency, u.avatar_url AS u_avatar_url,
+             u.is_external_agency AS u_is_external_agency,
+             COALESCE(NULLIF(u.avatar_url, ''), ga.avatar_url) AS u_avatar_url,
              p.status AS p_status, p.is_available AS p_is_available, p.vacation_mode AS p_vacation_mode,
              p.skipped_credit AS p_skipped_credit, p.work_schedule AS p_work_schedule, p.zalo_chat_id AS p_zalo_chat_id,
              p.sheet_sync_url AS p_sheet_sync_url, p.sheet_tab_name AS p_sheet_tab_name,
@@ -259,6 +312,7 @@ workspaceRouter.get('/bootstrap', async (_req, res) => {
              ob.screen_tours AS ob_screen_tours, ob.is_completed AS ob_is_completed, ob.dismissed_at AS ob_dismissed_at
            FROM tenants t
            LEFT JOIN users u ON u.tenant_id = t.id AND u.id = $2
+           LEFT JOIN global_accounts ga ON LOWER(ga.email) = LOWER(u.email)
            LEFT JOIN tenant_user_profiles p ON p.tenant_id = t.id AND p.user_id = u.id
            LEFT JOIN tenant_onboarding_progress ob ON ob.tenant_id = t.id
            WHERE t.id = $1
@@ -339,6 +393,8 @@ workspaceRouter.get('/bootstrap', async (_req, res) => {
           crm_erp_upgrade_status: r.t_crm_erp_upgrade_status || 'none',
           subscription: computeSubscriptionSnapshot(
             {
+              status: r.t_status,
+              package_code: r.t_package_code,
               plan_tier: r.t_plan_tier,
               created_at: r.t_created_at,
               trial_ends_at: r.t_trial_ends_at,
@@ -347,6 +403,12 @@ workspaceRouter.get('/bootstrap', async (_req, res) => {
               billing_cycle: r.t_billing_cycle,
               wallet_balance_vnd: r.t_wallet_balance_vnd,
               crm_erp_upgrade_status: r.t_crm_erp_upgrade_status,
+              grace_ends_at: r.t_grace_ends_at,
+              auto_renew: r.t_auto_renew,
+              cancel_at_period_end: r.t_cancel_at_period_end,
+              cancelled_at: r.t_cancelled_at,
+              scheduled_plan_code: r.t_scheduled_plan_code,
+              scheduled_billing_cycle: r.t_scheduled_billing_cycle,
             },
             catalog
           ),
@@ -434,7 +496,7 @@ workspaceRouter.get('/bootstrap', async (_req, res) => {
         `SELECT t.id, t.slug, t.name, t.industry, t.plan_tier, u.role, u.is_external_agency
          FROM tenants t
          INNER JOIN users u ON u.tenant_id = t.id
-         WHERE t.status IN ('active', 'trial') AND LOWER(u.email) = $1
+         WHERE t.status IN ('active', 'trial', 'grace') AND LOWER(u.email) = $1
          ORDER BY t.created_at DESC`,
         [(ctx.userEmail || '').toLowerCase()]
       );
@@ -470,9 +532,17 @@ analyticsRouter.get('/dashboard', async (req, res) => {
   try {
     const ctx = getTenantContext();
     const cfg = await getTenantSettingsCached(ctx.tenantId);
-    const datePreset = String(req.query.date_preset || 'this_month');
-    const startDate = req.query.start_date ? String(req.query.start_date) : null;
-    const endDate = req.query.end_date ? String(req.query.end_date) : null;
+    const datePreset = String(req.query.date_preset || req.query.date || 'this_month');
+    const startDate = req.query.since
+      ? String(req.query.since)
+      : req.query.start_date
+        ? String(req.query.start_date)
+        : null;
+    const endDate = req.query.until
+      ? String(req.query.until)
+      : req.query.end_date
+        ? String(req.query.end_date)
+        : null;
     const chartMode = String(req.query.chart_mode || 'day');
     const sourceMode = String(req.query.source_mode || 'lead');
     const roundId = req.query.round_id ? String(req.query.round_id) : null;
@@ -791,12 +861,18 @@ analyticsRouter.get('/fair-share', async (req, res) => {
   try {
     const ctx = getTenantContext();
     const roundId = req.query.round_id ? String(req.query.round_id) : null;
-    const datePreset = String(req.query.date_preset || 'this_month');
-    const dateInfo = resolveDateBounds(
-      datePreset,
-      req.query.start_date ? String(req.query.start_date) : null,
-      req.query.end_date ? String(req.query.end_date) : null
-    );
+    const datePreset = String(req.query.date_preset || req.query.date || 'this_month');
+    const startDate = req.query.since
+      ? String(req.query.since)
+      : req.query.start_date
+        ? String(req.query.start_date)
+        : null;
+    const endDate = req.query.until
+      ? String(req.query.until)
+      : req.query.end_date
+        ? String(req.query.end_date)
+        : null;
+    const dateInfo = resolveDateBounds(datePreset, startDate, endDate);
 
     const data = await withTenantTransaction(ctx.tenantId, async (client) => {
       let targetRoundId = roundId;
@@ -1119,22 +1195,61 @@ const workspacePackageSwitchHandler = async (req: any, res: any) => {
     const ctx = getTenantContext();
     const b = req.body || {};
     const targetCode = b.package_code || b.plan_tier || b.package;
+    const idempotencyKey =
+      String(req.header?.('X-Idempotency-Key') || b.idempotency_key || '').trim().slice(0, 120) || null;
 
-    const switched = await withTenantTransaction(ctx.tenantId, (client) =>
-      switchTenantSaasPackageInTx(client, ctx.tenantId, ctx.userId, {
-        package_code: targetCode,
-        education_addon: b.education_addon,
-        industry_key: b.industry_key,
-        note: b.note,
-      })
-    );
+    const runSwitch = () =>
+      withTenantTransaction(ctx.tenantId, (client) =>
+        switchTenantSaasPackageInTx(client, ctx.tenantId, ctx.userId, {
+          package_code: targetCode,
+          billing_cycle: b.billing_cycle,
+          months: b.months,
+          payment_method: b.payment_method,
+          provider: b.provider,
+          schedule_at_period_end: Boolean(b.schedule_at_period_end),
+          idempotency_key: idempotencyKey,
+          education_addon: b.education_addon,
+          industry_key: b.industry_key,
+          note: b.note,
+        })
+      );
+
+    let switched: Awaited<ReturnType<typeof switchTenantSaasPackageInTx>>;
+    try {
+      switched = await runSwitch();
+    } catch (txErr: any) {
+      if (idempotencyKey && isIdempotencyUniqueViolation(txErr)) {
+        const replayed = await runSwitch();
+        if (!replayed.idempotent_replay) throw txErr;
+        switched = replayed;
+      } else {
+        throw txErr;
+      }
+    }
+
+    if (switched.requires_payment) {
+      res.status(201).json({ success: true, data: switched });
+      return;
+    }
 
     tenantRedis.invalidateTenantCache(ctx.tenantId, switched.slug || ctx.tenantSlug);
     res.json({ success: true, data: switched });
   } catch (err: any) {
     const msg = String(err?.message || '');
-    if (msg.startsWith('INVALID_PACKAGE_CODE')) {
-      sendApiError(res, 422, 'INVALID_PACKAGE_CODE', msg);
+    if (msg.startsWith('INVALID_PACKAGE_CODE') || msg.startsWith('INVALID_PLAN_CODE')) {
+      sendApiError(res, 422, msg.split(':')[0], msg);
+      return;
+    }
+    if (msg.startsWith('DOWNGRADE_USAGE_EXCEEDED')) {
+      sendApiError(res, 409, 'DOWNGRADE_USAGE_EXCEEDED', msg);
+      return;
+    }
+    if (msg.startsWith('IDEMPOTENCY_KEY_MISMATCH')) {
+      sendApiError(res, 409, 'IDEMPOTENCY_KEY_MISMATCH', msg);
+      return;
+    }
+    if (msg.startsWith('INSUFFICIENT_WALLET_BALANCE')) {
+      sendApiError(res, 402, 'INSUFFICIENT_WALLET_BALANCE', msg);
       return;
     }
     sendApiError(res, 500, 'SWITCH_PACKAGE_FAILED', msg || 'Không thể chuyển đổi gói sản phẩm.');

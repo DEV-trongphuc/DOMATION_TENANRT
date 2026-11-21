@@ -1,0 +1,493 @@
+{
+  "schemaVersion": "1.0.0",
+  "planId": "PLAN-M4-UIUX-COMPARE-001",
+  "generatedAt": "2026-11-21T06:16:33.726Z",
+  "durationMs": 37978,
+  "config": {
+    "mode": "erp",
+    "outDir": "docs/screenshots/marketing-ui-comparison",
+    "viewports": [
+      "1440x900",
+      "390x844"
+    ],
+    "spawnBackend": true,
+    "spawnVite": true,
+    "mockMeta": true,
+    "strict": false,
+    "headless": true,
+    "fullPage": false,
+    "includeStates": true,
+    "seedFixtures": false,
+    "seedMyerpShowcase": true,
+    "dataDir": "d:\\GITHUB_SPACE\\AUTO_DATA_TENANRT\\.autodata-pgdata-myerp-showcase",
+    "tenantSlug": "ideas",
+    "routesFilter": [],
+    "capturesFilter": [
+      "C02p",
+      "C12p"
+    ]
+  },
+  "environment": {
+    "nodeVersion": "v24.18.0",
+    "platform": "win32",
+    "browserExecutable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "backendUrl": "http://127.0.0.1:60646",
+    "erpUrl": "http://127.0.0.1:60647",
+    "landingUrl": null,
+    "erpDir": "D:\\GITHUB_SPACE\\DOMATION_ERP_FULL",
+    "landingDir": "D:\\GITHUB_SPACE\\DOMATION_LANDINGPAGE"
+  },
+  "summary": {
+    "totalPlanned": 2,
+    "totalCaptured": 2,
+    "captureErrors": 0,
+    "totalChecks": 24,
+    "passed": 15,
+    "failed": 0,
+    "skipped": 9,
+    "overallStatus": "pass"
+  },
+  "checksById": {
+    "runtime_clean": {
+      "category": "Console & Network",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    },
+    "route_guard_clean": {
+      "category": "Auth & ErrorBoundary",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    },
+    "splash_landing_bg": {
+      "category": "Loading Screen (08:36Z)",
+      "passed": 0,
+      "failed": 0,
+      "skipped": 2
+    },
+    "dom_svg_decor_present": {
+      "category": "Architectural Decor (08:36Z)",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    },
+    "typography_be_vietnam_pro": {
+      "category": "Typography",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    },
+    "palette_sapphire_red_no_purple": {
+      "category": "Palette (09:10Z)",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    },
+    "sidebar_light_animated_clean": {
+      "category": "White Sidebar (09:10Z)",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    },
+    "settings_upgrade_relocated": {
+      "category": "Settings Upgrade (09:10Z)",
+      "passed": 0,
+      "failed": 0,
+      "skipped": 2
+    },
+    "standard_app_icons": {
+      "category": "AppIcons (09:10Z)",
+      "passed": 0,
+      "failed": 0,
+      "skipped": 2
+    },
+    "date_range_filter_present": {
+      "category": "Date Filter (09:10Z)",
+      "passed": 1,
+      "failed": 0,
+      "skipped": 1
+    },
+    "modal_zns_drawer_tour_contracts": {
+      "category": "R3 Components",
+      "passed": 0,
+      "failed": 0,
+      "skipped": 2
+    },
+    "viewport_no_horizontal_overflow": {
+      "category": "Layout Stability",
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "captures": [
+    {
+      "id": "C02p-portal-flows-list",
+      "group": "C",
+      "mode": "portal",
+      "route": "/marketing/flows",
+      "state": "default",
+      "viewport": "1440x900",
+      "url": "http://127.0.0.1:60647/marketing/flows",
+      "screenshotPath": "1440x900/C02p-portal-flows-list.png",
+      "screenshotAbsPath": "D:\\GITHUB_SPACE\\AUTO_DATA_TENANRT\\docs\\screenshots\\marketing-ui-comparison\\1440x900\\C02p-portal-flows-list.png",
+      "status": "pass",
+      "error": null,
+      "durationMs": 32747,
+      "checks": [
+        {
+          "id": "runtime_clean",
+          "category": "Console & Network",
+          "status": "pass",
+          "actual": {
+            "consoleErrors": 0,
+            "pageErrors": 0,
+            "http5xxErrors": 0,
+            "requestFailedErrors": 0,
+            "php404Or501Errors": 0,
+            "port3199Requests": 0
+          },
+          "expected": "0 consoleErrors, 0 pageErrors, 0 http5xx, 0 requestFailed, 0 .php 404/501, 0 legacy :3199 requests",
+          "detail": "Zero console, page, 5xx, failed request, .php 404/501, or :3199 errors"
+        },
+        {
+          "id": "route_guard_clean",
+          "category": "Auth & ErrorBoundary",
+          "status": "pass",
+          "actual": {
+            "expectedPathname": "/marketing/flows",
+            "pathname": "/marketing/flows",
+            "routeMatched": true,
+            "mainTextLength": 2429,
+            "portalTextLength": 0,
+            "hasAccessDenied": false,
+            "hasErrorBoundary": false,
+            "unexpectedLogin": false
+          },
+          "expected": "<main> text > 40 chars, no AccessDeniedView/ErrorBoundary text, no unexpected /login redirect",
+          "detail": "Rendered cleanly on /marketing/flows (2429 chars)"
+        },
+        {
+          "id": "splash_landing_bg",
+          "category": "Loading Screen (08:36Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "#ideas-splash-screen references fluent-brand-ambient-bg (HTTP 200) and fades cleanly after hydration",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "dom_svg_decor_present",
+          "category": "Architectural Decor (08:36Z)",
+          "status": "pass",
+          "actual": {
+            "decorSvgCount": 3
+          },
+          "expected": ">= 1 visible non-icon Domation SVG decor accent in .dom-meta-app-canvas / .mkt-scope / .ql-luxury-decor-layer",
+          "detail": "Found 3 visible Domation SVG decor element(s)"
+        },
+        {
+          "id": "typography_be_vietnam_pro",
+          "category": "Typography",
+          "status": "pass",
+          "actual": {
+            "bodyFont": "\"Be Vietnam Pro\", Inter, -apple-system, BlinkMacSystemFont, sans-serif",
+            "mktScopeFont": "\"Be Vietnam Pro\", Inter, -apple-system, BlinkMacSystemFont, sans-serif",
+            "mktFontVariantNumeric": "lining-nums tabular-nums",
+            "domMetaScopeFont": "",
+            "domMetaHeadingFont": "",
+            "hasVisibleMktScope": true,
+            "hasVisibleDomMetaScope": false
+          },
+          "expected": "Be Vietnam Pro on body, active .mkt-scope (+ tabular-nums), and .dom-meta-scope (+ h1/h2)",
+          "detail": "Be Vietnam Pro & tabular-nums verified"
+        },
+        {
+          "id": "palette_sapphire_red_no_purple",
+          "category": "Palette (09:10Z)",
+          "status": "pass",
+          "actual": {
+            "colorPrimaryVar": "#1e40ff",
+            "colorDangerVar": "#dc2626",
+            "colorBgVar": "#f8f9fa",
+            "colorTextVar": "#0f172a",
+            "purpleMatches": [],
+            "mktRedHits": 1,
+            "primaryCtaBg": "rgb(30, 64, 255)",
+            "quickNavRedCount": null
+          },
+          "expected": "Royal Sapphire #1e40ff, Red accent #dc2626/#ef4444 in Marketing & ERP, Canvas #f8f9fa, zero legacy purple",
+          "detail": "Royal Sapphire + Red accent verified with zero legacy purple"
+        },
+        {
+          "id": "sidebar_light_animated_clean",
+          "category": "White Sidebar (09:10Z)",
+          "status": "pass",
+          "actual": {
+            "exists": true,
+            "width": 260,
+            "hasDarkStop": false,
+            "hasLightStop": true,
+            "transitionDuration": 0.3,
+            "navTextColor": {
+              "r": 51,
+              "g": 65,
+              "b": 85,
+              "a": 1
+            },
+            "hasForbiddenUpgradeBox": false,
+            "hasMarketingGroup": true,
+            "requiredStandaloneHrefsMissing": [],
+            "crmHrefsFound": [
+              "/data",
+              "/contacts",
+              "/deals",
+              "/rounds",
+              "/rules",
+              "/integrations"
+            ]
+          },
+          "expected": "Light gradient sidebar (no dark stops), transitionDuration > 0, dark readable nav text, zero sidebar Upgrade box",
+          "detail": "White/light animated sidebar verified (width=260px, transition=0.3s)"
+        },
+        {
+          "id": "settings_upgrade_relocated",
+          "category": "Settings Upgrade (09:10Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "[data-testid=\"settings-upgrade-cta\"] & [data-testid=\"settings-upgrade-banner\"] on /settings + Upgrade tab",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "standard_app_icons",
+          "category": "AppIcons (09:10Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "Square bounded icons (sidebar 14..38px, .mkt-scope 56x56 tiles 32..56px, |w - h| <= 2)",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "date_range_filter_present",
+          "category": "Date Filter (09:10Z)",
+          "status": "pass",
+          "actual": {
+            "datePickerCount": 1,
+            "datePopoverOpened": "not-tested"
+          },
+          "expected": "Unified date range filter trigger visible on surface and opens unified-date-picker-popover",
+          "detail": "Unified date picker present (count=1)"
+        },
+        {
+          "id": "modal_zns_drawer_tour_contracts",
+          "category": "R3 Components",
+          "status": "skip",
+          "actual": null,
+          "expected": "Expanded Email modal (>=768px, 2-col), ZNS 2xl & 4 sub-tabs, Campaign/Flow/Survey drawers, Spotlight tours",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "viewport_no_horizontal_overflow",
+          "category": "Layout Stability",
+          "status": "pass",
+          "actual": {
+            "scrollWidth": 1440,
+            "innerWidth": 1440
+          },
+          "expected": "document.documentElement.scrollWidth <= window.innerWidth + 2",
+          "detail": "No horizontal overflow (1440px <= 1442px)"
+        }
+      ],
+      "diagnostics": {
+        "consoleErrors": [],
+        "pageErrors": [],
+        "http5xxErrors": [],
+        "http4xxUrls": [],
+        "requestFailedErrors": [],
+        "php404Or501Errors": [],
+        "port3199Requests": []
+      }
+    },
+    {
+      "id": "C12p-portal-capi",
+      "group": "C",
+      "mode": "portal",
+      "route": "/marketing/capi",
+      "state": "default",
+      "viewport": "1440x900",
+      "url": "http://127.0.0.1:60647/marketing/capi",
+      "screenshotPath": "1440x900/C12p-portal-capi.png",
+      "screenshotAbsPath": "D:\\GITHUB_SPACE\\AUTO_DATA_TENANRT\\docs\\screenshots\\marketing-ui-comparison\\1440x900\\C12p-portal-capi.png",
+      "status": "pass",
+      "error": null,
+      "durationMs": 1621,
+      "checks": [
+        {
+          "id": "runtime_clean",
+          "category": "Console & Network",
+          "status": "pass",
+          "actual": {
+            "consoleErrors": 0,
+            "pageErrors": 0,
+            "http5xxErrors": 0,
+            "requestFailedErrors": 0,
+            "php404Or501Errors": 0,
+            "port3199Requests": 0
+          },
+          "expected": "0 consoleErrors, 0 pageErrors, 0 http5xx, 0 requestFailed, 0 .php 404/501, 0 legacy :3199 requests",
+          "detail": "Zero console, page, 5xx, failed request, .php 404/501, or :3199 errors"
+        },
+        {
+          "id": "route_guard_clean",
+          "category": "Auth & ErrorBoundary",
+          "status": "pass",
+          "actual": {
+            "expectedPathname": "/marketing/capi",
+            "pathname": "/marketing/capi",
+            "routeMatched": true,
+            "mainTextLength": 7885,
+            "portalTextLength": 0,
+            "hasAccessDenied": false,
+            "hasErrorBoundary": false,
+            "unexpectedLogin": false
+          },
+          "expected": "<main> text > 40 chars, no AccessDeniedView/ErrorBoundary text, no unexpected /login redirect",
+          "detail": "Rendered cleanly on /marketing/capi (7885 chars)"
+        },
+        {
+          "id": "splash_landing_bg",
+          "category": "Loading Screen (08:36Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "#ideas-splash-screen references fluent-brand-ambient-bg (HTTP 200) and fades cleanly after hydration",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "dom_svg_decor_present",
+          "category": "Architectural Decor (08:36Z)",
+          "status": "pass",
+          "actual": {
+            "decorSvgCount": 3
+          },
+          "expected": ">= 1 visible non-icon Domation SVG decor accent in .dom-meta-app-canvas / .mkt-scope / .ql-luxury-decor-layer",
+          "detail": "Found 3 visible Domation SVG decor element(s)"
+        },
+        {
+          "id": "typography_be_vietnam_pro",
+          "category": "Typography",
+          "status": "pass",
+          "actual": {
+            "bodyFont": "\"Be Vietnam Pro\", Inter, -apple-system, BlinkMacSystemFont, sans-serif",
+            "mktScopeFont": "\"Be Vietnam Pro\", Inter, -apple-system, BlinkMacSystemFont, sans-serif",
+            "mktFontVariantNumeric": "lining-nums tabular-nums",
+            "domMetaScopeFont": "",
+            "domMetaHeadingFont": "",
+            "hasVisibleMktScope": true,
+            "hasVisibleDomMetaScope": false
+          },
+          "expected": "Be Vietnam Pro on body, active .mkt-scope (+ tabular-nums), and .dom-meta-scope (+ h1/h2)",
+          "detail": "Be Vietnam Pro & tabular-nums verified"
+        },
+        {
+          "id": "palette_sapphire_red_no_purple",
+          "category": "Palette (09:10Z)",
+          "status": "pass",
+          "actual": {
+            "colorPrimaryVar": "#1e40ff",
+            "colorDangerVar": "#dc2626",
+            "colorBgVar": "#f8f9fa",
+            "colorTextVar": "#0f172a",
+            "purpleMatches": [],
+            "mktRedHits": 0,
+            "primaryCtaBg": null,
+            "quickNavRedCount": null
+          },
+          "expected": "Royal Sapphire #1e40ff, Red accent #dc2626/#ef4444 in Marketing & ERP, Canvas #f8f9fa, zero legacy purple",
+          "detail": "Royal Sapphire + Red accent verified with zero legacy purple"
+        },
+        {
+          "id": "sidebar_light_animated_clean",
+          "category": "White Sidebar (09:10Z)",
+          "status": "pass",
+          "actual": {
+            "exists": true,
+            "width": 260,
+            "hasDarkStop": false,
+            "hasLightStop": true,
+            "transitionDuration": 0.3,
+            "navTextColor": {
+              "r": 51,
+              "g": 65,
+              "b": 85,
+              "a": 1
+            },
+            "hasForbiddenUpgradeBox": false,
+            "hasMarketingGroup": true,
+            "requiredStandaloneHrefsMissing": [],
+            "crmHrefsFound": [
+              "/data",
+              "/contacts",
+              "/deals",
+              "/rounds",
+              "/rules",
+              "/integrations"
+            ]
+          },
+          "expected": "Light gradient sidebar (no dark stops), transitionDuration > 0, dark readable nav text, zero sidebar Upgrade box",
+          "detail": "White/light animated sidebar verified (width=260px, transition=0.3s)"
+        },
+        {
+          "id": "settings_upgrade_relocated",
+          "category": "Settings Upgrade (09:10Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "[data-testid=\"settings-upgrade-cta\"] & [data-testid=\"settings-upgrade-banner\"] on /settings + Upgrade tab",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "standard_app_icons",
+          "category": "AppIcons (09:10Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "Square bounded icons (sidebar 14..38px, .mkt-scope 56x56 tiles 32..56px, |w - h| <= 2)",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "date_range_filter_present",
+          "category": "Date Filter (09:10Z)",
+          "status": "skip",
+          "actual": null,
+          "expected": "Unified date range filter trigger visible on surface and opens unified-date-picker-popover",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "modal_zns_drawer_tour_contracts",
+          "category": "R3 Components",
+          "status": "skip",
+          "actual": null,
+          "expected": "Expanded Email modal (>=768px, 2-col), ZNS 2xl & 4 sub-tabs, Campaign/Flow/Survey drawers, Spotlight tours",
+          "detail": "Not applicable to this capture"
+        },
+        {
+          "id": "viewport_no_horizontal_overflow",
+          "category": "Layout Stability",
+          "status": "pass",
+          "actual": {
+            "scrollWidth": 1440,
+            "innerWidth": 1440
+          },
+          "expected": "document.documentElement.scrollWidth <= window.innerWidth + 2",
+          "detail": "No horizontal overflow (1440px <= 1442px)"
+        }
+      ],
+      "diagnostics": {
+        "consoleErrors": [],
+        "pageErrors": [],
+        "http5xxErrors": [],
+        "http4xxUrls": [],
+        "requestFailedErrors": [],
+        "php404Or501Errors": [],
+        "port3199Requests": []
+      }
+    }
+  ]
+}

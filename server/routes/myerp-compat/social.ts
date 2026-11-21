@@ -19,39 +19,63 @@ export const socialCompatRouter = Router();
 
 // ---- Enterprise Social Feed & Comments ----
 const normalizePostPayload = (payload: any) => {
-  const items = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : [];
-  const posts = items.map((p: any) => ({
+  const rawItems = Array.isArray(payload?.data?.items)
+    ? payload.data.items
+    : Array.isArray(payload?.items)
+      ? payload.items
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload)
+          ? payload
+          : [];
+  const posts = rawItems.map((p: any) => ({
     ...p,
     author_id: p.author_id || p.author_user_id,
     author_name: p.author_name || 'Thành viên',
+    author_avatar: p.author_avatar || null,
     attachments: Array.isArray(p.attachments) ? p.attachments : [],
     reactions: p.reactions && typeof p.reactions === 'object' ? p.reactions : {},
     comments_count: Number(p.comments_count || 0),
     likes_count: Number(p.likes_count || 0),
   }));
-  return { items: posts, posts, next_cursor: null, has_more: false };
+  return {
+    ...(payload && typeof payload === 'object' ? payload : {}),
+    success: true,
+    data: { items: posts, posts, next_cursor: null, has_more: false },
+  };
 };
 
 const normalizeHonorsPayload = (payload: any) => {
-  const rawItems = Array.isArray(payload?.honors)
-    ? payload.honors
-    : Array.isArray(payload?.items)
-      ? payload.items
-      : [];
+  const rawItems = Array.isArray(payload?.data?.honors)
+    ? payload.data.honors
+    : Array.isArray(payload?.data?.items)
+      ? payload.data.items
+      : Array.isArray(payload?.honors)
+        ? payload.honors
+        : Array.isArray(payload?.items)
+          ? payload.items
+          : [];
   const honors = rawItems.map((h: any) => ({
     ...h,
     user_id: h.user_id || h.recipient_user_id,
+    full_name: h.full_name || h.recipient_name || h.user_name || 'Thành viên xuất sắc',
     user_name: h.user_name || h.recipient_name || 'Thành viên xuất sắc',
-    title: h.title || h.badge || 'Vinh danh nổi bật',
-    badge: h.badge || 'Top Performer',
+    avatar_url: h.avatar_url || h.recipient_avatar || null,
+    title: h.title || h.badge_title || h.badge || 'Vinh danh nổi bật',
+    badge: h.badge || h.badge_key || 'Top Performer',
     reason: h.reason || h.message || '',
     hearts_count: Number(h.hearts_count || h.points || 0),
     user_reactions: Number(h.user_reactions || 0),
   }));
   return {
-    items: honors,
-    honors,
-    leaderboard: Array.isArray(payload?.leaderboard) ? payload.leaderboard : [],
+    ...(payload && typeof payload === 'object' ? payload : {}),
+    success: true,
+    data: {
+      items: honors,
+      honors,
+      candidates: [],
+      leaderboard: Array.isArray(payload?.data?.leaderboard) ? payload.data.leaderboard : [],
+    },
   };
 };
 
@@ -158,17 +182,40 @@ socialCompatRouter.put('/comments/:id', (req, res) => ok(res, { id: req.params.i
 socialCompatRouter.get(
   '/chat/conversations',
   bridge(workchatRouter, '/channels', {
-    transform: (payload) =>
-      mapListData(payload, (c) =>
+    transform: (payload) => {
+      const raw = Array.isArray(payload?.data?.items)
+        ? payload.data.items
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : [];
+      const mapped = raw.map((c: any) =>
         withAliases(c, {
           title: (r) => r.title || r.name || 'Kênh chat',
+          name: (r) => r.name || r.title || 'Kênh chat',
           type: (r) => r.type || r.channel_type || 'group',
+          last_msg: (r) => r.last_msg || r.last_message_preview || '',
+          last_msg_at: (r) => r.last_msg_at || r.last_message_at || r.updated_at,
+          last_msg_type: (r) => (String(r.last_message_preview || '').startsWith('[Nhãn dán') ? 'sticker' : r.last_msg_type || 'text'),
         })
-      ),
+      );
+      return { ...(payload && typeof payload === 'object' ? payload : {}), success: true, data: mapped };
+    },
   })
 );
 socialCompatRouter.post('/chat/conversations', bridge(workchatRouter, '/channels'));
-socialCompatRouter.get('/chat/conversations/:id/messages', bridge(workchatRouter, (req) => `/channels/${req.params.id}/messages`));
+socialCompatRouter.get(
+  '/chat/conversations/:id/messages',
+  bridge(workchatRouter, (req) => `/channels/${req.params.id}/messages`, {
+    transform: (payload) => {
+      const items = Array.isArray(payload?.data?.items)
+        ? payload.data.items
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : [];
+      return { ...(payload && typeof payload === 'object' ? payload : {}), success: true, data: items };
+    },
+  })
+);
 socialCompatRouter.post('/chat/messages', (req, res, next) => {
   const convId = req.body?.conversation_id || req.body?.channel_id || req.query?.conversation_id;
   if (!convId) {

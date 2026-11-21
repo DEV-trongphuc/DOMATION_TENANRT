@@ -36,6 +36,7 @@ export async function runDatabaseMigrations(options?: { seedSuperAdmin?: boolean
     ['../../modules/attendance/schema.ts', 'ensureAttendanceWaveASchema'],
     ['../../modules/org-rbac/schema.ts', 'ensureOrgRbacWaveASchema'],
     ['../../modules/crm-360/schema.ts', 'ensureCrm360Schema'],
+    ['../../modules/dom-ai-portal/schema.ts', 'runDomAiPortalSchema'],
   ];
   for (const [modPath, fnName] of wave2SchemaLoaders) {
     try {
@@ -54,9 +55,27 @@ export async function runDatabaseMigrations(options?: { seedSuperAdmin?: boolean
       await postClient
         .query('ALTER TABLE tenant_cron_runs MODIFY COLUMN tenant_id VARCHAR(36) NULL')
         .catch(() => {});
+      await addMariaDbColumnIfNotExists(postClient, 'tenant_cron_runs', 'run_key', 'VARCHAR(120) NULL');
+      await postClient
+        .query('CREATE UNIQUE INDEX IF NOT EXISTS uk_cron_runs_tenant_sub_run_key ON tenant_cron_runs(tenant_id, subroutine_key, run_key)')
+        .catch(() => {});
+      await postClient
+        .query('CREATE INDEX IF NOT EXISTS idx_cron_runs_tenant_sub_status ON tenant_cron_runs(tenant_id, subroutine_key, status, started_at DESC)')
+        .catch(() => {});
+      await postClient
+        .query('CREATE INDEX IF NOT EXISTS idx_cron_runs_sub_started ON tenant_cron_runs(subroutine_key, started_at DESC)')
+        .catch(() => {});
     } else {
       const postPgSql = `
         ALTER TABLE IF EXISTS tenant_cron_runs ALTER COLUMN tenant_id DROP NOT NULL;
+        ALTER TABLE IF EXISTS tenant_cron_runs ADD COLUMN IF NOT EXISTS run_key VARCHAR(120);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_tenant_sub_run_key
+          ON tenant_cron_runs(tenant_id, subroutine_key, run_key)
+          WHERE tenant_id IS NOT NULL AND run_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_tenant_sub_status
+          ON tenant_cron_runs(tenant_id, subroutine_key, status, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_sub_started
+          ON tenant_cron_runs(subroutine_key, started_at DESC);
         DO $$
         DECLARE
           pol_rec RECORD;
@@ -132,11 +151,13 @@ async function runPostgresMigrations(
       password_hash VARCHAR(255) NOT NULL,
       full_name VARCHAR(150) NOT NULL,
       phone VARCHAR(30),
+      avatar_url TEXT,
       is_active BOOLEAN NOT NULL DEFAULT true,
       last_login_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
     );
+    ALTER TABLE global_accounts ADD COLUMN IF NOT EXISTS avatar_url TEXT;
     CREATE INDEX IF NOT EXISTS idx_global_accounts_email_lower ON global_accounts(LOWER(email));
     CREATE INDEX IF NOT EXISTS idx_global_accounts_phone ON global_accounts(phone) WHERE phone IS NOT NULL;
 
@@ -151,6 +172,7 @@ async function runPostgresMigrations(
     -- 4. Composite Indexes on leads
     CREATE INDEX IF NOT EXISTS idx_leads_tenant_phone_created ON leads(tenant_id, phone, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_leads_sla_sweep ON leads(tenant_id, is_accepted, sla_breached, stage_id);
+    CREATE INDEX IF NOT EXISTS idx_leads_tenant_created_at ON leads(tenant_id, created_at DESC);
 
     -- 5. Platform settings & platform consultation hub
     CREATE TABLE IF NOT EXISTS platform_settings (
@@ -243,22 +265,37 @@ async function runPostgresMigrations(
     CREATE INDEX IF NOT EXISTS idx_data_reports_tenant_created ON data_reports(tenant_id, created_at DESC);
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (clock_timestamp() + INTERVAL '30 days');
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS grace_ends_at TIMESTAMPTZ;
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS scheduled_plan_code VARCHAR(80);
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS scheduled_billing_cycle VARCHAR(30);
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_plan_code VARCHAR(80) NOT NULL DEFAULT 'trial_1m';
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS billing_cycle VARCHAR(30) NOT NULL DEFAULT 'trial';
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wallet_balance_vnd BIGINT NOT NULL DEFAULT 0;
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS crm_erp_upgrade_status VARCHAR(50) NOT NULL DEFAULT 'none';
     UPDATE tenants SET trial_ends_at = created_at + INTERVAL '30 days' WHERE trial_ends_at IS NULL;
+
+    ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_status_check;
+    ALTER TABLE tenants ADD CONSTRAINT tenants_status_check
+      CHECK (status IN ('active', 'suspended', 'trial', 'grace', 'cancelled'));
+
     CREATE TABLE IF NOT EXISTS tenant_billing_transactions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      tx_type VARCHAR(40) NOT NULL CHECK (tx_type IN ('topup', 'subscription_purchase', 'renewal', 'plan_upgrade', 'crm_erp_upgrade', 'admin_grant')),
+      tx_type VARCHAR(40) NOT NULL CHECK (tx_type IN ('topup', 'subscription_purchase', 'renewal', 'plan_upgrade', 'plan_downgrade', 'plan_switch', 'package_switch', 'refund', 'cancellation', 'proration_credit', 'reactivation', 'webhook_payment', 'crm_erp_upgrade', 'admin_grant')),
       plan_code VARCHAR(80),
       billing_cycle VARCHAR(30),
       months_added INTEGER NOT NULL DEFAULT 0,
       amount_vnd BIGINT NOT NULL DEFAULT 0,
+      proration_credit_vnd BIGINT NOT NULL DEFAULT 0,
       discount_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
       payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
-      status VARCHAR(30) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'completed')),
+      provider VARCHAR(40) NOT NULL DEFAULT 'manual_bank_transfer',
+      external_tx_id VARCHAR(160),
+      idempotency_key VARCHAR(120),
+      status VARCHAR(30) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'completed', 'failed', 'cancelled', 'refunded', 'expired')),
       reference_code VARCHAR(80),
       note TEXT,
       metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -267,8 +304,37 @@ async function runPostgresMigrations(
       processed_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
     );
+    ALTER TABLE tenant_billing_transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(120);
+    ALTER TABLE tenant_billing_transactions ADD COLUMN IF NOT EXISTS provider VARCHAR(40) NOT NULL DEFAULT 'manual_bank_transfer';
+    ALTER TABLE tenant_billing_transactions ADD COLUMN IF NOT EXISTS external_tx_id VARCHAR(160);
+    ALTER TABLE tenant_billing_transactions ADD COLUMN IF NOT EXISTS proration_credit_vnd BIGINT NOT NULL DEFAULT 0;
+
+    ALTER TABLE tenant_billing_transactions DROP CONSTRAINT IF EXISTS tenant_billing_transactions_tx_type_check;
+    ALTER TABLE tenant_billing_transactions ADD CONSTRAINT tenant_billing_transactions_tx_type_check
+      CHECK (tx_type IN ('topup', 'subscription_purchase', 'renewal', 'plan_upgrade', 'plan_downgrade', 'plan_switch', 'package_switch', 'refund', 'cancellation', 'proration_credit', 'reactivation', 'webhook_payment', 'crm_erp_upgrade', 'admin_grant'));
+
+    ALTER TABLE tenant_billing_transactions DROP CONSTRAINT IF EXISTS tenant_billing_transactions_status_check;
+    ALTER TABLE tenant_billing_transactions ADD CONSTRAINT tenant_billing_transactions_status_check
+      CHECK (status IN ('pending', 'approved', 'rejected', 'completed', 'failed', 'cancelled', 'refunded', 'expired'));
+
+    WITH dup_refs AS (
+      SELECT id, reference_code,
+             ROW_NUMBER() OVER (PARTITION BY reference_code ORDER BY created_at ASC, id ASC) AS rn
+      FROM tenant_billing_transactions
+      WHERE reference_code IS NOT NULL
+    )
+    UPDATE tenant_billing_transactions t
+    SET reference_code = LEFT(t.reference_code, 68) || '-' || LEFT(t.id::text, 8)
+    FROM dup_refs d
+    WHERE t.id = d.id AND d.rn > 1;
+
     CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_created ON tenant_billing_transactions(tenant_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_billing_tx_status_created ON tenant_billing_transactions(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_status_created ON tenant_billing_transactions(tenant_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_type_created ON tenant_billing_transactions(tenant_id, tx_type, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_tx_tenant_idempotency ON tenant_billing_transactions(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_tx_provider_ext ON tenant_billing_transactions(provider, external_tx_id) WHERE provider IS NOT NULL AND external_tx_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_tx_reference_code ON tenant_billing_transactions(reference_code) WHERE reference_code IS NOT NULL;
     ALTER TABLE tenant_billing_transactions ENABLE ROW LEVEL SECURITY;
     ALTER TABLE tenant_billing_transactions FORCE ROW LEVEL SECURITY;
     DO $$
@@ -332,12 +398,15 @@ async function runPostgresMigrations(
 
     ALTER TABLE tenant_integrations DROP CONSTRAINT IF EXISTS tenant_integrations_integration_type_check;
     ALTER TABLE tenant_integrations ADD CONSTRAINT tenant_integrations_integration_type_check
-      CHECK (integration_type IN ('telegram', 'telegram_bot', 'zalo_bot', 'zalo_oa', 'zalo_zns', 'meta_capi', 'facebook_ads', 'aws_ses', 'smtp', 'custom_domain_dkim', 'sms_brandname', 'google_sheets', 'misa_einvoice', 'ai_gemini', 'ai_gemini_byok'));
+      CHECK (integration_type IN ('telegram', 'telegram_bot', 'zalo_bot', 'zalo_oa', 'zalo_zns', 'meta_capi', 'meta_messenger', 'facebook_ads', 'google_ads', 'dom_meta_report', 'aws_ses', 'smtp', 'resend', 'sendgrid', 'postmark', 'custom_domain_dkim', 'sms_brandname', 'google_sheets', 'misa_einvoice', 'ai_gemini', 'ai_gemini_byok'));
 
     CREATE INDEX IF NOT EXISTS idx_leads_tenant_active_created ON leads(tenant_id, created_at DESC) WHERE is_deleted = false;
     CREATE INDEX IF NOT EXISTS idx_leads_tenant_assigned_status_created ON leads(tenant_id, assigned_to, status, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_leads_tenant_round_created ON leads(tenant_id, round_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_leads_tenant_campaign_ad ON leads(tenant_id, campaign_id, ad_id);
+    CREATE INDEX IF NOT EXISTS idx_leads_tenant_adset_created ON leads(tenant_id, adset_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_leads_tenant_phone ON leads(tenant_id, phone) WHERE phone IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_leads_tenant_updated ON leads(tenant_id, updated_at DESC);
 
     CREATE TABLE IF NOT EXISTS consultant_managers (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -515,7 +584,16 @@ async function runPostgresMigrations(
     CREATE INDEX IF NOT EXISTS idx_leads_drainer_unassigned ON leads(status, assigned_to) WHERE is_deleted = false AND status IN ('unassigned_pending', 'recalled');
     CREATE INDEX IF NOT EXISTS idx_webhook_dlq_retry_sweep ON tenant_webhook_dlq(retry_count, last_attempt_at ASC) WHERE retry_count < 10;
     CREATE INDEX IF NOT EXISTS idx_capi_retry_sweep ON capi_logs(response_status, sent_at ASC) WHERE response_status IN (429, 500, 502, 503, 504);
-    CREATE INDEX IF NOT EXISTS idx_tenants_subscription_expiry ON tenants(status, subscription_expires_at, trial_ends_at) WHERE status IN ('active', 'trial');
+    ALTER TABLE capi_logs ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE capi_logs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_capi_logs_lead_event_status ON capi_logs(tenant_id, lead_id, event_name, response_status);
+    CREATE INDEX IF NOT EXISTS idx_capi_logs_retry_next ON capi_logs(response_status, next_retry_at, sent_at ASC) WHERE response_status IN (429, 500, 502, 503, 504);
+    CREATE INDEX IF NOT EXISTS idx_leads_tenant_ad_id ON leads(tenant_id, ad_id) WHERE is_deleted = false AND ad_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_leads_tenant_adset_id ON leads(tenant_id, adset_id) WHERE is_deleted = false AND adset_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_data_reports_tenant_lead_created ON data_reports(tenant_id, lead_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_meta_ads_tenant_ad_stop ON meta_ads_insights(tenant_id, ad_id, date_stop DESC);
+    DROP INDEX IF EXISTS idx_tenants_subscription_expiry;
+    CREATE INDEX IF NOT EXISTS idx_tenants_subscription_expiry ON tenants(status, subscription_expires_at, trial_ends_at, grace_ends_at) WHERE status IN ('active', 'trial', 'grace');
     CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON admin_audit_logs(tenant_id, actor_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_comp_logs_consultant ON active_compensation_logs(tenant_id, consultant_user_id, created_at DESC);
 
@@ -557,7 +635,7 @@ async function runPostgresMigrations(
 
     ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_plan_tier_check;
     ALTER TABLE tenants ADD CONSTRAINT tenants_plan_tier_check
-      CHECK (plan_tier IN ('starter', 'growth', 'enterprise', 'autodata_crm', 'marketing_standalone', 'growth_combo', 'domation_promax'));
+      CHECK (plan_tier IN ('starter', 'growth', 'enterprise', 'autodata_standard', 'autodata_growth', 'domation_crm_erp', 'autodata_crm', 'marketing_standalone', 'growth_combo', 'domation_promax'));
 
     ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
     ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (char_length(trim(role)) >= 1);
@@ -1077,6 +1155,7 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
       password_hash VARCHAR(255) NOT NULL,
       full_name VARCHAR(150) NOT NULL,
       phone VARCHAR(30) NULL,
+      avatar_url TEXT NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       last_login_at DATETIME(6) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -1085,9 +1164,17 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
       INDEX idx_global_accounts_phone (phone)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
+  await addMariaDbColumnIfNotExists(client, 'global_accounts', 'avatar_url', 'TEXT NULL');
 
   // Safe column additions for existing MariaDB schemas
   await addMariaDbColumnIfNotExists(client, 'tenants', 'obfuscated_slug', 'VARCHAR(64) NULL UNIQUE');
+  await addMariaDbColumnIfNotExists(client, 'tenants', 'grace_ends_at', 'DATETIME(6) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenants', 'auto_renew', 'TINYINT(1) NOT NULL DEFAULT 1');
+  await addMariaDbColumnIfNotExists(client, 'tenants', 'cancel_at_period_end', 'TINYINT(1) NOT NULL DEFAULT 0');
+  await addMariaDbColumnIfNotExists(client, 'tenants', 'cancelled_at', 'DATETIME(6) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenants', 'scheduled_plan_code', 'VARCHAR(80) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenants', 'scheduled_billing_cycle', 'VARCHAR(30) NULL');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_tenants_subscription_expiry ON tenants(status, subscription_expires_at, trial_ends_at, grace_ends_at)').catch(() => {});
   await addMariaDbColumnIfNotExists(client, 'users', 'account_id', 'VARCHAR(36) NULL');
   await addMariaDbColumnIfNotExists(client, 'tenant_onboarding_progress', 'screen_tours', 'JSON NOT NULL DEFAULT (JSON_OBJECT())');
   await addMariaDbColumnIfNotExists(client, 'tenant_user_profiles', 'is_silent', 'TINYINT(1) NOT NULL DEFAULT 0');
@@ -1131,6 +1218,7 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
   // Composite indexes on leads
   await client.query('CREATE INDEX IF NOT EXISTS idx_leads_tenant_phone_created ON leads(tenant_id, phone, created_at DESC)').catch(() => {});
   await client.query('CREATE INDEX IF NOT EXISTS idx_leads_sla_sweep ON leads(tenant_id, is_accepted, sla_breached, stage_id)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_leads_tenant_created_at ON leads(tenant_id, created_at DESC)').catch(() => {});
 
   // Ensure billing & Phase 2 extension tables exist on upgraded MariaDB instances
   const mariaExtensionDdl = [
@@ -1142,8 +1230,12 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
       billing_cycle VARCHAR(30) NULL,
       months_added INT NOT NULL DEFAULT 0,
       amount_vnd BIGINT NOT NULL DEFAULT 0,
+      proration_credit_vnd BIGINT NOT NULL DEFAULT 0,
       discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
       payment_method VARCHAR(40) NOT NULL DEFAULT 'bank_transfer',
+      provider VARCHAR(40) NOT NULL DEFAULT 'manual_bank_transfer',
+      external_tx_id VARCHAR(160) NULL,
+      idempotency_key VARCHAR(120) NULL,
       status VARCHAR(30) NOT NULL DEFAULT 'pending',
       reference_code VARCHAR(80) NULL,
       note TEXT NULL,
@@ -1153,7 +1245,8 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
       processed_at DATETIME(6) NULL,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       INDEX idx_billing_tx_tenant_created (tenant_id, created_at DESC),
-      INDEX idx_billing_tx_status_created (status, created_at DESC)
+      INDEX idx_billing_tx_status_created (status, created_at DESC),
+      INDEX idx_billing_tx_tenant_status_created (tenant_id, status, created_at DESC)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     `CREATE TABLE IF NOT EXISTS consultant_managers (
       id VARCHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
@@ -1338,6 +1431,42 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
   for (const stmt of mariaExtensionDdl) {
     await client.query(stmt);
   }
+  await addMariaDbColumnIfNotExists(client, 'tenant_billing_transactions', 'idempotency_key', 'VARCHAR(120) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_billing_transactions', 'provider', "VARCHAR(40) NOT NULL DEFAULT 'manual_bank_transfer'");
+  await addMariaDbColumnIfNotExists(client, 'tenant_billing_transactions', 'external_tx_id', 'VARCHAR(160) NULL');
+  await addMariaDbColumnIfNotExists(client, 'tenant_billing_transactions', 'proration_credit_vnd', 'BIGINT NOT NULL DEFAULT 0');
+  await client.query('CREATE UNIQUE INDEX IF NOT EXISTS uk_billing_tx_tenant_idempotency ON tenant_billing_transactions(tenant_id, idempotency_key)').catch(() => {});
+  await client.query('CREATE UNIQUE INDEX IF NOT EXISTS uk_billing_tx_provider_ext ON tenant_billing_transactions(provider, external_tx_id)').catch(() => {});
+  await client
+    .query(
+      `UPDATE tenant_billing_transactions t
+       INNER JOIN (
+         SELECT id,
+                ROW_NUMBER() OVER (PARTITION BY reference_code ORDER BY created_at ASC, id ASC) AS rn
+         FROM tenant_billing_transactions
+         WHERE reference_code IS NOT NULL
+       ) d ON t.id = d.id
+       SET t.reference_code = CONCAT(LEFT(t.reference_code, 68), '-', LEFT(t.id, 8))
+       WHERE d.rn > 1`
+    )
+    .catch((err) => {
+      console.warn('[migrate][mariadb] Pre-dedup reference_code warning:', err?.message || err);
+    });
+  await client
+    .query('CREATE UNIQUE INDEX IF NOT EXISTS uk_billing_tx_reference_code ON tenant_billing_transactions(reference_code)')
+    .catch((err) => {
+      console.warn('[migrate][mariadb] uk_billing_tx_reference_code warning:', err?.message || err);
+    });
+  await client.query('CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_status_created ON tenant_billing_transactions(tenant_id, status, created_at DESC)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_billing_tx_tenant_type_created ON tenant_billing_transactions(tenant_id, tx_type, created_at DESC)').catch(() => {});
+  await addMariaDbColumnIfNotExists(client, 'capi_logs', 'retry_count', 'INT NOT NULL DEFAULT 0');
+  await addMariaDbColumnIfNotExists(client, 'capi_logs', 'next_retry_at', 'DATETIME(6) NULL');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_capi_logs_lead_event_status ON capi_logs(tenant_id, lead_id, event_name, response_status)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_capi_logs_retry_next ON capi_logs(response_status, next_retry_at, sent_at ASC)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_leads_tenant_ad_id ON leads(tenant_id, ad_id)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_leads_tenant_adset_id ON leads(tenant_id, adset_id)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_data_reports_tenant_lead_created ON data_reports(tenant_id, lead_id, created_at DESC)').catch(() => {});
+  await client.query('CREATE INDEX IF NOT EXISTS idx_meta_ads_tenant_ad_stop ON meta_ads_insights(tenant_id, ad_id, date_stop DESC)').catch(() => {});
   await addMariaDbColumnIfNotExists(client, 'meta_ads_insights', 'ad_account_id', 'VARCHAR(100) NULL');
 
   // Wave 1 MariaDB Additive Columns & Nullable Master Contact Relaxation
@@ -1710,6 +1839,17 @@ async function runMariaDbMigrations(client: DbClient, options?: { seedSuperAdmin
   ];
   for (const stmt of mariaFullCloneTables) {
     await client.query(stmt);
+  }
+
+  // Performance composite indexes on leads for MariaDB 10.6 parity with PostgreSQL
+  const mariaLeadIndexes = [
+    'CREATE INDEX IF NOT EXISTS idx_leads_tenant_adset_created ON leads(tenant_id, adset_id, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_leads_tenant_email ON leads(tenant_id, email)',
+    'CREATE INDEX IF NOT EXISTS idx_leads_tenant_phone ON leads(tenant_id, phone)',
+    'CREATE INDEX IF NOT EXISTS idx_leads_tenant_updated ON leads(tenant_id, updated_at)',
+  ];
+  for (const idxStmt of mariaLeadIndexes) {
+    await client.query(idxStmt).catch(() => {});
   }
 
   // Backfills

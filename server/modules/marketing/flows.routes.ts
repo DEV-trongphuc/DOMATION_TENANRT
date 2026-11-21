@@ -122,10 +122,14 @@ flowsRouter.post('/', requirePermission('mkt_flows', 'create'), async (req, res)
     const triggerType = String(req.body?.trigger_type || 'form_submitted').trim();
     const triggerConfig =
       req.body?.trigger_config && typeof req.body.trigger_config === 'object' ? req.body.trigger_config : {};
-    const steps: FlowStepNodeDto[] = Array.isArray(req.body?.steps) ? req.body.steps : [];
+    const steps: FlowStepNodeDto[] = Array.isArray(req.body?.steps)
+      ? req.body.steps
+      : Array.isArray(req.body?.steps_json)
+        ? req.body.steps_json
+        : [];
     const settings =
       req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-    const status = req.body?.status === 'active' ? 'active' : 'draft';
+    const status = req.body?.status === 'active' || req.body?.status === 'published' ? 'active' : 'draft';
 
     const id = crypto.randomUUID();
     const created = await withTenantTransaction(ctx.tenantId, async (client) => {
@@ -258,6 +262,18 @@ flowsRouter.put('/:id', requirePermission('mkt_flows', 'edit'), async (req, res)
           ? req.body.settings
           : parseJsonCol(ex.settings_json, {});
 
+      const prevStepsJson = JSON.stringify(parseJsonCol<FlowStepNodeDto[]>(ex.steps_json, []));
+      const nextStepsJson = JSON.stringify(steps);
+      const prevTrigCfgJson = JSON.stringify(parseJsonCol(ex.trigger_config, {}));
+      const nextTrigCfgJson = JSON.stringify(triggerConfig);
+      const shouldSnapshot =
+        status === 'active' &&
+        (prevStepsJson !== nextStepsJson ||
+          prevTrigCfgJson !== nextTrigCfgJson ||
+          triggerType !== String(ex.trigger_type) ||
+          String(ex.status) !== 'active');
+      const nextVersion = shouldSnapshot ? Number(ex.version || 0) + 1 : Number(ex.version || 1);
+
       await client.query(
         `UPDATE mkt_flows
          SET name = $3,
@@ -267,6 +283,7 @@ flowsRouter.put('/:id', requirePermission('mkt_flows', 'edit'), async (req, res)
              trigger_config = $7::jsonb,
              steps_json = $8::jsonb,
              settings_json = $9::jsonb,
+             version = $10,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
         [
@@ -276,11 +293,32 @@ flowsRouter.put('/:id', requirePermission('mkt_flows', 'edit'), async (req, res)
           description,
           status,
           triggerType,
-          JSON.stringify(triggerConfig),
-          JSON.stringify(steps),
+          nextTrigCfgJson,
+          nextStepsJson,
           JSON.stringify(settings),
+          nextVersion,
         ]
       );
+
+      if (shouldSnapshot) {
+        const audit = auditFlowWithDomAgent(triggerType, steps);
+        await client.query(
+          `INSERT INTO mkt_flow_snapshots (
+             id, tenant_id, flow_id, version, trigger_type, trigger_config, steps_json, review_score, published_by
+           ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9)`,
+          [
+            crypto.randomUUID(),
+            ctx.tenantId,
+            req.params.id,
+            nextVersion,
+            triggerType,
+            nextTrigCfgJson,
+            nextStepsJson,
+            audit.score,
+            ctx.userId,
+          ]
+        );
+      }
 
       const r = await client.query('SELECT * FROM mkt_flows WHERE tenant_id = $1 AND id = $2', [
         ctx.tenantId,
@@ -360,38 +398,82 @@ flowsRouter.post('/:id/publish', requirePermission('mkt_flows', 'edit'), async (
   }
 });
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // Restore from Version Snapshot
 flowsRouter.post('/:id/restore-snapshot', requirePermission('mkt_flows', 'edit'), async (req, res) => {
   try {
     const ctx = getTenantContext();
+    const flowId = String(req.params.id || '').trim();
+    if (!UUID_REGEX.test(flowId)) {
+      sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Không tìm thấy Automation Flow.');
+      return;
+    }
     const snapshotId = String(req.body?.snapshot_id || '').trim();
+    if (!snapshotId) {
+      sendApiError(res, 422, 'SNAPSHOT_ID_REQUIRED', 'Vui lòng cung cấp snapshot_id cần khôi phục.');
+      return;
+    }
+    if (!UUID_REGEX.test(snapshotId)) {
+      sendApiError(res, 404, 'SNAPSHOT_NOT_FOUND', 'Không tìm thấy phiên bản Snapshot cần khôi phục.');
+      return;
+    }
+
     const restored = await withTenantTransaction(ctx.tenantId, async (client) => {
-      const sRes = await client.query(
-        'SELECT * FROM mkt_flow_snapshots WHERE tenant_id = $1 AND flow_id = $2 AND id = $3 LIMIT 1',
-        [ctx.tenantId, req.params.id, snapshotId]
-      );
+      const [fRes, sRes] = await Promise.all([
+        client.query('SELECT * FROM mkt_flows WHERE tenant_id = $1 AND id = $2 LIMIT 1', [ctx.tenantId, flowId]),
+        client.query(
+          'SELECT * FROM mkt_flow_snapshots WHERE tenant_id = $1 AND flow_id = $2 AND id = $3 LIMIT 1',
+          [ctx.tenantId, flowId, snapshotId]
+        ),
+      ]);
+      const flow = fRes.rows[0];
       const snap = sRes.rows[0];
-      if (!snap) return null;
+      if (!flow || !snap) return null;
+
+      const restoredTriggerConfig = parseJsonCol<Record<string, unknown>>(snap.trigger_config, {});
+      const restoredSteps = parseJsonCol<FlowStepNodeDto[]>(snap.steps_json, []);
+      const nextVersion = Number(flow.version || 1) + 1;
+      const audit = auditFlowWithDomAgent(String(snap.trigger_type), restoredSteps);
 
       await client.query(
         `UPDATE mkt_flows
          SET trigger_type = $3,
              trigger_config = $4::jsonb,
              steps_json = $5::jsonb,
+             version = $6,
              updated_at = clock_timestamp()
          WHERE tenant_id = $1 AND id = $2`,
         [
           ctx.tenantId,
-          req.params.id,
+          flowId,
           snap.trigger_type,
-          JSON.stringify(parseJsonCol(snap.trigger_config, {})),
-          JSON.stringify(parseJsonCol(snap.steps_json, [])),
+          JSON.stringify(restoredTriggerConfig),
+          JSON.stringify(restoredSteps),
+          nextVersion,
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO mkt_flow_snapshots (
+           id, tenant_id, flow_id, version, trigger_type, trigger_config, steps_json, review_score, published_by
+         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9)`,
+        [
+          crypto.randomUUID(),
+          ctx.tenantId,
+          flowId,
+          nextVersion,
+          snap.trigger_type,
+          JSON.stringify(restoredTriggerConfig),
+          JSON.stringify(restoredSteps),
+          audit.score,
+          ctx.userId,
         ]
       );
 
       const r = await client.query('SELECT * FROM mkt_flows WHERE tenant_id = $1 AND id = $2', [
         ctx.tenantId,
-        req.params.id,
+        flowId,
       ]);
       return mapFlowRow(r.rows[0]);
     });
@@ -477,7 +559,7 @@ flowsRouter.post('/:id/enroll', requirePermission('mkt_flows', 'create'), async 
 
     const execution = await executeFlowForLead(ctx.tenantId, req.params.id, leadId, {
       actorId: ctx.userId,
-      skipWaitDelay: Boolean(req.body?.skip_wait_delay ?? true),
+      skipWaitDelay: Boolean(req.body?.skip_wait_delay ?? false),
     });
 
     res.status(201).json({ success: true, data: execution });
@@ -510,7 +592,7 @@ flowsRouter.delete('/:id', requirePermission('mkt_flows', 'delete'), async (req,
   }
 });
 
-// FlowAnalyticsTab: Per-Step Conversion Funnel & Branch Breakdown
+// FlowAnalyticsTab: Per-Step Conversion Funnel, Engagement & Branch Breakdown
 flowsRouter.get('/:id/analytics', requirePermission('mkt_flows', 'view'), async (req, res) => {
   try {
     const ctx = getTenantContext();
@@ -522,14 +604,28 @@ flowsRouter.get('/:id/analytics', requirePermission('mkt_flows', 'view'), async 
       const flowRow = fRes.rows[0];
       if (!flowRow) return null;
 
-      const enrollsRes = await client.query(
-        `SELECT id, lead_id, current_step_id, status, execution_trace, enrolled_at, completed_at
-         FROM mkt_flow_enrollments
-         WHERE tenant_id = $1 AND flow_id = $2
-         ORDER BY enrolled_at DESC
-         LIMIT 500`,
-        [ctx.tenantId, req.params.id]
-      );
+      const [enrollsRes, timelineRes] = await Promise.all([
+        client.query(
+          `SELECT id, lead_id, current_step_id, status, next_run_at, execution_trace, enrolled_at, completed_at
+           FROM mkt_flow_enrollments
+           WHERE tenant_id = $1 AND flow_id = $2
+           ORDER BY enrolled_at DESC
+           LIMIT 1000`,
+          [ctx.tenantId, req.params.id]
+        ),
+        client.query<{ lead_id: string; event_type: string; metadata: unknown; created_at: string }>(
+          `SELECT lead_id, event_type, metadata, created_at
+           FROM lead_timeline_events
+           WHERE tenant_id = $1
+             AND event_type IN (
+               'mkt_email_sent', 'email_opened', 'mkt_email_opened', 'email_clicked', 'mkt_email_clicked',
+               'link_clicked', 'zns_sent', 'zns_delivered', 'zns_clicked', 'zns_failed', 'deal_won', 'purchase_event'
+             )
+           ORDER BY created_at DESC
+           LIMIT 2000`,
+          [ctx.tenantId]
+        ),
+      ]);
 
       const steps = parseJsonCol<FlowStepNodeDto[]>(flowRow.steps_json, []);
       const stepMetricsMap = new Map<
@@ -539,12 +635,21 @@ flowsRouter.get('/:id/analytics', requirePermission('mkt_flows', 'view'), async 
           label: string;
           type: string;
           entered: number;
-          completed: number;
           waiting: number;
+          completed: number;
+          sent: number;
+          opened: number;
+          clicked: number;
+          converted: number;
+          failed: number;
           yes_count: number;
           no_count: number;
           branch_a_count: number;
           branch_b_count: number;
+          branch_counts: Record<string, number>;
+          _waitMinutesSum: number;
+          _waitMinutesCnt: number;
+          _enteredLeads: Set<string>;
         }
       >();
 
@@ -554,57 +659,233 @@ flowsRouter.get('/:id/analytics', requirePermission('mkt_flows', 'view'), async 
           label: s.label || s.type,
           type: s.type,
           entered: 0,
-          completed: 0,
           waiting: 0,
+          completed: 0,
+          sent: 0,
+          opened: 0,
+          clicked: 0,
+          converted: 0,
+          failed: 0,
           yes_count: 0,
           no_count: 0,
           branch_a_count: 0,
           branch_b_count: 0,
+          branch_counts: {},
+          _waitMinutesSum: 0,
+          _waitMinutesCnt: 0,
+          _enteredLeads: new Set<string>(),
         });
       }
 
-      let activeWaitingCount = 0;
-      for (const en of enrollsRes.rows) {
-        if (en.status === 'waiting') {
-          activeWaitingCount++;
-          if (en.current_step_id && stepMetricsMap.has(String(en.current_step_id))) {
-            stepMetricsMap.get(String(en.current_step_id))!.waiting++;
+      // Build lead/step engagement maps from timeline events scoped to this flow (or lead-level fallback)
+      const flowIdStr = String(req.params.id);
+      const stepOpenedLeads = new Map<string, Set<string>>();
+      const stepClickedLeads = new Map<string, Set<string>>();
+      const leadOpenedAny = new Set<string>();
+      const leadClickedAny = new Set<string>();
+      const leadConvertedAny = new Set<string>();
+
+      for (const ev of timelineRes.rows) {
+        const lid = String(ev.lead_id || '');
+        if (!lid) continue;
+        const et = String(ev.event_type || '').toLowerCase();
+        const meta = parseJsonCol<Record<string, unknown>>(ev.metadata, {});
+        const metaFlowId = meta.flow_id ? String(meta.flow_id) : null;
+        const metaStepId = meta.step_id ? String(meta.step_id) : null;
+
+        if (et === 'email_opened' || et === 'mkt_email_opened') {
+          leadOpenedAny.add(lid);
+          if ((!metaFlowId || metaFlowId === flowIdStr) && metaStepId) {
+            if (!stepOpenedLeads.has(metaStepId)) stepOpenedLeads.set(metaStepId, new Set());
+            stepOpenedLeads.get(metaStepId)!.add(lid);
           }
+        } else if (et === 'email_clicked' || et === 'mkt_email_clicked' || et === 'link_clicked' || et === 'zns_clicked') {
+          leadClickedAny.add(lid);
+          if ((!metaFlowId || metaFlowId === flowIdStr) && metaStepId) {
+            if (!stepClickedLeads.has(metaStepId)) stepClickedLeads.set(metaStepId, new Set());
+            stepClickedLeads.get(metaStepId)!.add(lid);
+          }
+        } else if (et === 'deal_won' || et === 'purchase_event') {
+          leadConvertedAny.add(lid);
         }
+      }
+
+      let activeWaitingCount = 0;
+      let exitedCount = 0;
+      let failedEnrollmentCount = 0;
+      let completedEnrollCount = 0;
+      const nowMs = Date.now();
+
+      for (const en of enrollsRes.rows) {
+        const lid = String(en.lead_id || '');
+        const enStatus = String(en.status || '');
+        if (enStatus === 'waiting') activeWaitingCount++;
+        else if (enStatus === 'exited') exitedCount++;
+        else if (enStatus === 'failed') failedEnrollmentCount++;
+        else if (enStatus === 'completed') completedEnrollCount++;
+
         const trace = parseJsonCol<FlowTraceEntry[]>(en.execution_trace, []);
-        for (const t of trace) {
+        const seenStepInThisRun = new Set<string>();
+
+        for (let i = 0; i < trace.length; i++) {
+          const t = trace[i];
           const m = stepMetricsMap.get(t.step_id);
           if (!m) continue;
-          m.entered++;
-          m.completed++;
-          if (t.branch === 'yes') m.yes_count++;
-          if (t.branch === 'no') m.no_count++;
-          if (t.branch === 'A') m.branch_a_count++;
-          if (t.branch === 'B') m.branch_b_count++;
+
+          if (!seenStepInThisRun.has(t.step_id)) {
+            seenStepInThisRun.add(t.step_id);
+            m.entered++;
+            if (lid) m._enteredLeads.add(lid);
+          }
+
+          const outcomeLower = String(t.outcome || '').toLowerCase();
+          const isWaitScheduled = outcomeLower.includes('đặt lịch chờ') || outcomeLower.includes('đang chờ sự kiện');
+          const isFailedOrSkipped =
+            outcomeLower.includes('thất bại') ||
+            outcomeLower.includes('lỗi') ||
+            outcomeLower.includes('bỏ qua') ||
+            outcomeLower.includes('từ chối');
+
+          if (isFailedOrSkipped) {
+            m.failed++;
+          } else if (!isWaitScheduled || i < trace.length - 1 || enStatus !== 'waiting') {
+            m.completed++;
+          }
+
+          if (t.node_type === 'send_email' || t.node_type === 'send_zns') {
+            if (!isFailedOrSkipped && (outcomeLower.includes('đã gửi') || outcomeLower.includes('mô phỏng'))) {
+              m.sent++;
+            }
+          }
+
+          if (t.node_type === 'push_to_autodata_sale_round' && !isFailedOrSkipped) {
+            m.converted++;
+          }
+
+          if (t.branch) {
+            const bKey = String(t.branch);
+            m.branch_counts[bKey] = (m.branch_counts[bKey] || 0) + 1;
+            if (bKey === 'yes') m.yes_count++;
+            if (bKey === 'no') m.no_count++;
+            if (bKey === 'A') m.branch_a_count++;
+            if (bKey === 'B') m.branch_b_count++;
+          }
+
+          // Compute wait duration between this step and next trace entry (or now if still waiting)
+          if (t.node_type === 'wait_delay' && t.timestamp) {
+            const startTs = new Date(t.timestamp).getTime();
+            const nextEntry = trace[i + 1];
+            const endTs = nextEntry?.timestamp ? new Date(nextEntry.timestamp).getTime() : enStatus === 'waiting' ? nowMs : startTs;
+            if (Number.isFinite(startTs) && Number.isFinite(endTs) && endTs >= startTs) {
+              m._waitMinutesSum += (endTs - startTs) / 60_000;
+              m._waitMinutesCnt++;
+            }
+          }
+        }
+
+        if (enStatus === 'waiting' && en.current_step_id && stepMetricsMap.has(String(en.current_step_id))) {
+          const wm = stepMetricsMap.get(String(en.current_step_id))!;
+          wm.waiting++;
+          if (!seenStepInThisRun.has(String(en.current_step_id))) {
+            wm.entered++;
+            if (lid) wm._enteredLeads.add(lid);
+          }
         }
       }
 
       const mappedFlow = mapFlowRow(flowRow);
-      const stepFunnel = Array.from(stepMetricsMap.values()).map((m) => ({
-        ...m,
-        conversion_pct:
-          mappedFlow.enrolled_count > 0
-            ? Number(((m.completed / Math.max(1, mappedFlow.enrolled_count)) * 100).toFixed(1))
-            : 0,
-      }));
+      const effectiveEnrolled = Math.max(mappedFlow.enrolled_count, enrollsRes.rows.length);
+      const effectiveCompleted = Math.max(mappedFlow.completed_count, completedEnrollCount);
+
+      let totalSent = 0;
+      let totalOpened = 0;
+      let totalClicked = 0;
+      let totalConverted = 0;
+      let totalFailed = 0;
+
+      const rawMetricsList = Array.from(stepMetricsMap.values());
+      const stepFunnel = rawMetricsList.map((m, idx) => {
+        const isMessaging = ['send_email', 'action', 'send_zns', 'zalo_zns'].includes(String(m.type).toLowerCase());
+        let opened = stepOpenedLeads.get(m.step_id)?.size || 0;
+        let clicked = stepClickedLeads.get(m.step_id)?.size || 0;
+        if (isMessaging && opened === 0 && m.sent > 0) {
+          for (const lid of m._enteredLeads) {
+            if (leadOpenedAny.has(lid)) opened++;
+          }
+        }
+        if (isMessaging && clicked === 0 && m.sent > 0) {
+          for (const lid of m._enteredLeads) {
+            if (leadClickedAny.has(lid)) clicked++;
+          }
+        }
+        let converted = m.converted;
+        if (converted === 0) {
+          for (const lid of m._enteredLeads) {
+            if (leadConvertedAny.has(lid)) converted++;
+          }
+        }
+
+        totalSent += m.sent;
+        totalOpened += opened;
+        totalClicked += clicked;
+        totalConverted = Math.max(totalConverted, converted, mappedFlow.pushed_to_sale_count);
+        totalFailed += m.failed;
+
+        const prevEntered = idx === 0 ? effectiveEnrolled : Math.max(1, rawMetricsList[idx - 1].entered);
+        const dropOffPct =
+          m.entered > 0
+            ? Number((Math.max(0, (m.entered - m.completed - m.waiting) / m.entered) * 100).toFixed(1))
+            : idx > 0 && prevEntered > 0
+              ? 100
+              : 0;
+        const avgWaitMinutes = m._waitMinutesCnt > 0 ? Number((m._waitMinutesSum / m._waitMinutesCnt).toFixed(1)) : 0;
+
+        return {
+          step_id: m.step_id,
+          label: m.label,
+          type: m.type,
+          entered: m.entered,
+          waiting: m.waiting,
+          completed: m.completed,
+          sent: m.sent,
+          opened,
+          clicked,
+          converted,
+          failed: m.failed,
+          drop_off_pct: dropOffPct,
+          avg_wait_minutes: avgWaitMinutes,
+          yes_count: m.yes_count,
+          no_count: m.no_count,
+          branch_a_count: m.branch_a_count,
+          branch_b_count: m.branch_b_count,
+          branch_counts: m.branch_counts,
+          conversion_pct:
+            effectiveEnrolled > 0 ? Number(((m.completed / Math.max(1, effectiveEnrolled)) * 100).toFixed(1)) : 0,
+        };
+      });
 
       return {
         flow: mappedFlow,
         summary: {
-          enrolled_count: mappedFlow.enrolled_count,
-          completed_count: mappedFlow.completed_count,
+          enrolled_count: effectiveEnrolled,
+          completed_count: effectiveCompleted,
           waiting_count: activeWaitingCount,
+          exited_count: exitedCount,
+          failed_count: Math.max(failedEnrollmentCount, totalFailed),
           pushed_to_sale_count: mappedFlow.pushed_to_sale_count,
           attributed_revenue_vnd: mappedFlow.attributed_revenue_vnd,
+          total_sent: totalSent,
+          total_opened: totalOpened,
+          total_clicked: totalClicked,
+          total_converted: totalConverted,
           completion_rate_pct:
-            mappedFlow.enrolled_count > 0
-              ? Number(((mappedFlow.completed_count / mappedFlow.enrolled_count) * 100).toFixed(1))
-              : 0,
+            effectiveEnrolled > 0 ? Number(((effectiveCompleted / effectiveEnrolled) * 100).toFixed(1)) : 0,
+          open_rate_pct: totalSent > 0 ? Number(((totalOpened / totalSent) * 100).toFixed(1)) : 0,
+          click_rate_pct: totalSent > 0 ? Number(((totalClicked / totalSent) * 100).toFixed(1)) : 0,
+          conversion_rate_pct:
+            effectiveEnrolled > 0 ? Number(((totalConverted / effectiveEnrolled) * 100).toFixed(1)) : 0,
+          error_rate_pct:
+            totalSent + totalFailed > 0 ? Number(((totalFailed / (totalSent + totalFailed)) * 100).toFixed(1)) : 0,
         },
         step_funnel: stepFunnel,
       };
@@ -738,7 +1019,7 @@ flowsRouter.post('/:id/manual-trigger', requirePermission('mkt_flows', 'create')
       try {
         const resExec = await executeFlowForLead(ctx.tenantId, req.params.id, lid, {
           actorId: ctx.userId,
-          skipWaitDelay: Boolean(req.body?.skip_wait_delay ?? true),
+          skipWaitDelay: Boolean(req.body?.skip_wait_delay ?? false),
         });
         enrolled++;
         if (resExec.promotedToSaleRound) promoted++;
